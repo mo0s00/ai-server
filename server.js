@@ -14,10 +14,6 @@ app.post("/comment", async (req, res) => {
       return res.status(400).json({ error: "prompt required" });
     }
 
-    if (!OPENAI_KEY) {
-      return res.status(500).json({ error: "OPENAI_KEY missing" });
-    }
-
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -36,15 +32,24 @@ app.post("/comment", async (req, res) => {
 
     const data = await response.json();
 
+    // 🔥 디버그 출력
+    console.log("OPENAI RAW:", JSON.stringify(data));
+
+    // 🔥 안전 처리
+    if (data.error) {
+      return res.status(500).json({ error: data.error.message });
+    }
+
     if (!data.choices || !data.choices[0]) {
-      return res.status(500).json({ error: "invalid OpenAI response", data });
+      return res.status(500).json({ error: "no choices", data });
     }
 
     res.json({
-      text: data.choices[0].message.content,
+      text: data.choices[0].message.content || "응답 없음",
     });
 
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "server error", detail: e.message });
   }
 });
