@@ -10,39 +10,31 @@ app.post("/comment", async (req, res) => {
   try {
     const { prompt } = req.body;
 
-    if (!prompt) {
-      return res.status(400).json({ error: "prompt required" });
-    }
-
     const response = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
+      "https://api.openai.com/v1/responses",
       {
         model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: "댓글 작성" },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 100,
+        input: `댓글 작성: ${prompt}`,
       },
       {
         headers: {
           Authorization: `Bearer ${OPENAI_KEY}`,
           "Content-Type": "application/json",
         },
-        timeout: 10000,
+        timeout: 8000, // 🔥 더 짧게
       }
     );
 
     res.json({
-      text: response.data.choices[0].message.content,
+      text: response.data.output[0].content[0].text,
     });
 
   } catch (e) {
-    console.error("ERROR:", e.message);
+    console.error("ERROR:", e.response?.data || e.message);
 
     res.status(500).json({
       error: "fail",
-      detail: e.message,
+      detail: e.response?.data || e.message,
     });
   }
 });
