@@ -10,6 +10,14 @@ app.post("/comment", async (req, res) => {
   try {
     const { prompt } = req.body;
 
+    if (!prompt) {
+      return res.status(400).json({ error: "prompt required" });
+    }
+
+    if (!OPENAI_KEY) {
+      return res.status(500).json({ error: "OPENAI_KEY missing" });
+    }
+
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -27,12 +35,21 @@ app.post("/comment", async (req, res) => {
     });
 
     const data = await response.json();
-    res.json(data);
+
+    if (!data.choices || !data.choices[0]) {
+      return res.status(500).json({ error: "invalid OpenAI response", data });
+    }
+
+    res.json({
+      text: data.choices[0].message.content,
+    });
+
   } catch (e) {
-    res.status(500).json({ error: "server error" });
+    res.status(500).json({ error: "server error", detail: e.message });
   }
 });
 
-app.listen(3000, () => {
-    console.log("server running on 3000");
-  });
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("server running on " + PORT);
+});
