@@ -16,7 +16,7 @@ app.post("/comment", async (req, res) => {
     const response = await axios.post(
       "https://api.anthropic.com/v1/messages",
       {
-        model: "claude-3-5-sonnet",
+        claude-3-sonnet-20240229
         max_tokens: 500,
         messages: [
           {
