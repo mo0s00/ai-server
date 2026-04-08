@@ -1,3 +1,4 @@
+console.log("API KEY:", ANTHROPIC_API_KEY);
 const express = require("express");
 const axios = require("axios");
 
