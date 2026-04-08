@@ -32,7 +32,7 @@ app.post("/comment", async (req, res) => {
           "anthropic-version": "2023-06-01",
           "Content-Type": "application/json",
         },
-        timeout: 8000,
+        timeout: 20000,
       }
     );
 
