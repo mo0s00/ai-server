@@ -32,18 +32,33 @@ app.post("/comment", async (req, res) => {
       }
     );
 
+    // T: Claude 응답 안전 파싱
     let text = "댓글 생성 실패";
 
-    if (response.data && response.data.content && response.data.content.length > 0) {
-      text = response.data.content[0].text || text;
+    if (
+      response &&
+      response.data &&
+      response.data.content &&
+      Array.isArray(response.data.content)
+    ) {
+      const item = response.data.content.find(
+        (v) => v.type === "text"
+      );
+
+      if (item && item.text) {
+        text = item.text;
+      }
     }
 
     res.json({ text });
+
   } catch (e) {
-    console.error("ERROR:", e.response?.data || e.message);
+    console.error("ERROR FULL:", e.response?.data || e.message);
 
     res.status(500).json({
-      text: "서버 오류",
+      error: true,
+      message: e.message,
+      details: e.response?.data || null,
     });
   }
 });
