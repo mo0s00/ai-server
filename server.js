@@ -3,15 +3,20 @@
 const express = require("express");
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-/** Prefer 3.5 Haiku; older 3 Haiku can return odd single-line content in edge cases. */
 const MODEL = "claude-3-5-haiku-20241022";
 const FETCH_TIMEOUT_MS = 25000;
+/** Bump when changing behavior (check with GET /health). */
+const SERVER_REV = "v5-simple-request-unicode-guard";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 process.on("unhandledRejection", (reason) => {
   console.log("[ai-server] unhandledRejection:", reason);
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, rev: SERVER_REV, model: MODEL });
 });
 
 app.get("/comment", (_req, res) => {
@@ -23,7 +28,22 @@ app.get("/comment", (_req, res) => {
   }
 });
 
+/** Anthropic sometimes echoes "model: claude-…" as the only text; reject those. */
+function isGarbageModelLine(s) {
+  if (!s || typeof s !== "string") return false;
+  const t = s
+    .replace(/^\uFEFF/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t) return false;
+  if (t === `model: ${MODEL}`) return true;
+  if (/^model[\s:：]\s*claude-/i.test(t)) return true;
+  return false;
+}
+
 app.post("/comment", async (req, res) => {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+
   try {
     const key = process.env.ANTHROPIC_API_KEY;
     if (!key || typeof key !== "string" || !key.trim()) {
@@ -38,15 +58,8 @@ app.post("/comment", async (req, res) => {
 
     const payload = JSON.stringify({
       model: MODEL,
-      max_tokens: 500,
-      system:
-        "You are a helpful assistant. Reply in natural language in the same language as the user. Never reply with only a model name or the word 'model:'.",
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: prompt }],
-        },
-      ],
+      max_tokens: 1024,
+      messages: [{ role: "user", content: prompt }],
     });
 
     const controller = new AbortController();
@@ -94,6 +107,8 @@ app.post("/comment", async (req, res) => {
       return res.status(statusOut).json({ text: String(msg) });
     }
 
+    console.log("[ai-server] Anthropic ok, raw head:", rawText.slice(0, 400));
+
     const blocks = Array.isArray(data.content) ? data.content : [];
     const textParts = [];
     for (const b of blocks) {
@@ -101,16 +116,16 @@ app.post("/comment", async (req, res) => {
       const t = b.text.trim();
       if (t) textParts.push(t);
     }
-    let text = textParts.join("\n\n").trim();
-    const normalized = text.replace(/\s+/g, " ").trim();
-    if (normalized && /^model:\s*claude-/i.test(normalized)) {
-      console.log("[ai-server] rejected model-line reply:", normalized.slice(0, 120));
-      console.log("[ai-server] raw preview:", rawText.slice(0, 800));
-      return res.status(502).json({ text: "댓글 생성 실패" });
-    }
+    const text = textParts.join("\n\n").trim();
 
     if (!text) {
       console.log("[ai-server] No text block in Anthropic response");
+      return res.status(502).json({ text: "댓글 생성 실패" });
+    }
+
+    if (isGarbageModelLine(text)) {
+      console.log("[ai-server] rejected garbage model-line reply");
+      console.log("[ai-server] full text was:", JSON.stringify(text));
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
 
