@@ -6,7 +6,7 @@ const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const MODEL = "claude-3-5-haiku-20241022";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v5-simple-request-unicode-guard";
+const SERVER_REV = "v6-garbage-detect-nfkc";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -28,16 +28,23 @@ app.get("/comment", (_req, res) => {
   }
 });
 
-/** Anthropic sometimes echoes "model: claude-…" as the only text; reject those. */
+/** Reject replies that are only a "model: claude-…" line (incl. homoglyphs / ZWSP). */
 function isGarbageModelLine(s) {
   if (!s || typeof s !== "string") return false;
-  const t = s
-    .replace(/^\uFEFF/, "")
+  let t = s
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .normalize("NFKC")
+    .replace(/\uFF1A/g, ":")
     .replace(/\s+/g, " ")
     .trim();
   if (!t) return false;
-  if (t === `model: ${MODEL}`) return true;
-  if (/^model[\s:：]\s*claude-/i.test(t)) return true;
+  const expected = `model: ${MODEL}`;
+  if (t === expected) return true;
+  if (t.toLowerCase() === expected.toLowerCase()) return true;
+  const compact = t.replace(/\s/g, "");
+  const compactExpected = expected.replace(/\s/g, "");
+  if (compact === compactExpected) return true;
+  if (/^model\s*:\s*claude-/i.test(t)) return true;
   return false;
 }
 
@@ -126,6 +133,7 @@ app.post("/comment", async (req, res) => {
     if (isGarbageModelLine(text)) {
       console.log("[ai-server] rejected garbage model-line reply");
       console.log("[ai-server] full text was:", JSON.stringify(text));
+      console.log("[ai-server] codepoints:", [...text].map((c) => c.codePointAt(0)).join(","));
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
 
