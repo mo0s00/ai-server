@@ -1,4 +1,3 @@
-console.log("🔥 THIS IS NEW CODE 🔥");
 const express = require("express");
 const axios = require("axios");
 
@@ -6,9 +5,6 @@ const app = express();
 app.use(express.json());
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-
-// T: API 키 전달 확인 로그
-console.log("API KEY:", ANTHROPIC_API_KEY);
 
 app.post("/comment", async (req, res) => {
   try {
@@ -57,7 +53,7 @@ app.post("/comment", async (req, res) => {
     res.json({ text });
 
   } catch (e) {
-    console.error("ERROR FULL:", e.response?.data || e.message);
+    console.error("ERROR:", e.response?.data || e.message);
 
     res.status(500).json({
       error: true,
