@@ -39,7 +39,14 @@ app.post("/comment", async (req, res) => {
     const payload = JSON.stringify({
       model: MODEL,
       max_tokens: 500,
-      messages: [{ role: "user", content: prompt }],
+      system:
+        "You are a helpful assistant. Reply in natural language in the same language as the user. Never reply with only a model name or the word 'model:'.",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: prompt }],
+        },
+      ],
     });
 
     const controller = new AbortController();
@@ -52,7 +59,7 @@ app.post("/comment", async (req, res) => {
         headers: {
           "x-api-key": key.trim(),
           "anthropic-version": "2023-06-01",
-          "Content-Type": "application/json",
+          "Content-Type": "application/json; charset=utf-8",
         },
         body: payload,
         signal: controller.signal,
@@ -95,11 +102,10 @@ app.post("/comment", async (req, res) => {
       if (t) textParts.push(t);
     }
     let text = textParts.join("\n\n").trim();
-    if (
-      text &&
-      /^model:\s*claude-3-[a-z0-9-]+$/i.test(text.replace(/\s+/g, " ").trim())
-    ) {
-      console.log("[ai-server] Anthropic returned only a model line as text; treating as failure");
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (normalized && /^model:\s*claude-/i.test(normalized)) {
+      console.log("[ai-server] rejected model-line reply:", normalized.slice(0, 120));
+      console.log("[ai-server] raw preview:", rawText.slice(0, 800));
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
 
