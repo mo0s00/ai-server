@@ -3,10 +3,11 @@
 const express = require("express");
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-const MODEL = "claude-3-5-haiku-20241022";
+/** Override in Render: ANTHROPIC_MODEL (see Anthropic docs for current IDs). */
+const MODEL = (process.env.ANTHROPIC_MODEL || "claude-haiku-4-5").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v6-garbage-detect-nfkc";
+const SERVER_REV = "v7-haiku-45-default";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -106,12 +107,16 @@ app.post("/comment", async (req, res) => {
         anthropicRes.status,
         typeof data === "object" ? JSON.stringify(data).slice(0, 500) : rawText.slice(0, 300)
       );
-      const msg =
+      const apiMsg =
         (data.error && data.error.message) ||
         data.message ||
         "Anthropic 요청에 실패했습니다.";
       const statusOut = anthropicRes.status >= 500 ? 502 : anthropicRes.status;
-      return res.status(statusOut).json({ text: String(msg) });
+      let textOut = String(apiMsg);
+      if (anthropicRes.status === 404) {
+        textOut = `[API 404] 모델을 찾을 수 없습니다. 현재 MODEL=${MODEL}. Anthropic 콘솔에서 사용 가능한 ID를 확인하고, Render에 ANTHROPIC_MODEL 로 설정하세요. 원문: ${apiMsg}`;
+      }
+      return res.status(statusOut).json({ text: textOut });
     }
 
     console.log("[ai-server] Anthropic ok, raw head:", rawText.slice(0, 400));
