@@ -3,7 +3,8 @@
 const express = require("express");
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-const MODEL = "claude-3-haiku-20240307";
+/** Prefer 3.5 Haiku; older 3 Haiku can return odd single-line content in edge cases. */
+const MODEL = "claude-3-5-haiku-20241022";
 const FETCH_TIMEOUT_MS = 25000;
 
 const app = express();
@@ -87,8 +88,20 @@ app.post("/comment", async (req, res) => {
     }
 
     const blocks = Array.isArray(data.content) ? data.content : [];
-    const textPart = blocks.find((b) => b && b.type === "text" && typeof b.text === "string");
-    const text = textPart ? textPart.text.trim() : "";
+    const textParts = [];
+    for (const b of blocks) {
+      if (!b || b.type !== "text" || typeof b.text !== "string") continue;
+      const t = b.text.trim();
+      if (t) textParts.push(t);
+    }
+    let text = textParts.join("\n\n").trim();
+    if (
+      text &&
+      /^model:\s*claude-3-[a-z0-9-]+$/i.test(text.replace(/\s+/g, " ").trim())
+    ) {
+      console.log("[ai-server] Anthropic returned only a model line as text; treating as failure");
+      return res.status(502).json({ text: "댓글 생성 실패" });
+    }
 
     if (!text) {
       console.log("[ai-server] No text block in Anthropic response");
