@@ -2,12 +2,12 @@
 
 const express = require("express");
 
-const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-/** Override in Render: ANTHROPIC_MODEL (see Anthropic docs for current IDs). */
-const MODEL = (process.env.ANTHROPIC_MODEL || "claude-haiku-4-5").trim();
+const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
+/** Override on host: DEEPSEEK_MODEL (e.g. deepseek-chat, deepseek-reasoner). */
+const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v7-haiku-45-default";
+const SERVER_REV = "v8-deepseek-chat-default";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -29,7 +29,7 @@ app.get("/comment", (_req, res) => {
   }
 });
 
-/** Reject replies that are only a "model: claude-…" line (incl. homoglyphs / ZWSP). */
+/** Reject replies that are only a "model: …" line (incl. homoglyphs / ZWSP). */
 function isGarbageModelLine(s) {
   if (!s || typeof s !== "string") return false;
   let t = s
@@ -45,7 +45,7 @@ function isGarbageModelLine(s) {
   const compact = t.replace(/\s/g, "");
   const compactExpected = expected.replace(/\s/g, "");
   if (compact === compactExpected) return true;
-  if (/^model\s*:\s*claude-/i.test(t)) return true;
+  if (/^model\s*:\s*(claude-|deepseek-)/i.test(t)) return true;
   return false;
 }
 
@@ -53,9 +53,9 @@ app.post("/comment", async (req, res) => {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
   try {
-    const key = process.env.ANTHROPIC_API_KEY;
+    const key = process.env.DEEPSEEK_API_KEY;
     if (!key || typeof key !== "string" || !key.trim()) {
-      console.log("[ai-server] ANTHROPIC_API_KEY is missing or empty");
+      console.log("[ai-server] DEEPSEEK_API_KEY is missing or empty");
       return res.status(503).json({ text: "서버 설정 오류입니다." });
     }
 
@@ -64,22 +64,33 @@ app.post("/comment", async (req, res) => {
       return res.status(400).json({ text: "prompt 필드가 필요합니다." });
     }
 
+    const requestedTemperature = Number(req.body && req.body.temperature);
+    const requestedMaxTokens = Number(req.body && req.body.maxTokens);
+    const temperature =
+      Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
+        ? requestedTemperature
+        : 0.9;
+    const maxTokens =
+      Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
+        ? Math.min(2048, Math.floor(requestedMaxTokens))
+        : 200;
+
     const payload = JSON.stringify({
       model: MODEL,
-      max_tokens: 1024,
+      temperature,
+      max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
     });
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-    let anthropicRes;
+    let dsRes;
     try {
-      anthropicRes = await fetch(ANTHROPIC_URL, {
+      dsRes = await fetch(DEEPSEEK_URL, {
         method: "POST",
         headers: {
-          "x-api-key": key.trim(),
-          "anthropic-version": "2023-06-01",
+          Authorization: `Bearer ${key.trim()}`,
           "Content-Type": "application/json; charset=utf-8",
         },
         body: payload,
@@ -89,49 +100,46 @@ app.post("/comment", async (req, res) => {
       clearTimeout(timer);
     }
 
-    const rawText = await anthropicRes.text();
+    const rawText = await dsRes.text();
     let data = {};
     if (rawText) {
       try {
         data = JSON.parse(rawText);
       } catch (parseErr) {
-        console.log("[ai-server] Anthropic response JSON parse error:", parseErr.message);
+        console.log("[ai-server] DeepSeek response JSON parse error:", parseErr.message);
         console.log("[ai-server] raw (first 300 chars):", rawText.slice(0, 300));
         return res.status(502).json({ text: "응답을 해석할 수 없습니다." });
       }
     }
 
-    if (!anthropicRes.ok) {
+    if (!dsRes.ok) {
       console.log(
-        "[ai-server] Anthropic HTTP",
-        anthropicRes.status,
+        "[ai-server] DeepSeek HTTP",
+        dsRes.status,
         typeof data === "object" ? JSON.stringify(data).slice(0, 500) : rawText.slice(0, 300)
       );
       const apiMsg =
         (data.error && data.error.message) ||
         data.message ||
-        "Anthropic 요청에 실패했습니다.";
-      const statusOut = anthropicRes.status >= 500 ? 502 : anthropicRes.status;
+        "DeepSeek 요청에 실패했습니다.";
+      const statusOut = dsRes.status >= 500 ? 502 : dsRes.status;
       let textOut = String(apiMsg);
-      if (anthropicRes.status === 404) {
-        textOut = `[API 404] 모델을 찾을 수 없습니다. 현재 MODEL=${MODEL}. Anthropic 콘솔에서 사용 가능한 ID를 확인하고, Render에 ANTHROPIC_MODEL 로 설정하세요. 원문: ${apiMsg}`;
+      if (dsRes.status === 404) {
+        textOut = `[API 404] 모델을 찾을 수 없습니다. 현재 MODEL=${MODEL}. 환경 변수 DEEPSEEK_MODEL을 DeepSeek 문서에 맞게 설정하세요. 원문: ${apiMsg}`;
       }
       return res.status(statusOut).json({ text: textOut });
     }
 
-    console.log("[ai-server] Anthropic ok, raw head:", rawText.slice(0, 400));
+    console.log("[ai-server] DeepSeek ok, raw head:", rawText.slice(0, 400));
 
-    const blocks = Array.isArray(data.content) ? data.content : [];
-    const textParts = [];
-    for (const b of blocks) {
-      if (!b || b.type !== "text" || typeof b.text !== "string") continue;
-      const t = b.text.trim();
-      if (t) textParts.push(t);
-    }
-    const text = textParts.join("\n\n").trim();
+    const choices = Array.isArray(data.choices) ? data.choices : [];
+    const first = choices[0];
+    const msgObj = first && first.message;
+    const text =
+      msgObj && typeof msgObj.content === "string" ? msgObj.content.trim() : "";
 
     if (!text) {
-      console.log("[ai-server] No text block in Anthropic response");
+      console.log("[ai-server] No assistant content in DeepSeek response");
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
 
