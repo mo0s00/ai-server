@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
-const SERVER_REV = "v14-stable-safe";
+const SERVER_REV = "v15-chat-complete";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -85,7 +85,7 @@ app.get("/memos/:userId", async (req, res) => {
 });
 
 // =========================
-// 📌 댓글 생성 + 저장 (🔥 안정화)
+// 📌 댓글 생성 + 저장
 // =========================
 app.post("/comment", async (req, res) => {
   try {
@@ -108,9 +108,7 @@ app.post("/comment", async (req, res) => {
       commenter_id
     });
 
-    // =========================
     // 🔥 AI 호출
-    // =========================
     const payload = JSON.stringify({
       model: MODEL,
       messages: [{ role: "user", content: safePrompt }]
@@ -145,9 +143,7 @@ app.post("/comment", async (req, res) => {
       text = "응답 생성 실패";
     }
 
-    // =========================
     // 🔥 UUID 변환
-    // =========================
     let finalMemoId = memo_id;
 
     if (!memo_id_safe.includes("-") && supabase) {
@@ -173,9 +169,7 @@ app.post("/comment", async (req, res) => {
       }
     }
 
-    // =========================
     // 🔥 DB 저장 (실패해도 계속)
-    // =========================
     if (supabase && finalMemoId) {
       try {
         const { error } = await supabase.from("comments").insert([
@@ -199,14 +193,51 @@ app.post("/comment", async (req, res) => {
       }
     }
 
-    // =========================
-    // 🔥 항상 응답 반환
-    // =========================
     res.json({ text });
 
   } catch (e) {
     console.log("❌ comment fatal:", e);
     res.status(500).json({ text: "server error" });
+  }
+});
+
+// =========================
+// 📌 채팅 저장 (🔥 추가된 핵심)
+// =========================
+app.post("/api/chat/message", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
+
+    const { user_id, commenter_id, sender, content } = req.body;
+
+    if (!user_id || !commenter_id || !content) {
+      return res.status(400).json({ error: "missing fields" });
+    }
+
+    console.log("📩 chat req:", req.body);
+
+    const { error } = await supabase.from("chat_messages").insert([
+      {
+        user_id,
+        commenter_id,
+        sender: sender || "user",
+        content
+      }
+    ]);
+
+    if (error) {
+      console.log("❌ chat save error:", error.message);
+      return res.status(500).json({ error: error.message });
+    }
+
+    console.log("✅ chat saved");
+
+    res.json({ ok: true });
+
+  } catch (e) {
+    console.log("❌ chat fatal:", e);
+    res.status(500).json({ error: "server error" });
   }
 });
 
