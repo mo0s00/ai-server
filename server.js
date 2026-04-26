@@ -6,11 +6,14 @@ import { createClient } from "@supabase/supabase-js";
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
-const SERVER_REV = "v13-final-clean";
+const SERVER_REV = "v14-stable-safe";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// =========================
+// 🔧 Supabase 연결
+// =========================
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
   const key =
@@ -19,13 +22,15 @@ function getSupabase() {
   return createClient(url, key);
 }
 
+// =========================
+// 🔍 health
+// =========================
 app.get("/health", (_req, res) => {
   res.json({ ok: true, rev: SERVER_REV });
 });
 
-
 // =========================
-// 📌 메모 저장 (local_id 포함)
+// 📌 메모 저장
 // =========================
 app.post("/memo", async (req, res) => {
   try {
@@ -50,11 +55,10 @@ app.post("/memo", async (req, res) => {
     res.json({ ok: true, id: data.id });
 
   } catch (e) {
-    console.log(e);
+    console.log("❌ memo fatal:", e);
     res.status(500).json({ error: "server error" });
   }
 });
-
 
 // =========================
 // 📌 메모 목록
@@ -75,19 +79,19 @@ app.get("/memos/:userId", async (req, res) => {
     res.json(data);
 
   } catch (e) {
+    console.log("❌ memos fatal:", e);
     res.status(500).json({ error: "server error" });
   }
 });
 
-
 // =========================
-// 📌 댓글 생성 + 저장 (UUID 변환 포함)
+// 📌 댓글 생성 + 저장 (🔥 안정화)
 // =========================
 app.post("/comment", async (req, res) => {
   try {
     const supabase = getSupabase();
 
-    const {
+    let {
       prompt,
       memo_id,
       user_id,
@@ -95,18 +99,30 @@ app.post("/comment", async (req, res) => {
       sender
     } = req.body;
 
+    const safePrompt = prompt || "";
+    const memo_id_safe = memo_id || "";
+
+    console.log("📩 comment req:", {
+      memo_id,
+      user_id,
+      commenter_id
+    });
+
+    // =========================
     // 🔥 AI 호출
+    // =========================
     const payload = JSON.stringify({
       model: MODEL,
-      messages: [{ role: "user", content: prompt }]
+      messages: [{ role: "user", content: safePrompt }]
     });
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-    let dsRes;
+    let text = "";
+
     try {
-      dsRes = await fetch(DEEPSEEK_URL, {
+      const dsRes = await fetch(DEEPSEEK_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
@@ -115,66 +131,84 @@ app.post("/comment", async (req, res) => {
         body: payload,
         signal: controller.signal
       });
+
+      const json = await dsRes.json();
+      text = json?.choices?.[0]?.message?.content?.trim() || "";
+
+    } catch (e) {
+      console.log("❌ AI error:", e);
     } finally {
       clearTimeout(timer);
     }
 
-    const json = await dsRes.json();
-
-    const text =
-      json?.choices?.[0]?.message?.content?.trim() || "";
-
     if (!text) {
-      return res.status(500).json({ text: "댓글 생성 실패" });
+      text = "응답 생성 실패";
     }
 
-    // 🔥 핵심: local_id → UUID 변환
+    // =========================
+    // 🔥 UUID 변환
+    // =========================
     let finalMemoId = memo_id;
 
-    if (!memo_id.includes("-")) {
-      console.log("👉 resolving memo:", memo_id, user_id);
+    if (!memo_id_safe.includes("-") && supabase) {
+      try {
+        console.log("👉 resolving memo:", memo_id, user_id);
 
-      const { data, error } = await supabase
-        .from("memos")
-        .select("id")
-        .eq("user_id", user_id)
-        .eq("local_id", memo_id)
-        .single();
+        const { data, error } = await supabase
+          .from("memos")
+          .select("id")
+          .eq("user_id", user_id)
+          .eq("local_id", memo_id)
+          .single();
 
-      if (error || !data) {
-        console.log("❌ memo resolve failed:", error);
-        return res.status(500).json({ error: "memo resolve failed" });
+        if (error || !data) {
+          console.log("❌ memo resolve failed:", error);
+        } else {
+          finalMemoId = data.id;
+          console.log("✅ resolved UUID:", finalMemoId);
+        }
+
+      } catch (e) {
+        console.log("❌ resolve exception:", e);
       }
-
-      finalMemoId = data.id;
-      console.log("✅ resolved UUID:", finalMemoId);
     }
 
-    // 🔥 저장
-    const { error } = await supabase.from("comments").insert([
-      {
-        memo_id: finalMemoId,
-        user_id,
-        commenter_id,
-        sender: sender || "commenter",
-        content: text
-      }
-    ]);
+    // =========================
+    // 🔥 DB 저장 (실패해도 계속)
+    // =========================
+    if (supabase && finalMemoId) {
+      try {
+        const { error } = await supabase.from("comments").insert([
+          {
+            memo_id: finalMemoId,
+            user_id,
+            commenter_id,
+            sender: sender || "commenter",
+            content: text
+          }
+        ]);
 
-    if (error) {
-      console.log("❌ comment save error:", error.message);
-    } else {
-      console.log("✅ comment saved");
+        if (error) {
+          console.log("❌ comment save error:", error.message);
+        } else {
+          console.log("✅ comment saved");
+        }
+
+      } catch (e) {
+        console.log("❌ DB exception:", e);
+      }
     }
 
+    // =========================
+    // 🔥 항상 응답 반환
+    // =========================
     res.json({ text });
 
   } catch (e) {
-    console.log(e);
+    console.log("❌ comment fatal:", e);
     res.status(500).json({ text: "server error" });
   }
 });
-
 
 // =========================
 // 🚀 서버 실행
