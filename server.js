@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
-const SERVER_REV = "v15-chat-complete";
+const SERVER_REV = "v16-cookie-restore";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -35,8 +35,6 @@ app.get("/health", (_req, res) => {
 app.post("/memo", async (req, res) => {
   try {
     const supabase = getSupabase();
-    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
-
     const { user_id, content, local_id } = req.body;
 
     const { data, error } = await supabase
@@ -45,41 +43,12 @@ app.post("/memo", async (req, res) => {
       .select("id")
       .single();
 
-    if (error) {
-      console.log("❌ memo save error:", error.message);
-      return res.status(500).json({ error: error.message });
-    }
+    if (error) return res.status(500).json({ error: error.message });
 
-    console.log("✅ memo saved:", data.id, "local_id:", local_id);
-
+    console.log("✅ memo saved:", data.id);
     res.json({ ok: true, id: data.id });
 
   } catch (e) {
-    console.log("❌ memo fatal:", e);
-    res.status(500).json({ error: "server error" });
-  }
-});
-
-// =========================
-// 📌 메모 목록
-// =========================
-app.get("/memos/:userId", async (req, res) => {
-  try {
-    const supabase = getSupabase();
-    const userId = req.params.userId;
-
-    const { data, error } = await supabase
-      .from("memos")
-      .select("*")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false });
-
-    if (error) return res.status(500).json({ error: error.message });
-
-    res.json(data);
-
-  } catch (e) {
-    console.log("❌ memos fatal:", e);
     res.status(500).json({ error: "server error" });
   }
 });
@@ -91,24 +60,13 @@ app.post("/comment", async (req, res) => {
   try {
     const supabase = getSupabase();
 
-    let {
-      prompt,
-      memo_id,
-      user_id,
-      commenter_id,
-      sender
-    } = req.body;
+    let { prompt, memo_id, user_id, commenter_id, sender } = req.body;
 
     const safePrompt = prompt || "";
     const memo_id_safe = memo_id || "";
 
-    console.log("📩 comment req:", {
-      memo_id,
-      user_id,
-      commenter_id
-    });
+    console.log("📩 comment req:", req.body);
 
-    // 🔥 AI 호출
     const payload = JSON.stringify({
       model: MODEL,
       messages: [{ role: "user", content: safePrompt }]
@@ -133,81 +91,48 @@ app.post("/comment", async (req, res) => {
       const json = await dsRes.json();
       text = json?.choices?.[0]?.message?.content?.trim() || "";
 
-    } catch (e) {
-      console.log("❌ AI error:", e);
     } finally {
       clearTimeout(timer);
     }
 
-    if (!text) {
-      text = "응답 생성 실패";
-    }
+    if (!text) text = "응답 생성 실패";
 
-    // 🔥 UUID 변환
     let finalMemoId = memo_id;
 
     if (!memo_id_safe.includes("-") && supabase) {
-      try {
-        console.log("👉 resolving memo:", memo_id, user_id);
+      const { data } = await supabase
+        .from("memos")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("local_id", memo_id)
+        .single();
 
-        const { data, error } = await supabase
-          .from("memos")
-          .select("id")
-          .eq("user_id", user_id)
-          .eq("local_id", memo_id)
-          .single();
-
-        if (error || !data) {
-          console.log("❌ memo resolve failed:", error);
-        } else {
-          finalMemoId = data.id;
-          console.log("✅ resolved UUID:", finalMemoId);
-        }
-
-      } catch (e) {
-        console.log("❌ resolve exception:", e);
-      }
+      if (data) finalMemoId = data.id;
     }
 
-    // 🔥 DB 저장 (실패해도 계속)
     if (supabase && finalMemoId) {
-      try {
-        const { error } = await supabase.from("comments").insert([
-          {
-            memo_id: finalMemoId,
-            user_id,
-            commenter_id,
-            sender: sender || "commenter",
-            content: text
-          }
-        ]);
-
-        if (error) {
-          console.log("❌ comment save error:", error.message);
-        } else {
-          console.log("✅ comment saved");
-        }
-
-      } catch (e) {
-        console.log("❌ DB exception:", e);
-      }
+      await supabase.from("comments").insert([{
+        memo_id: finalMemoId,
+        user_id,
+        commenter_id,
+        sender: sender || "commenter",
+        content: text
+      }]);
     }
 
     res.json({ text });
 
   } catch (e) {
-    console.log("❌ comment fatal:", e);
     res.status(500).json({ text: "server error" });
   }
 });
 
 // =========================
-// 📌 채팅 저장 (🔥 추가된 핵심)
+// 📌 채팅 저장
 // =========================
 app.post("/api/chat/message", async (req, res) => {
   try {
     const supabase = getSupabase();
-    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
 
     const { user_id, commenter_id, sender, content } = req.body;
 
@@ -215,28 +140,75 @@ app.post("/api/chat/message", async (req, res) => {
       return res.status(400).json({ error: "missing fields" });
     }
 
-    console.log("📩 chat req:", req.body);
-
-    const { error } = await supabase.from("chat_messages").insert([
-      {
-        user_id,
-        commenter_id,
-        sender: sender || "user",
-        content
-      }
-    ]);
-
-    if (error) {
-      console.log("❌ chat save error:", error.message);
-      return res.status(500).json({ error: error.message });
-    }
+    await supabase.from("chat_messages").insert([{
+      user_id,
+      commenter_id,
+      sender: sender || "user",
+      content
+    }]);
 
     console.log("✅ chat saved");
+    res.json({ ok: true });
+
+  } catch (e) {
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// =========================
+// 🍪 쿠키 거래 기록 저장
+// =========================
+app.post("/api/cookie-tx", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+
+    const { user_id, delta, reason, platform } = req.body;
+
+    if (!user_id || delta === undefined) {
+      return res.status(400).json({ error: "invalid request" });
+    }
+
+    await supabase.from("cookie_transactions").insert([{
+      user_id,
+      delta,
+      reason: reason || "unknown",
+      platform: platform || "app"
+    }]);
+
+    console.log("✅ cookie tx saved");
 
     res.json({ ok: true });
 
   } catch (e) {
-    console.log("❌ chat fatal:", e);
+    console.log("❌ cookie tx error:", e);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// =========================
+// 🍪 쿠키 잔액 조회 (복구 핵심)
+// =========================
+app.get("/api/cookie-balance/:userId", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    const userId = req.params.userId;
+
+    const { data, error } = await supabase
+      .from("cookie_transactions")
+      .select("delta")
+      .eq("user_id", userId);
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    const balance = (data || []).reduce((sum, row) => {
+      return sum + (row.delta || 0);
+    }, 0);
+
+    console.log("🍪 balance:", balance);
+
+    res.json({ balance });
+
+  } catch (e) {
     res.status(500).json({ error: "server error" });
   }
 });
