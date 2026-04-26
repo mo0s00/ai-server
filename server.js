@@ -8,7 +8,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v9-memo-supabase";
+const SERVER_REV = "v10-memos-get";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -93,6 +93,56 @@ app.post("/memo", async (req, res) => {
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
     console.log("[ai-server] POST /memo error:", msg);
+    if (e && e.stack) console.log(e.stack);
+    return res.status(500).json({ error: "서버 오류가 발생했습니다." });
+  }
+});
+
+/**
+ * GET /memos/:userId — JSON array of { id, user_id, content, created_at } (newest first).
+ */
+app.get("/memos/:userId", async (req, res) => {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+  try {
+    const supabase = getSupabase();
+    if (!supabase) {
+      console.log("[ai-server] GET /memos: Supabase env missing");
+      return res.status(503).json({ error: "Supabase 환경 변수가 설정되지 않았습니다." });
+    }
+
+    let userId = req.params.userId;
+    if (typeof userId === "string") {
+      try {
+        userId = decodeURIComponent(userId);
+      } catch (_) {
+        /* keep raw */
+      }
+    }
+    userId = String(userId || "").trim();
+    if (!userId) {
+      return res.status(400).json({ error: "user_id가 비어 있습니다." });
+    }
+
+    const { data, error } = await supabase
+      .from("memos")
+      .select("id, user_id, content, created_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.log("[ai-server] GET /memos Supabase:", error.message);
+      if (error.code) console.log("[ai-server] code:", error.code);
+      const dev = process.env.NODE_ENV !== "production";
+      return res.status(500).json({
+        error: "목록을 불러오지 못했습니다.",
+        ...(dev ? { supabase: error.message, code: error.code } : {}),
+      });
+    }
+
+    return res.status(200).json(Array.isArray(data) ? data : []);
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    console.log("[ai-server] GET /memos error:", msg);
     if (e && e.stack) console.log(e.stack);
     return res.status(500).json({ error: "서버 오류가 발생했습니다." });
   }
