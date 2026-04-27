@@ -5,20 +5,20 @@ import express from "express";
 import { createClient } from "@supabase/supabase-js";
 
 // =========================
-// 🔧 CONFIG
+// CONFIG
 // =========================
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 
-// 🔥 버전 업
-const SERVER_REV = "v17-commenter-state";
+// 🔥 버전
+const SERVER_REV = "v17-commenter-state-fixed";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // =========================
-// 🔧 Supabase
+// Supabase
 // =========================
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
@@ -31,14 +31,14 @@ function getSupabase() {
 }
 
 // =========================
-// 🔍 health
+// health
 // =========================
 app.get("/health", (_req, res) => {
   res.json({ ok: true, rev: SERVER_REV });
 });
 
 // =========================
-// 📌 MEMO
+// memo
 // =========================
 app.post("/memo", async (req, res) => {
   try {
@@ -60,21 +60,25 @@ app.post("/memo", async (req, res) => {
 });
 
 // =========================
-// 📌 COMMENT 생성
+// comment 생성
 // =========================
 app.post("/comment", async (req, res) => {
   try {
     const supabase = getSupabase();
-
     const { prompt, memo_id, user_id, commenter_id, sender } = req.body;
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     const payload = JSON.stringify({
       model: MODEL,
-      messages: [{ role: "user", content: prompt || "" }]
+      messages: [
+        {
+          role: "user",
+          content: String(prompt || "")
+        }
+      ]
     });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     let text = "";
 
@@ -82,7 +86,7 @@ app.post("/comment", async (req, res) => {
       const dsRes = await fetch(DEEPSEEK_URL, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+          "Authorization": "Bearer " + process.env.DEEPSEEK_API_KEY,
           "Content-Type": "application/json"
         },
         body: payload,
@@ -91,6 +95,8 @@ app.post("/comment", async (req, res) => {
 
       const json = await dsRes.json();
       text = json?.choices?.[0]?.message?.content?.trim() || "";
+    } catch (e) {
+      console.log("deepseek error:", e);
     } finally {
       clearTimeout(timer);
     }
@@ -116,13 +122,16 @@ app.post("/comment", async (req, res) => {
 });
 
 // =========================
-// 📌 CHAT
+// chat 저장
 // =========================
 app.post("/api/chat/message", async (req, res) => {
   try {
     const supabase = getSupabase();
-
     const { user_id, commenter_id, sender, content } = req.body;
+
+    if (!user_id || !commenter_id || !content) {
+      return res.status(400).json({ error: "missing fields" });
+    }
 
     await supabase.from("chat_messages").insert([
       { user_id, commenter_id, sender, content }
@@ -135,13 +144,16 @@ app.post("/api/chat/message", async (req, res) => {
 });
 
 // =========================
-// 🍪 COOKIE TX
+// cookie tx
 // =========================
 app.post("/api/cookie-tx", async (req, res) => {
   try {
     const supabase = getSupabase();
-
     const { user_id, delta, reason, platform } = req.body;
+
+    if (!user_id || delta === undefined) {
+      return res.status(400).json({ error: "invalid request" });
+    }
 
     await supabase.from("cookie_transactions").insert([
       { user_id, delta, reason, platform }
@@ -154,7 +166,7 @@ app.post("/api/cookie-tx", async (req, res) => {
 });
 
 // =========================
-// 🍪 COOKIE BALANCE
+// cookie balance
 // =========================
 app.get("/api/cookie-balance/:userId", async (req, res) => {
   try {
@@ -178,7 +190,7 @@ app.get("/api/cookie-balance/:userId", async (req, res) => {
 });
 
 // =========================
-// 👤 COMMENTER STATE (🔥 핵심)
+// 🔥 commenter state 저장
 // =========================
 app.post("/api/commenter-state", async (req, res) => {
   try {
@@ -224,7 +236,7 @@ app.post("/api/commenter-state", async (req, res) => {
 });
 
 // =========================
-// 📥 COMMENTER STATE GET (복구)
+// 🔥 commenter state 조회
 // =========================
 app.get("/api/commenter-state/:userId", async (req, res) => {
   try {
@@ -243,7 +255,7 @@ app.get("/api/commenter-state/:userId", async (req, res) => {
 });
 
 // =========================
-// 🚀 START
+// start
 // =========================
 const PORT = process.env.PORT || 3000;
 
