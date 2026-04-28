@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const SERVER_REV = "v21-api-memo-comment-save-alias";
+const SERVER_REV = "v22-add-missing-apis";
 
 // =========================
 // Supabase
@@ -42,7 +42,10 @@ app.get("/health", (_req, res) => {
     supabasePostPaths: [
       "POST /api/memo",
       "POST /api/comment-save",
-      "POST /api/cookie-tx"
+      "POST /api/cookie-tx",
+      "POST /api/custom-prompts",
+      "POST /api/commenter-state",
+      "POST /api/chat-message"
     ]
   });
 });
@@ -52,8 +55,6 @@ app.get("/health", (_req, res) => {
 // =========================
 app.post("/api/cookie-tx", async (req, res) => {
   try {
-    console.log("REQ:", req.body);
-
     const supabase = getSupabase();
     if (!supabase) {
       return res.status(500).json({ error: "supabase not configured" });
@@ -70,13 +71,11 @@ app.post("/api/cookie-tx", async (req, res) => {
     ]);
 
     if (error) {
-      console.error("INSERT ERROR:", error);
       return res.status(500).json({ error: error.message });
     }
 
     res.json({ ok: true });
   } catch (e) {
-    console.error("SERVER ERROR:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -86,8 +85,6 @@ app.post("/api/cookie-tx", async (req, res) => {
 // =========================
 app.post("/api/memo", async (req, res) => {
   try {
-    console.log("📩 memo req:", req.body);
-
     const supabase = getSupabase();
     if (!supabase) {
       return res.status(500).json({ error: "supabase not configured" });
@@ -106,13 +103,11 @@ app.post("/api/memo", async (req, res) => {
       .single();
 
     if (error) {
-      console.error("MEMO INSERT ERROR:", error);
       return res.status(500).json({ error: error.message });
     }
 
     res.json({ ok: true, id: data.id });
   } catch (e) {
-    console.error("MEMO SERVER ERROR:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -122,8 +117,6 @@ app.post("/api/memo", async (req, res) => {
 // =========================
 app.post("/api/comment-save", async (req, res) => {
   try {
-    console.log("📩 comment req:", req.body);
-
     const supabase = getSupabase();
     if (!supabase) {
       return res.status(500).json({ error: "supabase not configured" });
@@ -143,7 +136,6 @@ app.post("/api/comment-save", async (req, res) => {
       .single();
 
     if (memoError || !memo) {
-      console.error("❌ memo resolve failed:", memoError);
       return res.status(400).json({ error: "memo resolve failed" });
     }
 
@@ -158,13 +150,104 @@ app.post("/api/comment-save", async (req, res) => {
     ]);
 
     if (error) {
-      console.error("COMMENT INSERT ERROR:", error);
       return res.status(500).json({ error: error.message });
     }
 
     res.json({ ok: true });
   } catch (e) {
-    console.error("COMMENT SERVER ERROR:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =========================
+// CUSTOM PROMPTS
+// =========================
+app.post("/api/custom-prompts", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) {
+      return res.status(500).json({ error: "supabase not configured" });
+    }
+
+    const { user_id, commenter_id, prompt } = req.body;
+
+    if (!user_id || !commenter_id || !prompt) {
+      return res.status(400).json({ error: "invalid request" });
+    }
+
+    const { error } = await supabase
+      .from("custom_prompts")
+      .insert([{ user_id, commenter_id, prompt }]);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =========================
+// COMMENTER STATE
+// =========================
+app.post("/api/commenter-state", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) {
+      return res.status(500).json({ error: "supabase not configured" });
+    }
+
+    const { user_id, commenter_id, exp, level, is_unlocked } = req.body;
+
+    if (!user_id || !commenter_id) {
+      return res.status(400).json({ error: "invalid request" });
+    }
+
+    const { error } = await supabase
+      .from("commenter_state")
+      .upsert(
+        [{ user_id, commenter_id, exp, level, is_unlocked }],
+        { onConflict: ["user_id", "commenter_id"] }
+      );
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =========================
+// CHAT MESSAGE
+// =========================
+app.post("/api/chat-message", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) {
+      return res.status(500).json({ error: "supabase not configured" });
+    }
+
+    const { user_id, session_key, role, content } = req.body;
+
+    if (!user_id || !content) {
+      return res.status(400).json({ error: "invalid request" });
+    }
+
+    const { error } = await supabase
+      .from("chat_messages")
+      .insert([{ user_id, session_key, role, content }]);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
