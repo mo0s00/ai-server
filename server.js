@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const SERVER_REV = "v19-fix";
+const SERVER_REV = "v20-memo-local-id-comment-save";
 
 // =========================
 // Supabase
