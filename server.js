@@ -1,13 +1,12 @@
 "use strict";
 
 import express from "express";
-import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v25-comment-complete";
+const SERVER_REV = "v26-node-fetch-removed";
 
 // =========================
 // CONFIG
@@ -18,7 +17,9 @@ const MAX_PROMPT_CHARS = Math.max(
 );
 
 const MODEL = process.env.DEEPSEEK_MODEL || "deepseek-chat";
-const API_URL = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/v1/chat/completions";
+const API_URL =
+  process.env.DEEPSEEK_API_URL ||
+  "https://api.deepseek.com/v1/chat/completions";
 const API_KEY = process.env.DEEPSEEK_API_KEY;
 
 // =========================
@@ -64,7 +65,7 @@ function extractText(msg) {
 
   if (Array.isArray(c)) {
     return c
-      .map(p => (typeof p === "string" ? p : p?.text || ""))
+      .map((p) => (typeof p === "string" ? p : p?.text || ""))
       .join(" ")
       .trim();
   }
@@ -128,7 +129,6 @@ app.post("/comment", async (req, res) => {
     }
 
     res.json({ text });
-
   } catch (e) {
     console.error("[comment error]", e);
     res.status(500).json({ text: "server error" });
@@ -149,9 +149,9 @@ app.post("/api/cookie-tx", async (req, res) => {
       return res.status(400).json({ error: "invalid" });
     }
 
-    const { error } = await supabase.from("cookie_transactions").insert([
-      { user_id, delta, reason, platform },
-    ]);
+    const { error } = await supabase
+      .from("cookie_transactions")
+      .insert([{ user_id, delta, reason, platform }]);
 
     if (error) return res.status(500).json({ error: error.message });
 
