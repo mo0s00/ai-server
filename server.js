@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v26-node-fetch-removed";
+const SERVER_REV = "v29-custom-prompts-schema-align";
 
 // =========================
 // CONFIG
