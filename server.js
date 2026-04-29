@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v29-custom-prompts-schema-align";
+const SERVER_REV = "v30-custom-prompts-complete";
 
 // =========================
 // CONFIG
@@ -52,7 +52,6 @@ function sanitizePrompt(text) {
 
 function truncatePrompt(text) {
   if (text.length > MAX_PROMPT_CHARS) {
-    console.log("[truncate]", text.length);
     return text.slice(0, MAX_PROMPT_CHARS) + "\n\n[…truncated]";
   }
   return text;
@@ -61,6 +60,7 @@ function truncatePrompt(text) {
 function extractText(msg) {
   if (!msg) return "";
   const c = msg.content;
+
   if (typeof c === "string") return c.trim();
 
   if (Array.isArray(c)) {
@@ -81,7 +81,7 @@ app.get("/health", (_req, res) => {
 });
 
 // =========================
-// 🔥 COMMENT (핵심)
+// COMMENT
 // =========================
 app.post("/comment", async (req, res) => {
   try {
@@ -98,17 +98,12 @@ app.post("/comment", async (req, res) => {
     prompt = sanitizePrompt(prompt);
     prompt = truncatePrompt(prompt);
 
-    let payload;
-    try {
-      payload = JSON.stringify({
-        model: MODEL,
-        temperature,
-        max_tokens,
-        messages: [{ role: "user", content: prompt }],
-      });
-    } catch (e) {
-      return res.status(400).json({ text: "stringify fail" });
-    }
+    const payload = JSON.stringify({
+      model: MODEL,
+      temperature,
+      max_tokens,
+      messages: [{ role: "user", content: prompt }],
+    });
 
     const response = await fetch(API_URL, {
       method: "POST",
@@ -120,9 +115,7 @@ app.post("/comment", async (req, res) => {
     });
 
     const data = await response.json();
-
-    const msg = data?.choices?.[0]?.message;
-    const text = extractText(msg);
+    const text = extractText(data?.choices?.[0]?.message);
 
     if (!text) {
       return res.status(500).json({ text: "empty response" });
@@ -132,6 +125,64 @@ app.post("/comment", async (req, res) => {
   } catch (e) {
     console.error("[comment error]", e);
     res.status(500).json({ text: "server error" });
+  }
+});
+
+// =========================
+// 🔥 CUSTOM PROMPTS
+// =========================
+app.post("/api/custom-prompts", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "no supabase" });
+
+    const { user_id, commenter_id, prompt } = req.body;
+
+    if (!user_id || !commenter_id) {
+      return res.status(400).json({ error: "invalid request" });
+    }
+
+    const { error } = await supabase
+      .from("custom_prompts")
+      .upsert([
+        {
+          user_id,
+          commenter_id,
+          prompt,
+          updated_at: new Date().toISOString(),
+        },
+      ]);
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[custom-prompts error]", e);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+app.get("/api/custom-prompts", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "no supabase" });
+
+    const { user_id } = req.query;
+
+    if (!user_id) {
+      return res.status(400).json({ error: "user_id required" });
+    }
+
+    const { data, error } = await supabase
+      .from("custom_prompts")
+      .select("*")
+      .eq("user_id", user_id);
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ ok: true, rows: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
