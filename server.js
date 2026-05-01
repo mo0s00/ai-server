@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v30-custom-prompts-complete";
+const SERVER_REV = "v33-full-api-fixed";
 
 // =========================
 // CONFIG
@@ -77,11 +77,16 @@ function extractText(msg) {
 // health
 // =========================
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, rev: SERVER_REV });
+  const supabase = getSupabase();
+  res.json({
+    ok: true,
+    rev: SERVER_REV,
+    supabaseConfigured: !!supabase,
+  });
 });
 
 // =========================
-// COMMENT
+// COMMENT (AI)
 // =========================
 app.post("/comment", async (req, res) => {
   try {
@@ -129,7 +134,46 @@ app.post("/comment", async (req, res) => {
 });
 
 // =========================
-// 🔥 CUSTOM PROMPTS
+// commenter_state
+// =========================
+app.post("/api/commenter-state", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "no supabase" });
+
+    const { user_id, commenter_id, exp, level, is_unlocked, is_favorite } = req.body;
+
+    if (!user_id || !commenter_id) {
+      return res.status(400).json({ error: "invalid request" });
+    }
+
+    const { error } = await supabase
+      .from("commenter_state")
+      .upsert(
+        [
+          {
+            user_id,
+            commenter_id,
+            exp: exp ?? 0,
+            level: level ?? 1,
+            is_unlocked: is_unlocked ?? false,
+            is_favorite: is_favorite ?? false,
+          },
+        ],
+        { onConflict: "user_id,commenter_id" }
+      );
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[commenter-state error]", e);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// =========================
+// custom_prompts
 // =========================
 app.post("/api/custom-prompts", async (req, res) => {
   try {
@@ -162,32 +206,40 @@ app.post("/api/custom-prompts", async (req, res) => {
   }
 });
 
-app.get("/api/custom-prompts", async (req, res) => {
+// =========================
+// chat_messages
+// =========================
+app.post("/api/chat-message", async (req, res) => {
   try {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "no supabase" });
 
-    const { user_id } = req.query;
+    const { user_id, session_key, role, content } = req.body;
 
-    if (!user_id) {
-      return res.status(400).json({ error: "user_id required" });
+    if (!user_id || !content) {
+      return res.status(400).json({ error: "invalid request" });
     }
 
-    const { data, error } = await supabase
-      .from("custom_prompts")
-      .select("*")
-      .eq("user_id", user_id);
+    const { error } = await supabase.from("chat_messages").insert([
+      {
+        user_id,
+        session_key: session_key ?? null,
+        role: role ?? "user",
+        content,
+      },
+    ]);
 
     if (error) return res.status(500).json({ error: error.message });
 
-    res.json({ ok: true, rows: data });
+    res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("[chat-message error]", e);
+    res.status(500).json({ error: "server error" });
   }
 });
 
 // =========================
-// COOKIE TX
+// cookie_transactions
 // =========================
 app.post("/api/cookie-tx", async (req, res) => {
   try {
@@ -213,7 +265,7 @@ app.post("/api/cookie-tx", async (req, res) => {
 });
 
 // =========================
-// MEMO
+// memos
 // =========================
 app.post("/api/memo", async (req, res) => {
   try {
@@ -237,7 +289,7 @@ app.post("/api/memo", async (req, res) => {
 });
 
 // =========================
-// COMMENT SAVE
+// comment-save
 // =========================
 app.post("/api/comment-save", async (req, res) => {
   try {
