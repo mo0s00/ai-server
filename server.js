@@ -1,12 +1,13 @@
 "use strict";
 
 import express from "express";
+import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v39-json-fix";
+const SERVER_REV = "v40-ai-connected";
 
 // =========================
 // Supabase
@@ -36,7 +37,37 @@ app.get("/health", (_req, res) => {
 });
 
 // =========================
-// COMMENT (핵심 수정 완료)
+// AI 호출
+// =========================
+async function callAI(prompt) {
+  const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "deepseek-chat",
+      messages: [
+        {
+          role: "system",
+          content: "너는 현실적인 조언을 하는 댓글러 3명이다. 각자 짧고 다르게 답해."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ]
+    })
+  });
+
+  const data = await res.json();
+
+  return data?.choices?.[0]?.message?.content || "답변 생성 실패";
+}
+
+// =========================
+// COMMENT (AI 적용)
 // =========================
 async function handleComment(req, res) {
   try {
@@ -46,18 +77,24 @@ async function handleComment(req, res) {
       return res.status(400).json({ error: "no prompt" });
     }
 
-    console.log("[POST comment]");
+    console.log("[POST comment AI]");
+
+    const aiText = await callAI(prompt);
+
+    const parts = aiText
+      .split("\n")
+      .map(t => t.trim())
+      .filter(t => t.length > 0);
 
     res.json({
       choices: [
         {
           message: {
-            // 🔥 JSON.stringify 제거
             content: {
               comments: [
-                { name: "도혁", text: "지금 시작이면 방향 잡는 게 먼저다\n작게라도 움직여라" },
-                { name: "현우", text: "처음이면 불안한 게 정상이다\n호흡부터 정리해라" },
-                { name: "유진", text: "이미 시작했다는 게 중요해\n그 흐름 계속 가져가" }
+                { name: "도혁", text: parts[0] || aiText },
+                { name: "현우", text: parts[1] || aiText },
+                { name: "유진", text: parts[2] || aiText }
               ]
             }
           }
@@ -66,11 +103,11 @@ async function handleComment(req, res) {
     });
 
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: e.message });
   }
 }
 
-// 둘 다 지원
 app.post("/comment", handleComment);
 app.post("/api/comment", handleComment);
 
