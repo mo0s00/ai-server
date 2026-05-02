@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v37-api-dual-route";
+const SERVER_REV = "v38-gpt-format-fixed";
 
 // =========================
 // Supabase
@@ -36,7 +36,7 @@ app.get("/health", (_req, res) => {
 });
 
 // =========================
-// COMMENT (공통 핸들러)
+// COMMENT (GPT 형식)
 // =========================
 async function handleComment(req, res) {
   try {
@@ -48,11 +48,20 @@ async function handleComment(req, res) {
 
     console.log("[POST comment]");
 
+    // 🔥 앱이 기대하는 GPT 형식으로 응답
     res.json({
-      comments: [
-        { name: "도혁", text: "지금 시작이면 방향 잡는 게 먼저다\n작게라도 움직여라" },
-        { name: "현우", text: "처음이면 불안한 게 정상이다\n호흡부터 정리해라" },
-        { name: "유진", text: "이미 시작했다는 게 중요해\n그 흐름 계속 가져가" }
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              comments: [
+                { name: "도혁", text: "지금 시작이면 방향 잡는 게 먼저다\n작게라도 움직여라" },
+                { name: "현우", text: "처음이면 불안한 게 정상이다\n호흡부터 정리해라" },
+                { name: "유진", text: "이미 시작했다는 게 중요해\n그 흐름 계속 가져가" }
+              ]
+            })
+          }
+        }
       ]
     });
 
@@ -61,7 +70,7 @@ async function handleComment(req, res) {
   }
 }
 
-// 🔥 핵심: 둘 다 지원
+// 🔥 둘 다 지원
 app.post("/comment", handleComment);
 app.post("/api/comment", handleComment);
 
