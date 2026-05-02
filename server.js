@@ -1,13 +1,12 @@
 "use strict";
 
 import express from "express";
-import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v40-ai-connected";
+const SERVER_REV = "v41-native-fetch";
 
 // =========================
 // Supabase
@@ -37,7 +36,7 @@ app.get("/health", (_req, res) => {
 });
 
 // =========================
-// AI 호출
+// AI 호출 (node-fetch 없이)
 // =========================
 async function callAI(prompt) {
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
@@ -51,7 +50,7 @@ async function callAI(prompt) {
       messages: [
         {
           role: "system",
-          content: "너는 현실적인 조언을 하는 댓글러 3명이다. 각자 짧고 다르게 답해."
+          content: "너는 현실적인 조언을 하는 댓글러 3명이다. 각자 다르게 짧게 답해."
         },
         {
           role: "user",
