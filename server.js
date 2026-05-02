@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v41-native-fetch";
+const SERVER_REV = "v50-final";
 
 // =========================
 // Supabase
@@ -36,7 +36,7 @@ app.get("/health", (_req, res) => {
 });
 
 // =========================
-// AI 호출 (node-fetch 없이)
+// AI 호출 (native fetch)
 // =========================
 async function callAI(prompt) {
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
@@ -50,7 +50,7 @@ async function callAI(prompt) {
       messages: [
         {
           role: "system",
-          content: "너는 현실적인 조언을 하는 댓글러 3명이다. 각자 다르게 짧게 답해."
+          content: "너는 현실적인 조언을 하는 댓글러다. 짧고 자연스럽게 답해."
         },
         {
           role: "user",
@@ -61,22 +61,16 @@ async function callAI(prompt) {
   });
 
   const data = await res.json();
-
-  return data?.choices?.[0]?.message?.content || "답변 생성 실패";
+  return data?.choices?.[0]?.message?.content || "답변 실패";
 }
 
 // =========================
-// COMMENT (AI 적용)
+// COMMENT (핵심)
 // =========================
 async function handleComment(req, res) {
   try {
     const { prompt } = req.body;
-
-    if (!prompt) {
-      return res.status(400).json({ error: "no prompt" });
-    }
-
-    console.log("[POST comment AI]");
+    if (!prompt) return res.status(400).json({ error: "no prompt" });
 
     const aiText = await callAI(prompt);
 
@@ -89,13 +83,14 @@ async function handleComment(req, res) {
       choices: [
         {
           message: {
-            content: {
+            // 🔥 문자열로 보내야 Flutter가 정상 파싱
+            content: JSON.stringify({
               comments: [
-                { name: "도혁", text: parts[0] || aiText },
-                { name: "현우", text: parts[1] || aiText },
-                { name: "유진", text: parts[2] || aiText }
+                { text: parts[0] || aiText },
+                { text: parts[1] || aiText },
+                { text: parts[2] || aiText }
               ]
-            }
+            })
           }
         }
       ]
@@ -109,36 +104,6 @@ async function handleComment(req, res) {
 
 app.post("/comment", handleComment);
 app.post("/api/comment", handleComment);
-
-// =========================
-// COMMENT SAVE
-// =========================
-function handleCommentSave(req, res) {
-  try {
-    console.log("[POST comment-save]", req.body);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-}
-
-app.post("/comment-save", handleCommentSave);
-app.post("/api/comment-save", handleCommentSave);
-
-// =========================
-// COMMENTER STATE
-// =========================
-function handleCommenterState(req, res) {
-  try {
-    console.log("[POST commenter-state]", req.body);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-}
-
-app.post("/commenter-state", handleCommenterState);
-app.post("/api/commenter-state", handleCommenterState);
 
 // =========================
 // MEMO SAVE
