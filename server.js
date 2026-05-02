@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v50-final";
+const SERVER_REV = "v60-multi-commenter-ai";
 
 // =========================
 // Supabase
@@ -36,9 +36,30 @@ app.get("/health", (_req, res) => {
 });
 
 // =========================
-// AI 호출 (native fetch)
+// 댓글러 풀 (임시)
 // =========================
-async function callAI(prompt) {
+const commenterPool = [
+  { id: "c01", name: "도혁", style: "현실적이고 직설적으로 말한다." },
+  { id: "c02", name: "현우", style: "차분하고 분석적으로 설명한다." },
+  { id: "c03", name: "유진", style: "감정적으로 공감하며 말한다." },
+  { id: "c04", name: "지훈", style: "냉정하게 핵심만 말한다." },
+  { id: "c05", name: "서연", style: "친근하고 부드럽게 말한다." },
+  { id: "c06", name: "민준", style: "논리적으로 핵심만 정리한다." }
+];
+
+// =========================
+// 랜덤 댓글러 선택
+// =========================
+function pickRandomCommenters(n = 3) {
+  return [...commenterPool]
+    .sort(() => 0.5 - Math.random())
+    .slice(0, n);
+}
+
+// =========================
+// AI 호출 (1명)
+// =========================
+async function callAIForCommenter(prompt, commenter) {
   const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -50,7 +71,13 @@ async function callAI(prompt) {
       messages: [
         {
           role: "system",
-          content: "너는 현실적인 조언을 하는 댓글러다. 짧고 자연스럽게 답해."
+          content: `
+너는 "${commenter.name}"이다.
+성격: ${commenter.style}
+
+짧고 자연스럽게 한 문단으로 답해.
+JSON 쓰지 마.
+`
         },
         {
           role: "user",
@@ -61,6 +88,7 @@ async function callAI(prompt) {
   });
 
   const data = await res.json();
+
   return data?.choices?.[0]?.message?.content || "답변 실패";
 }
 
@@ -72,24 +100,29 @@ async function handleComment(req, res) {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: "no prompt" });
 
-    const aiText = await callAI(prompt);
+    console.log("[POST comment multi AI]");
 
-    const parts = aiText
-      .split("\n")
-      .map(t => t.trim())
-      .filter(t => t.length > 0);
+    const selected = pickRandomCommenters(3);
 
+    // 🔥 병렬 AI 호출
+    const results = await Promise.all(
+      selected.map(async (c) => {
+        const text = await callAIForCommenter(prompt, c);
+        return {
+          commenter_id: c.id,
+          name: c.name,
+          text
+        };
+      })
+    );
+
+    // 🔥 Flutter 호환 (문자열 JSON)
     res.json({
       choices: [
         {
           message: {
-            // 🔥 문자열로 보내야 Flutter가 정상 파싱
             content: JSON.stringify({
-              comments: [
-                { text: parts[0] || aiText },
-                { text: parts[1] || aiText },
-                { text: parts[2] || aiText }
-              ]
+              comments: results
             })
           }
         }
@@ -124,6 +157,7 @@ app.post("/api/memo", async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     res.json({ ok: true, id: data.id });
+
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -148,6 +182,7 @@ app.get("/api/memos/:userId", async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     res.json(data);
+
   } catch (e) {
     res.status(500).json({ error: "server error" });
   }
@@ -171,6 +206,7 @@ app.delete("/api/memos/:id", async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     res.json({ ok: true });
+
   } catch (e) {
     res.status(500).json({ error: "server error" });
   }
