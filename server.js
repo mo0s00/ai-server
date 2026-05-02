@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v35-memos-crud-fixed";
+const SERVER_REV = "v36-full-api-fixed";
 
 // =========================
 // Supabase
@@ -33,6 +33,57 @@ app.get("/health", (_req, res) => {
     rev: SERVER_REV,
     supabaseConfigured: !!supabase,
   });
+});
+
+// =========================
+// COMMENT (핵심)
+// =========================
+app.post("/comment", async (req, res) => {
+  try {
+    const { prompt } = req.body;
+
+    if (!prompt) {
+      return res.status(400).json({ error: "no prompt" });
+    }
+
+    console.log("[POST /comment]");
+
+    // 🔥 테스트용 응답 (AI 붙이기 전)
+    res.json({
+      comments: [
+        { name: "도혁", text: "지금 시작이면 방향 잡는 게 먼저다\n작게라도 움직여라" },
+        { name: "현우", text: "처음이면 불안한 게 정상이다\n호흡부터 정리해라" },
+        { name: "유진", text: "이미 시작했다는 게 중요해\n그 흐름 계속 가져가" }
+      ]
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =========================
+// COMMENT SAVE
+// =========================
+app.post("/comment-save", async (req, res) => {
+  try {
+    console.log("[POST /comment-save]", req.body);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =========================
+// COMMENTER STATE
+// =========================
+app.post("/commenter-state", async (req, res) => {
+  try {
+    console.log("[POST /commenter-state]", req.body);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // =========================
@@ -69,28 +120,22 @@ app.get("/api/memos/:userId", async (req, res) => {
 
     const { userId } = req.params;
 
-    console.log("[GET /api/memos] userId:", userId);
-
     const { data, error } = await supabase
       .from("memos")
       .select("*")
       .eq("user_id", userId)
       .order("created_at", { ascending: false });
 
-    if (error) {
-      console.error("[GET memos error]", error);
-      return res.status(500).json({ error: error.message });
-    }
+    if (error) return res.status(500).json({ error: error.message });
 
     res.json(data);
   } catch (e) {
-    console.error("[GET memos crash]", e);
     res.status(500).json({ error: "server error" });
   }
 });
 
 // =========================
-// MEMO DELETE 🔥 (핵심 추가)
+// MEMO DELETE
 // =========================
 app.delete("/api/memos/:id", async (req, res) => {
   try {
@@ -99,21 +144,15 @@ app.delete("/api/memos/:id", async (req, res) => {
 
     const { id } = req.params;
 
-    console.log("[DELETE /api/memos] id:", id);
-
     const { error } = await supabase
       .from("memos")
       .delete()
       .eq("id", id);
 
-    if (error) {
-      console.error("[DELETE memos error]", error);
-      return res.status(500).json({ error: error.message });
-    }
+    if (error) return res.status(500).json({ error: error.message });
 
     res.json({ ok: true });
   } catch (e) {
-    console.error("[DELETE memos crash]", e);
     res.status(500).json({ error: "server error" });
   }
 });
