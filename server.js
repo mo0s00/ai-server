@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v36-full-api-fixed";
+const SERVER_REV = "v37-api-dual-route";
 
 // =========================
 // Supabase
@@ -36,9 +36,9 @@ app.get("/health", (_req, res) => {
 });
 
 // =========================
-// COMMENT (핵심)
+// COMMENT (공통 핸들러)
 // =========================
-app.post("/comment", async (req, res) => {
+async function handleComment(req, res) {
   try {
     const { prompt } = req.body;
 
@@ -46,9 +46,8 @@ app.post("/comment", async (req, res) => {
       return res.status(400).json({ error: "no prompt" });
     }
 
-    console.log("[POST /comment]");
+    console.log("[POST comment]");
 
-    // 🔥 테스트용 응답 (AI 붙이기 전)
     res.json({
       comments: [
         { name: "도혁", text: "지금 시작이면 방향 잡는 게 먼저다\n작게라도 움직여라" },
@@ -60,31 +59,41 @@ app.post("/comment", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+}
+
+// 🔥 핵심: 둘 다 지원
+app.post("/comment", handleComment);
+app.post("/api/comment", handleComment);
 
 // =========================
 // COMMENT SAVE
 // =========================
-app.post("/comment-save", async (req, res) => {
+function handleCommentSave(req, res) {
   try {
-    console.log("[POST /comment-save]", req.body);
+    console.log("[POST comment-save]", req.body);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+}
+
+app.post("/comment-save", handleCommentSave);
+app.post("/api/comment-save", handleCommentSave);
 
 // =========================
 // COMMENTER STATE
 // =========================
-app.post("/commenter-state", async (req, res) => {
+function handleCommenterState(req, res) {
   try {
-    console.log("[POST /commenter-state]", req.body);
+    console.log("[POST commenter-state]", req.body);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+}
+
+app.post("/commenter-state", handleCommenterState);
+app.post("/api/commenter-state", handleCommenterState);
 
 // =========================
 // MEMO SAVE
