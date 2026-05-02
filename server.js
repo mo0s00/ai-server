@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v34-memos-get-fixed";
+const SERVER_REV = "v35-memos-crud-fixed";
 
 // =========================
 // Supabase
@@ -60,7 +60,7 @@ app.post("/api/memo", async (req, res) => {
 });
 
 // =========================
-// MEMO GET (핵심 추가)
+// MEMO GET
 // =========================
 app.get("/api/memos/:userId", async (req, res) => {
   try {
@@ -85,6 +85,35 @@ app.get("/api/memos/:userId", async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error("[GET memos crash]", e);
+    res.status(500).json({ error: "server error" });
+  }
+});
+
+// =========================
+// MEMO DELETE 🔥 (핵심 추가)
+// =========================
+app.delete("/api/memos/:id", async (req, res) => {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "no supabase" });
+
+    const { id } = req.params;
+
+    console.log("[DELETE /api/memos] id:", id);
+
+    const { error } = await supabase
+      .from("memos")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.error("[DELETE memos error]", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE memos crash]", e);
     res.status(500).json({ error: "server error" });
   }
 });
