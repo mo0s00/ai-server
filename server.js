@@ -88,7 +88,7 @@ if (!apiKey) {
   });
 }
 
-const aiRes = await fetch("<https://api.deepseek.com/v1/chat/completions>", {
+const aiRes = await fetch("https://api.deepseek.com/v1/chat/completions", {
   method: "POST",
   headers: {
     Authorization: `Bearer ${apiKey}`,
