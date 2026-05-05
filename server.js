@@ -1,3 +1,5 @@
+// FORCE DEPLOY FINAL
+
 "use strict";
 
 import express from "express";
@@ -6,9 +8,9 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix server";
+const SERVER_REV = "force deploy final";
 
-// =========================
+// =========================2
 // Supabase
 // =========================
 function getSupabase() {
