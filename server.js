@@ -159,7 +159,7 @@ if (error) {
 return { memoUuid: null, err: error.message };
 }
 const row = Array.isArray(data) && data.length ? data[0] : null;
-if (!row || ![row.id](http://row.id/)) {
+if (!row || !row.id) {
 return {
 memoUuid: null,
 err:
@@ -167,7 +167,7 @@ err:
 `memos 테이블에 text 컬럼 local_id 를 추가하고 /memo 저장 시 넘기세요`,
 };
 }
-return { memoUuid: [row.id](http://row.id/), err: null };
+return { memoUuid: row.id, err: null };
 }
 
 function logSupabaseErr(label, err) {
@@ -680,7 +680,7 @@ cause && typeof cause === "object" && typeof cause.message === "string"
 const combined = `${msg} ${causeMsg}`.trim();
 console.error("[ai-server] POST /comment error:", combined);
 if (e && e.stack) console.error(e.stack);
-if (e && [e.name](http://e.name/) === "AbortError") {
+if (e && e.name === "AbortError") {
 return res.status(504).json({ text: "요청 시간이 초과되었습니다." });
 }
 if (
