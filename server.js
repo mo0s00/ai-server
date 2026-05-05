@@ -1141,6 +1141,20 @@ app.get("/api/comments-by-memo/:memoId", async (req, res) => {
 });
 
 
+app.get("/api/memos", async (req, res) => {
+  const supabase = getSupabase();
+  if (!supabase) return res.status(500).json({ error: "no supabase" });
+
+  const { data, error } = await supabase
+    .from("memos")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json(data || []);
+});
+
 app.post("/api/chat/message", (req, res) =>
   handleChatMessagePost(req, res, { requireSessionKey: false, extendRow: false }),
 );
