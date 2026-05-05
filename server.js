@@ -7,7 +7,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v70 community feed"
+const SERVER_REV = "fix: comments_kst 적용"
 
 let supabaseEnvLogged = false;
 
