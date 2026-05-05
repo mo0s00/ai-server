@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "v64-comment-ai-restore";
+const SERVER_REV = "fix server";
 
 // =========================
 // Supabase
