@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix supabase key syntax";
+const SERVER_REV = "fix deepseek fetch url";
 
 // =========================
 // Supabase
@@ -88,7 +88,7 @@ if (!apiKey) {
   });
 }
 
-const aiRes = await fetch("<https://api.deepseek.com/v1/chat/completions>", {
+const aiRes = await fetch("https://api.deepseek.com/v1/chat/completions", {
   method: "POST",
   headers: {
     Authorization: `Bearer ${apiKey}`,
