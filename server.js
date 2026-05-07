@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix memo duplicate race";
+const SERVER_REV = "fix memo heart api";
 
 // =========================
 // Supabase
@@ -58,7 +58,8 @@ app.get("/health", (_req, res) => {
       "POST /api/chat-message",
       "GET /api/chat-messages/:userId",
       "POST /api/cookie-tx",
-      "GET /api/cookie-tx/:userId"
+       "GET /api/cookie-tx/:userId",
+       "POST /api/memo-heart"
     ]
   });
 });
@@ -739,6 +740,76 @@ app.get("/api/cookie-tx/:userId", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// =========================
+// MEMO HEART +1
+// =========================
+app.post("/api/memo-heart", async (req, res) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const { memo_id } = req.body;
+
+    if (!memo_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "no memo_id"
+      });
+    }
+
+    // 현재 하트 수 조회
+    const { data: memo, error: getError } = await supabase
+      .from("memos")
+      .select("heart_count")
+      .eq("id", memo_id)
+      .single();
+
+    if (getError) {
+      console.error("[memo-heart get error]", getError);
+
+      return res.status(500).json({
+        ok: false,
+        error: getError.message
+      });
+    }
+
+    const nextHeart =
+      ((memo?.heart_count || 0) + 1);
+
+    // 증가 저장
+    const { data, error } = await supabase
+      .from("memos")
+      .update({
+        heart_count: nextHeart
+      })
+      .eq("id", memo_id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error("[memo-heart update error]", error);
+
+      return res.status(500).json({
+        ok: false,
+        error: error.message
+      });
+    }
+
+    res.json({
+      ok: true,
+      heart_count: data.heart_count
+    });
+  } catch (e) {
+    console.error("[memo-heart server error]", e);
+
+    res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+});
+
 
 // =========================
 // START
