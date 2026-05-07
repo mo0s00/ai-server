@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "add memo alias route";
+const SERVER_REV = "fix memo duplicate race";
 
 // =========================
 // Supabase
@@ -148,15 +148,17 @@ async function handleMemoPost(req, res) {
       });
     }
 
+    const row = {
+      user_id,
+      content,
+      local_id,
+    };
+
     const { data, error } = await supabase
       .from("memos")
-      .insert([
-        {
-          user_id,
-          content,
-          local_id,
-        },
-      ])
+      .upsert(row, {
+        onConflict: "user_id,local_id",
+      })
       .select()
       .single();
 
