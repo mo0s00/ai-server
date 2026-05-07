@@ -6,17 +6,17 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix memo duplicate race";
+const SERVER_REV = "fix supabase key syntax";
 
 // =========================
 // Supabase
 // =========================
 function getSupabase() {
 const url = (process.env.SUPABASE_URL || "").trim();
-const key = (a
-process.env.SUPABASE_SERVICE_ROLE_KEY ||
-process.env.SUPABASE_ANON_KEY ||
-""
+const key = (
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  ""
 ).trim();
 
 if (!url || !key) return null;
