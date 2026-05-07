@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "force deploy final";
+const SERVER_REV = "add public memo feed";
 
 // =========================
 // Supabase
@@ -155,6 +155,80 @@ app.post("/api/memo", async (req, res) => {
 });
 
 // =========================
+// PUBLIC MEMO FEED
+// =========================
+app.get("/api/memos/feed", async (req, res) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const limit = Number(req.query.limit || 30);
+    const offset = Number(req.query.offset || 0);
+    const embedComments = req.query.embed === "comments";
+
+    const { data: memos, error } = await supabase
+      .from("memos")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      console.error("[public memo feed error]", error);
+
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
+    }
+
+    if (!embedComments || !memos?.length) {
+      return res.json(memos || []);
+    }
+
+    const memoIds = memos.map((m) => m.id);
+
+    const { data: comments, error: commentError } = await supabase
+      .from("comments")
+      .select("*")
+      .in("memo_id", memoIds)
+      .order("created_at", { ascending: true });
+
+    if (commentError) {
+      console.error("[public memo comments error]", commentError);
+
+      return res.status(500).json({
+        ok: false,
+        error: commentError.message,
+      });
+    }
+
+    const commentMap = {};
+
+    for (const c of comments || []) {
+      if (!commentMap[c.memo_id]) {
+        commentMap[c.memo_id] = [];
+      }
+
+      commentMap[c.memo_id].push(c);
+    }
+
+    const result = memos.map((m) => ({
+      ...m,
+      comments: commentMap[m.id] || [],
+    }));
+
+    res.json(result);
+  } catch (e) {
+    console.error("[public memo feed server error]", e);
+
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
+// =========================
 // MEMO GET
 // =========================
 app.get("/api/memos/:userId", async (req, res) => {
@@ -172,13 +246,21 @@ app.get("/api/memos/:userId", async (req, res) => {
 
     if (error) {
       console.error("[memo get error]", error);
-      return res.status(500).json({ ok: false, error: error.message });
+
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
     }
 
     res.json(data || []);
   } catch (e) {
     console.error("[memo get server error]", e);
-    res.status(500).json({ ok: false, error: e.message });
+
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
   }
 });
 
