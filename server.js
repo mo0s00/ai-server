@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "add public memo feed";
+const SERVER_REV = "add memo alias route";
 
 // =========================
 // Supabase
@@ -126,34 +126,66 @@ app.post("/api/comment", handleComment);
 // =========================
 // MEMO SAVE
 // =========================
-app.post("/api/memo", async (req, res) => {
+
+async function handleMemoPost(req, res) {
   try {
     const supabase = requireSupabase(res);
     if (!supabase) return;
 
     const { user_id, content, local_id } = req.body;
 
-    if (!user_id) return res.status(400).json({ ok: false, error: "no user_id" });
-    if (!content) return res.status(400).json({ ok: false, error: "no content" });
+    if (!user_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "no user_id",
+      });
+    }
+
+    if (!content) {
+      return res.status(400).json({
+        ok: false,
+        error: "no content",
+      });
+    }
 
     const { data, error } = await supabase
       .from("memos")
-      .insert([{ user_id, content, local_id }])
+      .insert([
+        {
+          user_id,
+          content,
+          local_id,
+        },
+      ])
       .select()
       .single();
 
     if (error) {
       console.error("[memo save error]", error);
-      return res.status(500).json({ ok: false, error: error.message });
+
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
     }
 
-    res.json({ ok: true, id: data.id, data });
+    res.json({
+      ok: true,
+      id: data.id,
+      data,
+    });
   } catch (e) {
     console.error("[memo save server error]", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+}
+
+app.post("/memo", handleMemoPost);
+app.post("/api/memo", handleMemoPost);
 // =========================
 // PUBLIC MEMO FEED
 // =========================
