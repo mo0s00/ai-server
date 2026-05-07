@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix deepseek fetch url";
+const SERVER_REV = "fix fetch syntax";
 
 // =========================
 // Supabase
