@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix fetch syntax";
+const SERVER_REV = "fix deepseek fetch url";
 
 // =========================
 // Supabase
@@ -74,7 +74,7 @@ temperature = 0.82,
 maxTokens = 180
 } = req.body;
 
-```
+
 if (!prompt) {
   return res.status(400).json({ ok: false, error: "no prompt" });
 }
@@ -115,7 +115,7 @@ if (!aiRes.ok) {
 }
 
 res.type("application/json").send(raw);
-```
+
 
 } catch (e) {
 console.error("[comment server error]", e);
@@ -135,7 +135,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { user_id, content, local_id } = req.body;
 
 if (!user_id) {
@@ -180,17 +180,17 @@ res.json({
   id: data.id,
   data,
 });
-```
+
 
 } catch (e) {
 console.error("[memo save server error]", e);
 
-```
+
 res.status(500).json({
   ok: false,
   error: e.message,
 });
-```
+
 
 }
 }
@@ -205,7 +205,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const limit = Number(req.query.limit || 30);
 const offset = Number(req.query.offset || 0);
 const embedComments = req.query.embed === "comments";
@@ -262,17 +262,17 @@ const result = memos.map((m) => ({
 }));
 
 res.json(result);
-```
+
 
 } catch (e) {
 console.error("[public memo feed server error]", e);
 
-```
+
 res.status(500).json({
   ok: false,
   error: e.message,
 });
-```
+
 
 }
 });
@@ -285,7 +285,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { userId } = req.params;
 
 const { data, error } = await supabase
@@ -304,17 +304,17 @@ if (error) {
 }
 
 res.json(data || []);
-```
+
 
 } catch (e) {
 console.error("[memo get server error]", e);
 
-```
+
 res.status(500).json({
   ok: false,
   error: e.message,
 });
-```
+
 
 }
 });
@@ -327,7 +327,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { id } = req.params;
 
 const { error } = await supabase
@@ -341,7 +341,7 @@ if (error) {
 }
 
 res.json({ ok: true });
-```
+
 
 } catch (e) {
 console.error("[memo delete server error]", e);
@@ -357,7 +357,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { memo_id, user_id, commenter_id, sender, content } = req.body;
 
 if (!memo_id) return res.status(400).json({ ok: false, error: "no memo_id" });
@@ -412,7 +412,7 @@ if (error) {
 }
 
 res.json({ ok: true, data });
-```
+
 
 } catch (e) {
 console.error("[comment-save server error]", e);
@@ -428,7 +428,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { userId } = req.params;
 
 const { data, error } = await supabase
@@ -443,7 +443,7 @@ if (error) {
 }
 
 res.json(data || []);
-```
+
 
 } catch (e) {
 console.error("[comments get server error]", e);
@@ -459,7 +459,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const {
   user_id,
   commenter_id,
@@ -497,7 +497,7 @@ if (error) {
 }
 
 res.json({ ok: true, data });
-```
+
 
 } catch (e) {
 console.error("[commenter-state server error]", e);
@@ -513,7 +513,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { userId } = req.params;
 
 const { data, error } = await supabase
@@ -528,7 +528,7 @@ if (error) {
 }
 
 res.json(data || []);
-```
+
 
 } catch (e) {
 console.error("[commenter-state get server error]", e);
@@ -547,7 +547,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const {
   user_id,
   commenter_id,
@@ -589,7 +589,7 @@ if (error) {
 }
 
 res.json({ ok: true, data });
-```
+
 
 } catch (e) {
 console.error("[custom-prompts server error]", e);
@@ -605,7 +605,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { userId } = req.params;
 
 const { data, error } = await supabase
@@ -620,7 +620,7 @@ if (error) {
 }
 
 res.json(data || []);
-```
+
 
 } catch (e) {
 console.error("[custom-prompts get server error]", e);
@@ -636,7 +636,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const {
   user_id,
   session_key,
@@ -669,7 +669,7 @@ if (error) {
 }
 
 res.json({ ok: true, data });
-```
+
 
 } catch (e) {
 console.error("[chat-message server error]", e);
@@ -685,7 +685,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { userId } = req.params;
 const { session_key } = req.query;
 
@@ -707,7 +707,7 @@ if (error) {
 }
 
 res.json(data || []);
-```
+
 
 } catch (e) {
 console.error("[chat-messages get server error]", e);
@@ -723,7 +723,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const {
   user_id,
   delta,
@@ -755,7 +755,7 @@ if (error) {
 }
 
 res.json({ ok: true, data });
-```
+
 
 } catch (e) {
 console.error("[cookie-tx server error]", e);
@@ -771,7 +771,7 @@ try {
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
-```
+
 const { userId } = req.params;
 
 const { data, error } = await supabase
