@@ -786,7 +786,7 @@ if (error) {
 }
 
 res.json(data || []);
-```
+
 
 } catch (e) {
 console.error("[cookie-tx get server error]", e);
