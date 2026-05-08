@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "add memo like api";
+const SERVER_REV = "fix memo like local id";
 
 // =========================
 // Supabase
@@ -351,10 +351,12 @@ res.status(500).json({ ok: false, error: e.message });
 });
 
 // =========================
+// =========================
 // MEMO LIKE
 // =========================
 app.post("/api/memo-like", async (req, res) => {
 try {
+
 const supabase = requireSupabase(res);
 if (!supabase) return;
 
@@ -374,11 +376,42 @@ if (!user_id) {
   });
 }
 
+let realMemoId = memo_id;
+
+const uuidLike =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    memo_id
+  );
+
+if (!uuidLike) {
+
+  const { data: memo, error: memoError } = await supabase
+    .from("memos")
+    .select("id")
+    .eq("user_id", user_id)
+    .eq("local_id", memo_id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (memoError || !memo) {
+
+    console.error("[memo-like memo lookup error]", memoError);
+
+    return res.status(400).json({
+      ok: false,
+      error: "memo not found"
+    });
+  }
+
+  realMemoId = memo.id;
+}
+
 const { error: insertError } = await supabase
   .from("memo_likes")
   .insert([
     {
-      memo_id,
+      memo_id: realMemoId,
       user_id
     }
   ]);
@@ -387,6 +420,7 @@ if (
   insertError &&
   !insertError.message.includes("duplicate")
 ) {
+
   console.error("[memo-like insert error]", insertError);
 
   return res.status(500).json({
@@ -401,9 +435,10 @@ const { count, error: countError } = await supabase
     count: "exact",
     head: true
   })
-  .eq("memo_id", memo_id);
+  .eq("memo_id", realMemoId);
 
 if (countError) {
+
   console.error("[memo-like count error]", countError);
 
   return res.status(500).json({
@@ -417,14 +452,15 @@ res.json({
   heart_count: count || 0
 });
 
-
 } catch (e) {
+
 console.error("[memo-like server error]", e);
 
 res.status(500).json({
   ok: false,
   error: e.message
 });
+
 }
 });
 
