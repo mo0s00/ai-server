@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix deepseek fetch url";
+const SERVER_REV = "add memo like api";
 
 // =========================
 // Supabase
@@ -49,6 +49,7 @@ apis: [
 "GET /api/memos/:userId",
 "DELETE /api/memos/:id",
 "POST /api/comment-save",
+"POST /api/memo-like",
 "GET /api/comments/:userId",
 "POST /api/commenter-state",
 "GET /api/commenter-state/:userId",
@@ -346,6 +347,84 @@ res.json({ ok: true });
 } catch (e) {
 console.error("[memo delete server error]", e);
 res.status(500).json({ ok: false, error: e.message });
+}
+});
+
+// =========================
+// MEMO LIKE
+// =========================
+app.post("/api/memo-like", async (req, res) => {
+try {
+const supabase = requireSupabase(res);
+if (!supabase) return;
+
+const { memo_id, user_id } = req.body;
+
+if (!memo_id) {
+  return res.status(400).json({
+    ok: false,
+    error: "no memo_id"
+  });
+}
+
+if (!user_id) {
+  return res.status(400).json({
+    ok: false,
+    error: "no user_id"
+  });
+}
+
+const { error: insertError } = await supabase
+  .from("memo_likes")
+  .insert([
+    {
+      memo_id,
+      user_id
+    }
+  ]);
+
+if (
+  insertError &&
+  !insertError.message.includes("duplicate")
+) {
+  console.error("[memo-like insert error]", insertError);
+
+  return res.status(500).json({
+    ok: false,
+    error: insertError.message
+  });
+}
+
+const { count, error: countError } = await supabase
+  .from("memo_likes")
+  .select("*", {
+    count: "exact",
+    head: true
+  })
+  .eq("memo_id", memo_id);
+
+if (countError) {
+  console.error("[memo-like count error]", countError);
+
+  return res.status(500).json({
+    ok: false,
+    error: countError.message
+  });
+}
+
+res.json({
+  ok: true,
+  heart_count: count || 0
+});
+
+
+} catch (e) {
+console.error("[memo-like server error]", e);
+
+res.status(500).json({
+  ok: false,
+  error: e.message
+});
 }
 });
 
