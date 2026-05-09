@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix memo like local id";
+const SERVER_REV = "add comments by memo route";
 
 // =========================
 // Supabase
@@ -50,7 +50,7 @@ apis: [
 "DELETE /api/memos/:id",
 "POST /api/comment-save",
 "POST /api/memo-like",
-"GET /api/comments/:userId",
+"GET /api/comments-by-memo/:memoId",
 "POST /api/commenter-state",
 "GET /api/commenter-state/:userId",
 "GET /api/commenter-states/:userId",
@@ -565,6 +565,106 @@ console.error("[comments get server error]", e);
 res.status(500).json({ ok: false, error: e.message });
 }
 });
+
+// =========================
+// COMMENTS BY MEMO GET
+// =========================
+
+function isUuid(v) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+}
+
+async function handleCommentsByMemoGet(req, res) {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const raw = decodeURIComponent(
+      req.params.memoId || ""
+    ).trim();
+
+    if (!raw) {
+      return res.json([]);
+    }
+
+    let memoUuid = raw;
+
+    // local_id → 실제 UUID 변환
+    if (!isUuid(raw)) {
+      const userId =
+        typeof req.query.user_id === "string"
+          ? req.query.user_id.trim()
+          : "";
+
+      let q = supabase
+        .from("memos")
+        .select("id")
+        .eq("local_id", raw);
+
+      if (userId) {
+        q = q.eq("user_id", userId);
+      }
+
+      const { data: memo, error: memoError } = await q
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (memoError || !memo) {
+        console.error(
+          "[comments-by-memo memo lookup error]",
+          memoError
+        );
+
+        return res.json([]);
+      }
+
+      memoUuid = memo.id;
+    }
+
+    const { data, error } = await supabase
+      .from("comments")
+      .select("*")
+      .eq("memo_id", memoUuid)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.error(
+        "[comments-by-memo error]",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: error.message
+      });
+    }
+
+    res.json(data || []);
+
+  } catch (e) {
+
+    console.error(
+      "[comments-by-memo server error]",
+      e
+    );
+
+    res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+}
+
+app.get(
+  "/api/comments-by-memo/:memoId",
+  handleCommentsByMemoGet
+);
+
+app.get(
+  "/comments-by-memo/:memoId",
+  handleCommentsByMemoGet
+);
 
 // =========================
 // COMMENTER STATE SAVE
