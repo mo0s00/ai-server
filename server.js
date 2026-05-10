@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "add comments by memo route";
+const SERVER_REV = "fix memos embed comments";
 
 // =========================
 // Supabase
@@ -282,42 +282,77 @@ res.status(500).json({
 // MEMO GET
 // =========================
 app.get("/api/memos/:userId", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
 
+    const { userId } = req.params;
 
-const { userId } = req.params;
+    const embedComments =
+      typeof req.query.embed === "string" &&
+      req.query.embed.trim().toLowerCase() === "comments";
 
-const { data, error } = await supabase
-  .from("memos")
-  .select("*")
-  .eq("user_id", userId)
-  .order("created_at", { ascending: false });
+    const { data: memos, error } = await supabase
+      .from("memos")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
 
-if (error) {
-  console.error("[memo get error]", error);
+    if (error) {
+      console.error("[memo get error]", error);
 
-  return res.status(500).json({
-    ok: false,
-    error: error.message,
-  });
-}
+      return res.status(500).json({
+        ok: false,
+        error: error.message,
+      });
+    }
 
-res.json(data || []);
+    if (!embedComments || !memos?.length) {
+      return res.json(memos || []);
+    }
 
+    const memoIds = memos.map((m) => m.id);
 
-} catch (e) {
-console.error("[memo get server error]", e);
+    const { data: comments, error: commentError } = await supabase
+      .from("comments")
+      .select("*")
+      .in("memo_id", memoIds)
+      .order("created_at", { ascending: true });
 
+    if (commentError) {
+      console.error("[memo comments error]", commentError);
 
-res.status(500).json({
-  ok: false,
-  error: e.message,
-});
+      return res.status(500).json({
+        ok: false,
+        error: commentError.message,
+      });
+    }
 
+    const commentMap = {};
 
-}
+    for (const c of comments || []) {
+      if (!commentMap[c.memo_id]) {
+        commentMap[c.memo_id] = [];
+      }
+
+      commentMap[c.memo_id].push(c);
+    }
+
+    const result = memos.map((m) => ({
+      ...m,
+      comments: commentMap[m.id] || [],
+    }));
+
+    res.json(result);
+
+  } catch (e) {
+    console.error("[memo get server error]", e);
+
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
 });
 
 // =========================
