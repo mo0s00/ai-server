@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "add story cover endpoint";
+const SERVER_REV = "add story cover api";
 
 // =========================
 // Supabase
@@ -239,6 +239,7 @@ apis: [
 "POST /comment",
 "POST /api/comment",
 "POST /api/story-chat",
+"POST /api/story-cover-image",
 "POST /api/memo",
 "GET /api/memos/:userId",
 "DELETE /api/memos/:id",
@@ -401,6 +402,109 @@ app.post("/api/story-chat", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+
+// =========================
+// STORY COVER IMAGE
+// =========================
+app.post("/api/story-cover-image", async (req, res) => {
+  try {
+    const {
+      program_type = "story",
+      title = "",
+      opening = "",
+      mood = "",
+      partner = "",
+    } = req.body || {};
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "no OPENAI_API_KEY",
+      });
+    }
+
+    const prompt = `
+Create a premium cinematic vertical story cover background.
+
+Rules:
+- no text
+- no UI
+- background focused
+- cinematic composition
+- high quality dramatic lighting
+- suitable for mobile story chat background
+- no close-up faces unless silhouette is compositionally necessary
+
+Story context:
+Program: ${program_type}
+Title: ${title}
+Opening: ${opening}
+Mood: ${mood}
+Partner: ${partner}
+`.trim();
+
+    const r = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-image-1",
+        size: "1024x1536",
+        quality: "medium",
+        output_format: "png",
+        prompt
+      })
+    });
+
+    const raw = await r.text();
+
+    if (!r.ok) {
+      console.error("[story-cover openai error]", r.status, raw);
+
+      return res.status(r.status).json({
+        ok: false,
+        error: raw
+      });
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      return res.status(500).json({
+        ok: false,
+        error: "invalid openai response"
+      });
+    }
+
+    const imageBase64 = parsed?.data?.[0]?.b64_json || null;
+
+    if (!imageBase64) {
+      return res.status(500).json({
+        ok: false,
+        error: "no image returned"
+      });
+    }
+
+    res.json({
+      ok: true,
+      image_url: `data:image/png;base64,${imageBase64}`,
+      prompt_used: prompt
+    });
+
+  } catch (e) {
+    console.error("[story-cover server error]", e);
+
+    res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+});
+
 
 // =========================
 // MEMO SAVE
