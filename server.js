@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "fix memos embed comments";
+const SERVER_REV = "add story scene predictor";
 
 // =========================
 // Supabase
@@ -32,6 +32,199 @@ return null;
 return supabase;
 }
 
+
+// =========================
+// Story Scene Director (OpenAI)
+// =========================
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || process.env.openai_key || "").trim();
+const OPENAI_SCENE_MODEL = (process.env.OPENAI_SCENE_MODEL || "gpt-4o-mini").trim();
+
+const STORY_SCENE_KEYS = [
+  "default",
+  "royal_banquet",
+  "royal_private_room",
+  "palace_corridor",
+  "palace_garden",
+  "throne_room",
+  "war_room",
+  "secret_room",
+  "prison",
+  "fantasy_forest",
+  "fantasy_castle",
+  "battlefield",
+  "dungeon",
+  "village",
+  "dragon_lair",
+  "romance_cafe",
+  "restaurant",
+  "night_street",
+  "rain_street",
+  "rooftop_night",
+  "bedroom_night",
+  "science_roundtable",
+  "laboratory",
+  "auditorium",
+  "news_studio",
+  "debate_stage"
+];
+
+function safeJsonObjectFromText(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return null;
+
+  try {
+    return JSON.parse(t);
+  } catch (_) {}
+
+  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) {
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch (_) {}
+  }
+
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(t.slice(start, end + 1));
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+function normalizeSceneKey(value) {
+  const key = String(value || "").trim();
+  return STORY_SCENE_KEYS.includes(key) ? key : "default";
+}
+
+function normalizePreload(value, scene) {
+  const arr = Array.isArray(value) ? value : [];
+  const out = [];
+
+  for (const v of arr) {
+    const key = normalizeSceneKey(v);
+    if (key !== "default" && key !== scene && !out.includes(key)) {
+      out.push(key);
+    }
+    if (out.length >= 3) break;
+  }
+
+  return out;
+}
+
+async function predictStoryScene(contextText) {
+  if (!OPENAI_API_KEY) {
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_no_openai_key"
+    };
+  }
+
+  const safeContext = String(contextText || "").trim().slice(-9000);
+
+  if (!safeContext) {
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_empty_context"
+    };
+  }
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: OPENAI_SCENE_MODEL,
+      temperature: 0.25,
+      max_tokens: 220,
+      messages: [
+        {
+          role: "system",
+          content: `너는 AI 스토리 채팅방의 장면 감독이다.
+
+목표:
+- 사용자가 메시지를 보낸 직후, 캐릭터 답변이 표시될 때 어울릴 배경 scene을 고른다.
+- 현재 장면과 최근 대사 흐름을 보고 다음에 곧 필요할 수 있는 preload scene을 최대 3개 고른다.
+- 과장하지 말고, 대화 흐름상 자연스러운 장면만 선택한다.
+- 성적 노골 묘사나 미성년 관련 장면은 만들지 말고 일반적인 공간/분위기 배경만 고른다.
+
+허용 scene keys:
+${STORY_SCENE_KEYS.join("\n")}
+
+출력 규칙:
+- 반드시 JSON만 출력한다.
+- scene은 허용 scene keys 중 하나만 사용한다.
+- preload는 허용 scene keys 중 최대 3개만 사용한다.
+
+형식:
+{"scene":"royal_banquet","preload":["palace_corridor","palace_garden"]}`
+        },
+        {
+          role: "user",
+          content: safeContext
+        }
+      ]
+    })
+  });
+
+  const raw = await r.text();
+
+  if (!r.ok) {
+    console.error("[openai scene error]", r.status, raw);
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_openai_error"
+    };
+  }
+
+  try {
+    const upstream = JSON.parse(raw);
+    const content = upstream?.choices?.[0]?.message?.content || "";
+    const parsed = safeJsonObjectFromText(content);
+    const scene = normalizeSceneKey(parsed?.scene);
+
+    return {
+      scene,
+      preload: normalizePreload(parsed?.preload, scene),
+      source: "openai"
+    };
+  } catch (e) {
+    console.error("[scene parse error]", e, raw);
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_parse_error"
+    };
+  }
+}
+
+function plainTextFromDeepSeekJson(decoded) {
+  const text = decoded?.text;
+  if (typeof text === "string" && text.trim()) return text.trim();
+
+  const choices = decoded?.choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const first = choices[0];
+    const msgContent = first?.message?.content;
+    if (typeof msgContent === "string" && msgContent.trim()) {
+      return msgContent.trim();
+    }
+    const legacyText = first?.text;
+    if (typeof legacyText === "string" && legacyText.trim()) {
+      return legacyText.trim();
+    }
+  }
+
+  return "";
+}
+
 // =========================
 // Health
 // =========================
@@ -45,6 +238,7 @@ supabaseConfigured: !!supabase,
 apis: [
 "POST /comment",
 "POST /api/comment",
+"POST /api/story-chat",
 "POST /api/memo",
 "GET /api/memos/:userId",
 "DELETE /api/memos/:id",
@@ -126,6 +320,87 @@ res.status(500).json({ ok: false, error: e.message });
 
 app.post("/comment", handleComment);
 app.post("/api/comment", handleComment);
+
+
+// =========================
+// STORY CHAT (DeepSeek reply + OpenAI scene prediction)
+// =========================
+app.post("/api/story-chat", async (req, res) => {
+  try {
+    const {
+      prompt,
+      story_context = "",
+      temperature = 0.82,
+      maxTokens = 220
+    } = req.body;
+
+    if (!prompt) {
+      return res.status(400).json({ ok: false, error: "no prompt" });
+    }
+
+    const deepseekKey = (process.env.DEEPSEEK_API_KEY || "").trim();
+
+    if (!deepseekKey) {
+      return res.status(500).json({
+        ok: false,
+        error: "no DEEPSEEK_API_KEY"
+      });
+    }
+
+    const sceneContext = story_context || prompt;
+
+    const [deepseekRaw, sceneData] = await Promise.all([
+      fetch("https://api.deepseek.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${deepseekKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "deepseek-chat",
+          temperature,
+          max_tokens: maxTokens,
+          messages: [
+            {
+              role: "user",
+              content: prompt
+            }
+          ]
+        })
+      }),
+      predictStoryScene(sceneContext)
+    ]);
+
+    const raw = await deepseekRaw.text();
+
+    if (!deepseekRaw.ok) {
+      console.error("[story-chat deepseek error]", deepseekRaw.status, raw);
+      return res.status(deepseekRaw.status).send(raw);
+    }
+
+    let deepseekJson;
+    try {
+      deepseekJson = JSON.parse(raw);
+    } catch (_) {
+      deepseekJson = { text: raw };
+    }
+
+    const reply = plainTextFromDeepSeekJson(deepseekJson);
+
+    res.json({
+      ok: true,
+      reply,
+      scene: sceneData.scene,
+      preload: sceneData.preload,
+      scene_source: sceneData.source,
+      raw: deepseekJson
+    });
+
+  } catch (e) {
+    console.error("[story-chat server error]", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // =========================
 // MEMO SAVE
