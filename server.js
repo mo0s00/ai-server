@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-const SERVER_REV = "add story cover api";
+const SERVER_REV = "force deploy story cover route";
 
 // =========================
 // Supabase
