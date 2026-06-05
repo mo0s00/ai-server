@@ -1,13 +1,14 @@
 "use strict";
 
 import express from "express";
+import FormData from "form-data";
 import { createClient } from "@supabase/supabase-js";
 
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v39-story-image-edits-fallback";
+const SERVER_REV = "v40-story-image-formdata-array";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -1766,6 +1767,13 @@ async function requestOpenAiStoryImageGeneration(prompt) {
   });
 }
 
+async function readOpenAiStoryImageResponse(res, label) {
+  const raw = await res.text();
+  console.log(`[story-image openai ${label}] status=${res.status}`);
+  console.log(`[story-image openai ${label}] body=${raw}`);
+  return { ok: res.ok, status: res.status, raw };
+}
+
 async function requestOpenAiStoryImageEdits(prompt, referenceImages) {
   const refs = filterStoryReferenceImagesForApi(referenceImages);
   if (!refs.length) return null;
@@ -1776,19 +1784,26 @@ async function requestOpenAiStoryImageEdits(prompt, referenceImages) {
   form.append("size", "1024x1536");
   form.append("n", "1");
   for (const ref of refs) {
-    const blob = new Blob([ref.buf], { type: "image/png" });
-    form.append(
-      "image[]",
-      blob,
-      `${sanitizeStoryImagePathSegment(ref.name, 40)}.png`,
-    );
+    form.append("image[]", ref.buf, {
+      filename: `${sanitizeStoryImagePathSegment(ref.name, 40)}.png`,
+      contentType: "image/png",
+    });
   }
+
+  console.log(
+    "[story-image edits request]",
+    `refs=${refs.length}`,
+    `names=${refs.map((r) => r.name).join(",")}`,
+  );
+
   return fetch("https://api.openai.com/v1/images/edits", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
+      ...form.getHeaders(),
     },
     body: form,
+    duplex: "half",
   });
 }
 
@@ -1802,40 +1817,29 @@ async function generateStoryImageFromPrompt(
     throw new Error("no OPENAI_API_KEY");
   }
 
-  let imageRes = null;
-  let usedEdits = false;
+  let result;
 
   if (referenceImages.length > 0) {
     const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages);
     if (editsRes) {
-      usedEdits = true;
-      if (editsRes.ok) {
-        imageRes = editsRes;
-      } else {
-        const editsErr = await editsRes.text();
-        console.error(
-          "[story-image edits failed, fallback to generations]",
-          editsRes.status,
-          editsErr.slice(0, 500),
-        );
-        imageRes = await requestOpenAiStoryImageGeneration(prompt);
+      result = await readOpenAiStoryImageResponse(editsRes, "edits");
+      if (!result.ok) {
+        console.warn("[story-image edits failed, fallback to generations]");
+        const genRes = await requestOpenAiStoryImageGeneration(prompt);
+        result = await readOpenAiStoryImageResponse(genRes, "generations-fallback");
       }
     } else {
-      imageRes = await requestOpenAiStoryImageGeneration(prompt);
+      const genRes = await requestOpenAiStoryImageGeneration(prompt);
+      result = await readOpenAiStoryImageResponse(genRes, "generations");
     }
   } else {
-    imageRes = await requestOpenAiStoryImageGeneration(prompt);
+    const genRes = await requestOpenAiStoryImageGeneration(prompt);
+    result = await readOpenAiStoryImageResponse(genRes, "generations");
   }
 
-  const raw = await imageRes.text();
-  if (!imageRes.ok) {
-    console.error(
-      "[story-image openai error]",
-      usedEdits ? "edits+fallback" : "generations",
-      imageRes.status,
-      raw.slice(0, 500),
-    );
-    throw new Error(`image generation failed (${imageRes.status})`);
+  const raw = result.raw;
+  if (!result.ok) {
+    throw new Error(`image generation failed (${result.status})`);
   }
 
   let parsed;
