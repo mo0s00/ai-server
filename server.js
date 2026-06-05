@@ -7,9 +7,13 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v37-story-chat-restored";
+const SERVER_REV = "v38-openai-key-fallback";
 
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+const OPENAI_API_KEY = (
+  process.env.OPENAI_API_KEY ||
+  process.env.openai_key ||
+  ""
+).trim();
 const OPENAI_IMAGE_MODEL = (process.env.OPENAI_IMAGE_MODEL || "gpt-image-1").trim();
 const OPENAI_SCENE_MODEL = (process.env.OPENAI_SCENE_MODEL || "gpt-4o-mini").trim();
 
@@ -93,6 +97,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     rev: SERVER_REV,
     model: MODEL,
+    openaiConfigured: !!OPENAI_API_KEY,
     supabaseConfigured: !!(url && key),
     supabasePostPaths: [
       "POST /api/cookie-tx",
