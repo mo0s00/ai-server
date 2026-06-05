@@ -7,7 +7,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v38-openai-key-fallback";
+const SERVER_REV = "v39-story-image-edits-fallback";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -1725,6 +1725,73 @@ async function uploadStoryImageToSupabase(sessionKey, subfolder, fileStem, pngBu
   return data?.publicUrl || null;
 }
 
+const STORY_REF_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+
+function filterStoryReferenceImagesForApi(referenceImages) {
+  const out = [];
+  for (const ref of referenceImages) {
+    if (out.length >= 4) break;
+    let buf;
+    try {
+      buf = Buffer.from(ref.data, "base64");
+    } catch (_e) {
+      continue;
+    }
+    if (!buf?.length || buf.length > STORY_REF_IMAGE_MAX_BYTES) {
+      console.warn(
+        "[story-image] skip ref",
+        ref.name,
+        buf?.length ? `too large (${buf.length})` : "invalid",
+      );
+      continue;
+    }
+    out.push({ name: ref.name, buf });
+  }
+  return out;
+}
+
+async function requestOpenAiStoryImageGeneration(prompt) {
+  return fetch("https://api.openai.com/v1/images/generations", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_IMAGE_MODEL,
+      prompt,
+      size: "1024x1536",
+      n: 1,
+    }),
+  });
+}
+
+async function requestOpenAiStoryImageEdits(prompt, referenceImages) {
+  const refs = filterStoryReferenceImagesForApi(referenceImages);
+  if (!refs.length) return null;
+
+  const form = new FormData();
+  form.append("model", OPENAI_IMAGE_MODEL);
+  form.append("prompt", prompt);
+  form.append("size", "1024x1536");
+  form.append("n", "1");
+  for (const ref of refs) {
+    const blob = new Blob([ref.buf], { type: "image/png" });
+    form.append(
+      "image[]",
+      blob,
+      `${sanitizeStoryImagePathSegment(ref.name, 40)}.png`,
+    );
+  }
+  return fetch("https://api.openai.com/v1/images/edits", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: form,
+  });
+}
+
 async function generateStoryImageFromPrompt(
   prompt,
   sessionKey,
@@ -1735,49 +1802,39 @@ async function generateStoryImageFromPrompt(
     throw new Error("no OPENAI_API_KEY");
   }
 
-  let imageRes;
+  let imageRes = null;
+  let usedEdits = false;
+
   if (referenceImages.length > 0) {
-    const form = new FormData();
-    form.append("model", OPENAI_IMAGE_MODEL);
-    form.append("prompt", prompt);
-    form.append("size", "1024x1536");
-    form.append("n", "1");
-    form.append("input_fidelity", "high");
-    for (const ref of referenceImages) {
-      const buf = Buffer.from(ref.data, "base64");
-      const blob = new Blob([buf], { type: "image/png" });
-      form.append(
-        "image",
-        blob,
-        `${sanitizeStoryImagePathSegment(ref.name, 40)}.png`,
-      );
+    const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages);
+    if (editsRes) {
+      usedEdits = true;
+      if (editsRes.ok) {
+        imageRes = editsRes;
+      } else {
+        const editsErr = await editsRes.text();
+        console.error(
+          "[story-image edits failed, fallback to generations]",
+          editsRes.status,
+          editsErr.slice(0, 500),
+        );
+        imageRes = await requestOpenAiStoryImageGeneration(prompt);
+      }
+    } else {
+      imageRes = await requestOpenAiStoryImageGeneration(prompt);
     }
-    imageRes = await fetch("https://api.openai.com/v1/images/edits", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: form,
-    });
   } else {
-    imageRes = await fetch("https://api.openai.com/v1/images/generations", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: OPENAI_IMAGE_MODEL,
-        prompt,
-        size: "1024x1536",
-        n: 1,
-      }),
-    });
+    imageRes = await requestOpenAiStoryImageGeneration(prompt);
   }
 
   const raw = await imageRes.text();
   if (!imageRes.ok) {
-    console.error("[story-image openai error]", imageRes.status, raw.slice(0, 500));
+    console.error(
+      "[story-image openai error]",
+      usedEdits ? "edits+fallback" : "generations",
+      imageRes.status,
+      raw.slice(0, 500),
+    );
     throw new Error(`image generation failed (${imageRes.status})`);
   }
 
