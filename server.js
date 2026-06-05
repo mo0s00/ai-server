@@ -7,10 +7,11 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v36-story-image-character-refs";
+const SERVER_REV = "v37-story-chat-restored";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_IMAGE_MODEL = (process.env.OPENAI_IMAGE_MODEL || "gpt-image-1").trim();
+const OPENAI_SCENE_MODEL = (process.env.OPENAI_SCENE_MODEL || "gpt-4o-mini").trim();
 
 let supabaseEnvLogged = false;
 
@@ -107,6 +108,7 @@ app.get("/health", (_req, res) => {
       "GET /api/custom-prompts/:userId",
       "POST /api/comment-save",
       "POST /comment-save",
+      "POST /api/story-chat",
       "POST /api/story-cover-image",
       "POST /api/story-scene-image",
     ],
@@ -1265,6 +1267,289 @@ app.post("/api/chat-message", (req, res) =>
 app.post("/chat-message", (req, res) =>
   handleChatMessagePost(req, res, { requireSessionKey: true, extendRow: true }),
 );
+
+// =========================
+// STORY CHAT (DeepSeek reply + OpenAI scene prediction)
+// =========================
+
+const STORY_SCENE_KEYS = [
+  "default",
+  "royal_banquet",
+  "royal_private_room",
+  "palace_corridor",
+  "palace_garden",
+  "throne_room",
+  "war_room",
+  "secret_room",
+  "prison",
+  "fantasy_forest",
+  "fantasy_castle",
+  "battlefield",
+  "dungeon",
+  "village",
+  "dragon_lair",
+  "romance_cafe",
+  "restaurant",
+  "night_street",
+  "rain_street",
+  "rooftop_night",
+  "bedroom_night",
+  "science_roundtable",
+  "laboratory",
+  "auditorium",
+  "news_studio",
+  "debate_stage",
+];
+
+function safeJsonObjectFromText(raw) {
+  const t = String(raw || "").trim();
+  if (!t) return null;
+
+  try {
+    return JSON.parse(t);
+  } catch (_e) {
+    /* continue */
+  }
+
+  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) {
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch (_e) {
+      /* continue */
+    }
+  }
+
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(t.slice(start, end + 1));
+    } catch (_e) {
+      /* continue */
+    }
+  }
+
+  return null;
+}
+
+function normalizeStorySceneKey(value) {
+  const key = String(value || "").trim();
+  return STORY_SCENE_KEYS.includes(key) ? key : "default";
+}
+
+function normalizeStoryScenePreload(value, scene) {
+  const arr = Array.isArray(value) ? value : [];
+  const out = [];
+
+  for (const v of arr) {
+    const key = normalizeStorySceneKey(v);
+    if (key !== "default" && key !== scene && !out.includes(key)) {
+      out.push(key);
+    }
+    if (out.length >= 3) break;
+  }
+
+  return out;
+}
+
+async function predictStoryScene(contextText) {
+  if (!OPENAI_API_KEY) {
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_no_openai_key",
+    };
+  }
+
+  const safeContext = String(contextText || "").trim().slice(-9000);
+  if (!safeContext) {
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_empty_context",
+    };
+  }
+
+  const sceneRes = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_SCENE_MODEL,
+      temperature: 0.25,
+      max_tokens: 220,
+      messages: [
+        {
+          role: "system",
+          content: `You are the scene director for an AI story chat.
+
+Goals:
+- Pick the background scene key for the next character reply.
+- From current scene and recent dialogue, pick up to 3 preload scene keys that may be needed soon.
+- Stay natural to the dialogue flow; do not over-dramatize.
+
+Allowed scene keys:
+${STORY_SCENE_KEYS.join("\n")}
+
+Output rules:
+- JSON only.
+- scene must be one allowed key.
+- preload: up to 3 allowed keys.
+
+Format:
+{"scene":"royal_banquet","preload":["palace_corridor","palace_garden"]}`,
+        },
+        {
+          role: "user",
+          content: safeContext,
+        },
+      ],
+    }),
+  });
+
+  const raw = await sceneRes.text();
+  if (!sceneRes.ok) {
+    console.error("[story-chat scene error]", sceneRes.status, raw.slice(0, 400));
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_openai_error",
+    };
+  }
+
+  try {
+    const upstream = JSON.parse(raw);
+    const content = upstream?.choices?.[0]?.message?.content || "";
+    const parsed = safeJsonObjectFromText(content);
+    const scene = normalizeStorySceneKey(parsed?.scene);
+
+    return {
+      scene,
+      preload: normalizeStoryScenePreload(parsed?.preload, scene),
+      source: "openai",
+    };
+  } catch (e) {
+    console.error("[story-chat scene parse error]", e?.message || e);
+    return {
+      scene: "default",
+      preload: [],
+      source: "fallback_parse_error",
+    };
+  }
+}
+
+function plainTextFromDeepSeekJson(decoded) {
+  const choices = Array.isArray(decoded?.choices) ? decoded.choices : [];
+  const first = choices[0];
+  let out = assistantTextFromMessage(first && first.message);
+  if (out) return out;
+  if (first && typeof first.text === "string" && first.text.trim()) {
+    return first.text.trim();
+  }
+  const text = decoded?.text;
+  if (typeof text === "string" && text.trim()) return text.trim();
+  return "";
+}
+
+app.post("/api/story-chat", async (req, res) => {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+
+  try {
+    const promptRaw = req.body && req.body.prompt;
+    const storyContext = readString(req.body, "story_context");
+    const requestedTemperature = Number(req.body && req.body.temperature);
+    const requestedMaxTokens = Number(req.body && req.body.maxTokens);
+    const temperature =
+      Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
+        ? requestedTemperature
+        : 0.82;
+    const max_tokens =
+      Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
+        ? Math.min(2048, Math.floor(requestedMaxTokens))
+        : 620;
+
+    if (typeof promptRaw !== "string" || !promptRaw.trim()) {
+      return res.status(400).json({ ok: false, error: "no prompt" });
+    }
+
+    const deepseekKey = (process.env.DEEPSEEK_API_KEY || "").trim();
+    if (!deepseekKey) {
+      return res.status(500).json({ ok: false, error: "no DEEPSEEK_API_KEY" });
+    }
+
+    const cleanedPrompt = sanitizePromptForApi(promptRaw);
+    if (!cleanedPrompt) {
+      return res.status(400).json({ ok: false, error: "no prompt" });
+    }
+
+    const sceneContext = storyContext || cleanedPrompt;
+
+    await acquireDeepSeekSlot();
+    let deepseekRes;
+    let sceneData;
+    try {
+      [deepseekRes, sceneData] = await Promise.all([
+        fetch(DEEPSEEK_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${deepseekKey}`,
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify({
+            model: MODEL,
+            temperature,
+            max_tokens,
+            messages: [{ role: "user", content: cleanedPrompt }],
+          }),
+        }),
+        predictStoryScene(sceneContext),
+      ]);
+    } finally {
+      releaseDeepSeekSlot();
+    }
+
+    const raw = await deepseekRes.text();
+
+    if (!deepseekRes.ok) {
+      console.error("[story-chat deepseek error]", deepseekRes.status, raw.slice(0, 400));
+      const statusOut = deepseekRes.status >= 500 ? 502 : deepseekRes.status;
+      let errMsg = "deepseek failed";
+      try {
+        errMsg = deepSeekErrorMessage(JSON.parse(raw)) || errMsg;
+      } catch (_e) {
+        if (raw.trim()) errMsg = raw.slice(0, 200);
+      }
+      return res.status(statusOut).json({ ok: false, error: errMsg });
+    }
+
+    let deepseekJson;
+    try {
+      deepseekJson = JSON.parse(raw);
+    } catch (_e) {
+      deepseekJson = { text: raw };
+    }
+
+    const reply = plainTextFromDeepSeekJson(deepseekJson);
+    if (!reply) {
+      return res.status(502).json({ ok: false, error: "empty deepseek reply" });
+    }
+
+    return res.json({
+      ok: true,
+      reply,
+      scene: sceneData.scene,
+      preload: sceneData.preload,
+      scene_source: sceneData.source,
+      raw: deepseekJson,
+    });
+  } catch (e) {
+    console.error("[story-chat server error]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // =========================
 // STORY IMAGE GENERATION (GPT cover + scene backgrounds)
