@@ -3,1037 +3,1126 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 
-const app = express();
-app.use(express.json({ limit: "5mb" }));
+const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
+const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
+const FETCH_TIMEOUT_MS = 25000;
+/** Bump when changing behavior (check with GET /health). */
+const SERVER_REV = "v36-story-image-character-refs";
 
-const SERVER_REV = "force deploy story cover route";
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+const OPENAI_IMAGE_MODEL = (process.env.OPENAI_IMAGE_MODEL || "gpt-image-1").trim();
 
-// =========================
-// Supabase
-// =========================
+let supabaseEnvLogged = false;
+
+function logSupabaseInit() {
+  const url = (process.env.SUPABASE_URL || "").trim();
+  const hasServiceRole = !!(
+    process.env.SUPABASE_SERVICE_ROLE_KEY &&
+    String(process.env.SUPABASE_SERVICE_ROLE_KEY).trim()
+  );
+  const hasAnon = !!(process.env.SUPABASE_ANON_KEY && String(process.env.SUPABASE_ANON_KEY).trim());
+  console.log("[ai-server] SUPABASE INIT CHECK");
+  console.log("[ai-server]   SUPABASE_URL:", url || "(missing or empty)");
+  console.log("[ai-server]   SUPABASE_SERVICE_ROLE_KEY:", hasServiceRole ? "OK" : "MISSING");
+  console.log("[ai-server]   SUPABASE_ANON_KEY:", hasAnon ? "OK" : "MISSING");
+  console.log("[ai-server]   client can start:", url && (hasServiceRole || hasAnon) ? "yes" : "no");
+}
+
+function safeJsonForLog(value, maxLen) {
+  const n = maxLen === undefined ? 800 : maxLen;
+  try {
+    const s = typeof value === "string" ? value : JSON.stringify(value);
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  } catch (_e) {
+    return "[unserializable]";
+  }
+}
+
 function getSupabase() {
-const url = (process.env.SUPABASE_URL || "").trim();
-const key = (
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  ""
-).trim();
+  const url = (process.env.SUPABASE_URL || "").trim();
+  const key = (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    ""
+  ).trim();
 
-if (!url || !key) return null;
-return createClient(url, key);
+  if (!supabaseEnvLogged) {
+    supabaseEnvLogged = true;
+    console.log("[ai-server] getSupabase (first call) SUPABASE_URL:", url || "(empty)");
+    console.log(
+      "[ai-server] getSupabase (first call) SUPABASE_SERVICE_ROLE_KEY:",
+      process.env.SUPABASE_SERVICE_ROLE_KEY ? "OK" : "MISSING"
+    );
+    console.log(
+      "[ai-server] getSupabase (first call) SUPABASE_ANON_KEY:",
+      process.env.SUPABASE_ANON_KEY ? "OK" : "MISSING"
+    );
+  }
+
+  if (!url || !key) return null;
+  return createClient(url, key);
 }
 
 function requireSupabase(res) {
-const supabase = getSupabase();
-if (!supabase) {
-res.status(500).json({ ok: false, error: "no supabase" });
-return null;
-}
-return supabase;
-}
-
-
-// =========================
-// Story Scene Director (OpenAI)
-// =========================
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || process.env.openai_key || "").trim();
-const OPENAI_SCENE_MODEL = (process.env.OPENAI_SCENE_MODEL || "gpt-4o-mini").trim();
-
-const STORY_SCENE_KEYS = [
-  "default",
-  "royal_banquet",
-  "royal_private_room",
-  "palace_corridor",
-  "palace_garden",
-  "throne_room",
-  "war_room",
-  "secret_room",
-  "prison",
-  "fantasy_forest",
-  "fantasy_castle",
-  "battlefield",
-  "dungeon",
-  "village",
-  "dragon_lair",
-  "romance_cafe",
-  "restaurant",
-  "night_street",
-  "rain_street",
-  "rooftop_night",
-  "bedroom_night",
-  "science_roundtable",
-  "laboratory",
-  "auditorium",
-  "news_studio",
-  "debate_stage"
-];
-
-function safeJsonObjectFromText(raw) {
-  const t = String(raw || "").trim();
-  if (!t) return null;
-
-  try {
-    return JSON.parse(t);
-  } catch (_) {}
-
-  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced && fenced[1]) {
-    try {
-      return JSON.parse(fenced[1].trim());
-    } catch (_) {}
+  const supabase = getSupabase();
+  if (!supabase) {
+    console.error("[ai-server] Supabase not initialized (missing SUPABASE_URL or key)");
+    res.status(500).json({ error: "supabase not configured" });
+    return null;
   }
-
-  const start = t.indexOf("{");
-  const end = t.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    try {
-      return JSON.parse(t.slice(start, end + 1));
-    } catch (_) {}
-  }
-
-  return null;
+  return supabase;
 }
 
-function normalizeSceneKey(value) {
-  const key = String(value || "").trim();
-  return STORY_SCENE_KEYS.includes(key) ? key : "default";
-}
+const app = express();
+/** 피메모+[검증된 사실] 등 긴 프롬프트 — 1mb 초과 시 express가 본문 파싱 단계에서 실패할 수 있음 */
+app.use(express.json({ limit: "30mb" }));
 
-function normalizePreload(value, scene) {
-  const arr = Array.isArray(value) ? value : [];
-  const out = [];
+process.on("unhandledRejection", (reason) => {
+  console.log("[ai-server] unhandledRejection:", reason);
+});
 
-  for (const v of arr) {
-    const key = normalizeSceneKey(v);
-    if (key !== "default" && key !== scene && !out.includes(key)) {
-      out.push(key);
-    }
-    if (out.length >= 3) break;
-  }
-
-  return out;
-}
-
-async function predictStoryScene(contextText) {
-  if (!OPENAI_API_KEY) {
-    return {
-      scene: "default",
-      preload: [],
-      source: "fallback_no_openai_key"
-    };
-  }
-
-  const safeContext = String(contextText || "").trim().slice(-9000);
-
-  if (!safeContext) {
-    return {
-      scene: "default",
-      preload: [],
-      source: "fallback_empty_context"
-    };
-  }
-
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: OPENAI_SCENE_MODEL,
-      temperature: 0.25,
-      max_tokens: 220,
-      messages: [
-        {
-          role: "system",
-          content: `너는 AI 스토리 채팅방의 장면 감독이다.
-
-목표:
-- 사용자가 메시지를 보낸 직후, 캐릭터 답변이 표시될 때 어울릴 배경 scene을 고른다.
-- 현재 장면과 최근 대사 흐름을 보고 다음에 곧 필요할 수 있는 preload scene을 최대 3개 고른다.
-- 과장하지 말고, 대화 흐름상 자연스러운 장면만 선택한다.
-- 성적 노골 묘사나 미성년 관련 장면은 만들지 말고 일반적인 공간/분위기 배경만 고른다.
-
-허용 scene keys:
-${STORY_SCENE_KEYS.join("\n")}
-
-출력 규칙:
-- 반드시 JSON만 출력한다.
-- scene은 허용 scene keys 중 하나만 사용한다.
-- preload는 허용 scene keys 중 최대 3개만 사용한다.
-
-형식:
-{"scene":"royal_banquet","preload":["palace_corridor","palace_garden"]}`
-        },
-        {
-          role: "user",
-          content: safeContext
-        }
-      ]
-    })
+app.get("/health", (_req, res) => {
+  const url = (process.env.SUPABASE_URL || "").trim();
+  const key = (
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    ""
+  ).trim();
+  res.json({
+    ok: true,
+    rev: SERVER_REV,
+    model: MODEL,
+    supabaseConfigured: !!(url && key),
+    supabasePostPaths: [
+      "POST /api/cookie-tx",
+      "POST /api/commenter-state",
+      "POST /commenter-state",
+      "POST /api/memo",
+      "POST /memo",
+      "POST /api/chat/message",
+      "POST /api/chat-message",
+      "POST /api/custom-prompt",
+      "POST /api/custom-prompts (same handler as custom-prompt)",
+      "GET /api/custom-prompts?user_id=…",
+      "GET /api/custom-prompts/:userId",
+      "POST /api/comment-save",
+      "POST /comment-save",
+      "POST /api/story-cover-image",
+      "POST /api/story-scene-image",
+    ],
   });
+});
 
-  const raw = await r.text();
+function readString(body, key) {
+  const v = body && body[key];
+  return typeof v === "string" ? v.trim() : "";
+}
 
-  if (!r.ok) {
-    console.error("[openai scene error]", r.status, raw);
+function readInt(body, key, fallback) {
+  const v = body && body[key];
+  if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
+  if (typeof v === "string" && v.trim()) {
+    const n = parseInt(v, 10);
+    if (Number.isFinite(n)) return n;
+  }
+  return fallback;
+}
+
+function readBool(body, key) {
+  const v = body && body[key];
+  if (v === true || v === false) return v;
+  return false;
+}
+
+function isUuid(s) {
+  return (
+    typeof s === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      s.trim()
+    )
+  );
+}
+
+/** comments.memo_id 가 uuid 일 때: 앱이 보내는 로컬 왕관 id → memos.id(uuid) 로 치환 */
+async function resolveMemoUuidForComment(supabase, userId, memoIdRaw) {
+  const raw = (memoIdRaw || "").trim();
+  if (!raw) {
+    return { memoUuid: null, err: "empty memo_id" };
+  }
+  if (isUuid(raw)) {
+    return { memoUuid: raw, err: null };
+  }
+  const { data, error } = await supabase
+    .from("memos")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("local_id", raw)
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (error) {
+    return { memoUuid: null, err: error.message };
+  }
+  const row = Array.isArray(data) && data.length ? data[0] : null;
+  if (!row || !row.id) {
     return {
-      scene: "default",
-      preload: [],
-      source: "fallback_openai_error"
+      memoUuid: null,
+      err:
+        `no memos row for local_id="${raw}" user_id="${userId}" — ` +
+        `memos 테이블에 text 컬럼 local_id 를 추가하고 /memo 저장 시 넘기세요`,
     };
   }
+  return { memoUuid: row.id, err: null };
+}
 
+function logSupabaseErr(label, err) {
+  console.log(`❌ ${label}:`, err?.message || err);
   try {
-    const upstream = JSON.parse(raw);
-    const content = upstream?.choices?.[0]?.message?.content || "";
-    const parsed = safeJsonObjectFromText(content);
-    const scene = normalizeSceneKey(parsed?.scene);
-
-    return {
-      scene,
-      preload: normalizePreload(parsed?.preload, scene),
-      source: "openai"
-    };
-  } catch (e) {
-    console.error("[scene parse error]", e, raw);
-    return {
-      scene: "default",
-      preload: [],
-      source: "fallback_parse_error"
-    };
+    console.log(`❌ ${label} (full):`, JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
+  } catch (_) {
+    console.log(`❌ ${label} (raw):`, err);
   }
 }
 
-function plainTextFromDeepSeekJson(decoded) {
-  const text = decoded?.text;
-  if (typeof text === "string" && text.trim()) return text.trim();
-
-  const choices = decoded?.choices;
-  if (Array.isArray(choices) && choices.length > 0) {
-    const first = choices[0];
-    const msgContent = first?.message?.content;
-    if (typeof msgContent === "string" && msgContent.trim()) {
-      return msgContent.trim();
-    }
-    const legacyText = first?.text;
-    if (typeof legacyText === "string" && legacyText.trim()) {
-      return legacyText.trim();
-    }
-  }
-
+/** DeepSeek/호환 API 오류 본문에서 사람이 읽을 문자열만 뽑는다. */
+function deepSeekErrorMessage(json) {
+  if (!json || typeof json !== "object") return "";
+  const e = json.error;
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object" && typeof e.message === "string") return e.message;
+  if (typeof json.message === "string") return json.message;
   return "";
 }
 
-// =========================
-// Health
-// =========================
-app.get("/health", (_req, res) => {
-const supabase = getSupabase();
-
-res.json({
-ok: true,
-rev: SERVER_REV,
-supabaseConfigured: !!supabase,
-apis: [
-"POST /comment",
-"POST /api/comment",
-"POST /api/story-chat",
-"POST /api/story-cover-image",
-"POST /api/memo",
-"GET /api/memos/:userId",
-"DELETE /api/memos/:id",
-"POST /api/comment-save",
-"POST /api/memo-like",
-"GET /api/comments-by-memo/:memoId",
-"POST /api/commenter-state",
-"GET /api/commenter-state/:userId",
-"GET /api/commenter-states/:userId",
-"POST /api/custom-prompts",
-"GET /api/custom-prompts/:userId",
-"POST /api/chat-message",
-"GET /api/chat-messages/:userId",
-"POST /api/cookie-tx",
-"GET /api/cookie-tx/:userId"
-]
-});
-});
-
-// =========================
-// COMMENT AI
-// =========================
-async function handleComment(req, res) {
-try {
-const {
-prompt,
-temperature = 0.82,
-maxTokens = 180
-} = req.body;
-
-
-if (!prompt) {
-  return res.status(400).json({ ok: false, error: "no prompt" });
+/** Null 등 API 페이로드를 깨뜨릴 수 있는 문자 제거 */
+function sanitizePromptForApi(raw) {
+  if (typeof raw !== "string") return "";
+  return raw.replace(/\u0000/g, "").trim();
 }
 
-const apiKey = (process.env.DEEPSEEK_API_KEY || "").trim();
+const MAX_PROMPT_CHARS = Math.max(
+  8_000,
+  Number.parseInt(process.env.MAX_PROMPT_CHARS || "100000", 10) || 100_000
+);
 
-if (!apiKey) {
-  return res.status(500).json({
-    ok: false,
-    error: "no DEEPSEEK_API_KEY"
-  });
-}
-
-const aiRes = await fetch("https://api.deepseek.com/v1/chat/completions", {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${apiKey}`,
-    "Content-Type": "application/json"
-  },
-  body: JSON.stringify({
-    model: "deepseek-chat",
-    temperature,
-    max_tokens: maxTokens,
-    messages: [
-      {
-        role: "user",
-        content: prompt
+/** `message.content` — 문자열·배열·구조화 객체({ comments })·null */
+function assistantTextFromContent(c) {
+  if (typeof c === "string") return c.trim();
+  if (c == null) return "";
+  if (Array.isArray(c)) {
+    const parts = [];
+    for (const part of c) {
+      if (typeof part === "string") parts.push(part);
+      else if (part && typeof part === "object") {
+        if (typeof part.text === "string") parts.push(part.text);
+        else if (part.type === "text" && typeof part.text === "string") {
+          parts.push(part.text);
+        }
       }
-    ]
-  })
-});
-
-const raw = await aiRes.text();
-
-if (!aiRes.ok) {
-  console.error("[comment ai error]", aiRes.status, raw);
-  return res.status(aiRes.status).send(raw);
-}
-
-res.type("application/json").send(raw);
-
-
-} catch (e) {
-console.error("[comment server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-}
-
-app.post("/comment", handleComment);
-app.post("/api/comment", handleComment);
-
-
-// =========================
-// STORY CHAT (DeepSeek reply + OpenAI scene prediction)
-// =========================
-app.post("/api/story-chat", async (req, res) => {
-  try {
-    const {
-      prompt,
-      story_context = "",
-      temperature = 0.82,
-      maxTokens = 220
-    } = req.body;
-
-    if (!prompt) {
-      return res.status(400).json({ ok: false, error: "no prompt" });
     }
-
-    const deepseekKey = (process.env.DEEPSEEK_API_KEY || "").trim();
-
-    if (!deepseekKey) {
-      return res.status(500).json({
-        ok: false,
-        error: "no DEEPSEEK_API_KEY"
-      });
-    }
-
-    const sceneContext = story_context || prompt;
-
-    const [deepseekRaw, sceneData] = await Promise.all([
-      fetch("https://api.deepseek.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${deepseekKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: "deepseek-chat",
-          temperature,
-          max_tokens: maxTokens,
-          messages: [
-            {
-              role: "user",
-              content: prompt
-            }
-          ]
-        })
-      }),
-      predictStoryScene(sceneContext)
-    ]);
-
-    const raw = await deepseekRaw.text();
-
-    if (!deepseekRaw.ok) {
-      console.error("[story-chat deepseek error]", deepseekRaw.status, raw);
-      return res.status(deepseekRaw.status).send(raw);
-    }
-
-    let deepseekJson;
-    try {
-      deepseekJson = JSON.parse(raw);
-    } catch (_) {
-      deepseekJson = { text: raw };
-    }
-
-    const reply = plainTextFromDeepSeekJson(deepseekJson);
-
-    res.json({
-      ok: true,
-      reply,
-      scene: sceneData.scene,
-      preload: sceneData.preload,
-      scene_source: sceneData.source,
-      raw: deepseekJson
-    });
-
-  } catch (e) {
-    console.error("[story-chat server error]", e);
-    res.status(500).json({ ok: false, error: e.message });
+    return parts.join("").trim();
   }
-});
-
-
-// =========================
-// STORY COVER IMAGE
-// =========================
-app.post("/api/story-cover-image", async (req, res) => {
-  try {
-    const {
-      program_type = "story",
-      title = "",
-      opening = "",
-      mood = "",
-      partner = "",
-    } = req.body || {};
-
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: "no OPENAI_API_KEY",
-      });
-    }
-
-    const prompt = `
-Create a premium cinematic vertical story cover background.
-
-Rules:
-- no text
-- no UI
-- background focused
-- cinematic composition
-- high quality dramatic lighting
-- suitable for mobile story chat background
-- no close-up faces unless silhouette is compositionally necessary
-
-Story context:
-Program: ${program_type}
-Title: ${title}
-Opening: ${opening}
-Mood: ${mood}
-Partner: ${partner}
-`.trim();
-
-    const r = await fetch("https://api.openai.com/v1/images/generations", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "gpt-image-1",
-        size: "1024x1536",
-        quality: "medium",
-        output_format: "png",
-        prompt
-      })
-    });
-
-    const raw = await r.text();
-
-    if (!r.ok) {
-      console.error("[story-cover openai error]", r.status, raw);
-
-      return res.status(r.status).json({
-        ok: false,
-        error: raw
-      });
-    }
-
-    let parsed;
+  if (typeof c === "object") {
     try {
-      parsed = JSON.parse(raw);
+      return JSON.stringify(c);
     } catch (_) {
-      return res.status(500).json({
-        ok: false,
-        error: "invalid openai response"
-      });
+      return "";
     }
-
-    const imageBase64 = parsed?.data?.[0]?.b64_json || null;
-
-    if (!imageBase64) {
-      return res.status(500).json({
-        ok: false,
-        error: "no image returned"
-      });
-    }
-
-    res.json({
-      ok: true,
-      image_url: `data:image/png;base64,${imageBase64}`,
-      prompt_used: prompt
-    });
-
-  } catch (e) {
-    console.error("[story-cover server error]", e);
-
-    res.status(500).json({
-      ok: false,
-      error: e.message
-    });
   }
+  return "";
+}
+
+/**
+ * deepseek-reasoner / thinking 응답에서 `content`가 비고 `reasoning_content`만 채워진 경우.
+ * 사용자에게 보일 짧은 본문은 보통 맨 끝 단락에 가깝다.
+ */
+function assistantTextFromReasoning(reasoningRaw) {
+  if (typeof reasoningRaw !== "string") return "";
+  let t = reasoningRaw.replace(/\r\n/g, "\n").trim();
+  if (!t) return "";
+  const max = 8000;
+  if (t.length > max) {
+    t = t.slice(-max);
+  }
+  const paras = t
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (paras.length >= 1) {
+    return paras[paras.length - 1];
+  }
+  return t;
+}
+
+/** DeepSeek/호환 API assistant 메시지 */
+function assistantTextFromMessage(msgObj) {
+  if (!msgObj || typeof msgObj !== "object") return "";
+  let out = assistantTextFromContent(msgObj.content);
+  if (out) return out;
+  if (typeof msgObj.reasoning_content === "string") {
+    out = assistantTextFromReasoning(msgObj.reasoning_content);
+    if (out) return out;
+  }
+  return "";
+}
+
+/** DeepSeek 동시 outbound 제한(Render·API 과부하·일시 차단 완화) */
+const DEEPSEEK_MAX_CONCURRENT = Math.max(
+  1,
+  Number.parseInt(process.env.DEEPSEEK_MAX_CONCURRENT || "3", 10) || 3
+);
+let dsPermits = DEEPSEEK_MAX_CONCURRENT;
+const dsWaitQueue = [];
+
+function acquireDeepSeekSlot() {
+  return new Promise((resolve) => {
+    if (dsPermits > 0) {
+      dsPermits--;
+      resolve();
+    } else {
+      dsWaitQueue.push(resolve);
+    }
+  });
+}
+
+function releaseDeepSeekSlot() {
+  if (dsWaitQueue.length > 0) {
+    const next = dsWaitQueue.shift();
+    next();
+  } else {
+    dsPermits++;
+  }
+}
+
+/** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
+function isGarbageModelLine(s, modelStr) {
+  const model = typeof modelStr === "string" && modelStr.trim() ? modelStr.trim() : "deepseek-chat";
+  if (!s || typeof s !== "string") return false;
+  let t = s
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .normalize("NFKC")
+    .replace(/\uFF1A/g, ":")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t) return false;
+  const expected = `model: ${model}`;
+  if (t === expected) return true;
+  if (t.toLowerCase() === expected.toLowerCase()) return true;
+  const compact = t.replace(/\s/g, "");
+  const compactExpected = expected.replace(/\s/g, "");
+  if (compact === compactExpected) return true;
+  if (/^model\s*:\s*(claude-|deepseek-)/i.test(t)) return true;
+  return false;
+}
+
+app.get("/comment", (_req, res) => {
+  res.status(200).json({ text: "" });
 });
 
+app.get("/api/comment", (_req, res) => {
+  res.status(200).json({ text: "" });
+});
 
 // =========================
-// MEMO SAVE
+// 메모 저장 (local_id = 앱 왕관 TodoItem.id, comments FK 용)
 // =========================
-
 async function handleMemoPost(req, res) {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
 
+    const user_id = readString(req.body, "user_id");
+    const content = readString(req.body, "content");
+    const local_id = readString(req.body, "local_id");
+    if (!user_id || !content) {
+      return res.status(400).json({ error: "user_id, content 필요" });
+    }
 
-const { user_id, content, local_id } = req.body;
+    const row = { user_id, content };
+    if (local_id) row.local_id = local_id;
 
-if (!user_id) {
-  return res.status(400).json({
-    ok: false,
-    error: "no user_id",
-  });
-}
+    // 동일 (user_id, local_id)는 DB 유니크 + upsert로 한 행만 유지(동시 POST 레이스 방지).
+    if (local_id) {
+      const { data: upserted, error: upErr } = await supabase
+        .from("memos")
+        .upsert(row, { onConflict: "user_id,local_id" })
+        .select("id")
+        .single();
 
-if (!content) {
-  return res.status(400).json({
-    ok: false,
-    error: "no content",
-  });
-}
+      if (upErr) {
+        logSupabaseErr("[memo] upsert", upErr);
+        return res.status(500).json({ error: upErr.message });
+      }
+      if (!upserted?.id) {
+        return res.status(500).json({ error: "memo upsert 응답 없음" });
+      }
+      console.log(
+        "✅ memo upsert id=",
+        upserted.id,
+        `local_id=${local_id}`,
+      );
+      return res.json({ ok: true, id: upserted.id, upserted: true });
+    }
 
-const row = {
-  user_id,
-  content,
-  local_id,
-};
+    const { data, error } = await supabase
+      .from("memos")
+      .insert([row])
+      .select("id")
+      .single();
 
-const { data, error } = await supabase
-  .from("memos")
-  .upsert(row, {
-    onConflict: "user_id,local_id",
-  })
-  .select()
-  .single();
+    if (error) {
+      logSupabaseErr("[memo] insert", error);
+      return res.status(500).json({ error: error.message });
+    }
 
-if (error) {
-  console.error("[memo save error]", error);
-
-  return res.status(500).json({
-    ok: false,
-    error: error.message,
-  });
-}
-
-res.json({
-  ok: true,
-  id: data.id,
-  data,
-});
-
-
-} catch (e) {
-console.error("[memo save server error]", e);
-
-
-res.status(500).json({
-  ok: false,
-  error: e.message,
-});
-
-
-}
+    console.log("✅ memo saved id=", data?.id, local_id ? `local_id=${local_id}` : "");
+    res.json({ ok: true, id: data.id });
+  } catch (e) {
+    console.log("[memo]", e);
+    res.status(500).json({ error: "server error" });
+  }
 }
 
 app.post("/memo", handleMemoPost);
 app.post("/api/memo", handleMemoPost);
-// =========================
-// PUBLIC MEMO FEED
-// =========================
-app.get("/api/memos/feed", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
 
-
-const limit = Number(req.query.limit || 30);
-const offset = Number(req.query.offset || 0);
-const embedComments = req.query.embed === "comments";
-
-const { data: memos, error } = await supabase
-  .from("memos")
-  .select("*")
-  .order("created_at", { ascending: false })
-  .range(offset, offset + limit - 1);
-
-if (error) {
-  console.error("[public memo feed error]", error);
-
-  return res.status(500).json({
-    ok: false,
-    error: error.message,
-  });
-}
-
-if (!embedComments || !memos?.length) {
-  return res.json(memos || []);
-}
-
-const memoIds = memos.map((m) => m.id);
-
-const { data: comments, error: commentError } = await supabase
-  .from("comments")
-  .select("*")
-  .in("memo_id", memoIds)
-  .order("created_at", { ascending: true });
-
-if (commentError) {
-  console.error("[public memo comments error]", commentError);
-
-  return res.status(500).json({
-    ok: false,
-    error: commentError.message,
-  });
-}
-
-const commentMap = {};
-
-for (const c of comments || []) {
-  if (!commentMap[c.memo_id]) {
-    commentMap[c.memo_id] = [];
-  }
-
-  commentMap[c.memo_id].push(c);
-}
-
-const result = memos.map((m) => ({
-  ...m,
-  comments: commentMap[m.id] || [],
-}));
-
-res.json(result);
-
-
-} catch (e) {
-console.error("[public memo feed server error]", e);
-
-
-res.status(500).json({
-  ok: false,
-  error: e.message,
-});
-
-
-}
-});
-
-// =========================
-// MEMO GET
-// =========================
-app.get("/api/memos/:userId", async (req, res) => {
+/// 전체 사용자 메모 피드 — `GET /api/memos/feed?limit=40&offset=0&embed=comments`
+/// [embed=comments]이면 같은 묶음의 memos에 `comments` 배열을 붙여 한 번에 반환(N+1 방지).
+/// `:userId` 라우트보다 **먼저** 등록해야 `userId=feed` 오인 없음.
+async function handleMemosFeedGet(req, res) {
   try {
-    const supabase = requireSupabase(res);
-    if (!supabase) return;
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
 
-    const { userId } = req.params;
+    const limRaw = req.query && req.query.limit;
+    const offRaw = req.query && req.query.offset;
+    let limit = 40;
+    let offset = 0;
+    if (typeof limRaw === "string" && limRaw.trim()) {
+      const n = parseInt(limRaw, 10);
+      if (Number.isFinite(n)) limit = Math.min(120, Math.max(1, n));
+    }
+    if (typeof offRaw === "string" && offRaw.trim()) {
+      const n = parseInt(offRaw, 10);
+      if (Number.isFinite(n)) offset = Math.max(0, n);
+    }
 
-    const embedComments =
-      typeof req.query.embed === "string" &&
+    const embed =
+      typeof req.query?.embed === "string" &&
       req.query.embed.trim().toLowerCase() === "comments";
 
+    const hi = offset + limit - 1;
     const { data: memos, error } = await supabase
+      .from("memos")
+      .select("id, user_id, content, local_id, created_at")
+      .order("created_at", { ascending: false })
+      .range(offset, hi);
+
+    if (error) {
+      logSupabaseErr("[memos-feed] select", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const list = memos || [];
+    if (!embed || list.length === 0) {
+      return res.json(list);
+    }
+
+    const ids = list.map((m) => m && m.id).filter(Boolean);
+    const { data: comments, error: cErr } = await supabase
+      .from("comments")
+      .select("*")
+      .in("memo_id", ids)
+      .order("created_at", { ascending: true });
+
+    if (cErr) {
+      logSupabaseErr("[memos-feed] comments", cErr);
+      return res.status(500).json({ error: cErr.message });
+    }
+
+    /** @type {Record<string, any[]>} */
+    const bucket = Object.create(null);
+    for (const row of comments || []) {
+      const k = row.memo_id;
+      if (!bucket[k]) bucket[k] = [];
+      bucket[k].push(row);
+    }
+
+    const out = list.map((m) => ({
+      ...m,
+      comments: bucket[m.id] || [],
+    }));
+    res.json(out);
+  } catch (e) {
+    console.log("[memos-feed]", e);
+    res.status(500).json({ error: "server error" });
+  }
+}
+
+app.get("/api/memos/feed", handleMemosFeedGet);
+app.get("/memos/feed", handleMemosFeedGet);
+
+async function handleMemosList(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
+
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json([]);
+
+    const embed =
+      typeof req.query?.embed === "string" &&
+      req.query.embed.trim().toLowerCase() === "comments";
+
+    const { data, error } = await supabase
       .from("memos")
       .select("*")
       .eq("user_id", userId)
       .order("created_at", { ascending: false });
 
-    if (error) {
-      console.error("[memo get error]", error);
+    if (error) return res.status(500).json({ error: error.message });
 
-      return res.status(500).json({
-        ok: false,
-        error: error.message,
-      });
+    const list = data || [];
+    if (!embed || list.length === 0) {
+      return res.json(list);
     }
 
-    if (!embedComments || !memos?.length) {
-      return res.json(memos || []);
-    }
-
-    const memoIds = memos.map((m) => m.id);
-
-    const { data: comments, error: commentError } = await supabase
+    const ids = list.map((m) => m && m.id).filter(Boolean);
+    const { data: comments, error: cErr } = await supabase
       .from("comments")
       .select("*")
-      .in("memo_id", memoIds)
+      .in("memo_id", ids)
       .order("created_at", { ascending: true });
 
-    if (commentError) {
-      console.error("[memo comments error]", commentError);
+    if (cErr) {
+      logSupabaseErr("[memos-user] comments", cErr);
+      return res.status(500).json({ error: cErr.message });
+    }
 
-      return res.status(500).json({
-        ok: false,
-        error: commentError.message,
+    /** @type {Record<string, any[]>} */
+    const bucket = Object.create(null);
+    for (const row of comments || []) {
+      const k = row.memo_id;
+      if (!bucket[k]) bucket[k] = [];
+      bucket[k].push(row);
+    }
+
+    const out = list.map((m) => ({
+      ...m,
+      comments: bucket[m.id] || [],
+    }));
+    res.json(out);
+  } catch (e) {
+    console.log("[memos]", e);
+    res.status(500).json({ error: "server error" });
+  }
+}
+
+app.get("/memos/:userId", handleMemosList);
+app.get("/api/memos/:userId", handleMemosList);
+
+async function handleMemosDelete(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "no supabase" });
+
+    const id = decodeURIComponent(req.params.id || "").trim();
+    // eslint-disable-next-line no-console
+    console.log("[DELETE memos] id:", id);
+
+    if (!id) return res.status(400).json({ error: "id 필요" });
+
+    const { error } = await supabase.from("memos").delete().eq("id", id);
+
+    if (error) {
+      console.error("[DELETE memos error]", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE memos crash]", e);
+    res.status(500).json({ error: "server error" });
+  }
+}
+
+app.delete("/api/memos/:id", handleMemosDelete);
+app.delete("/memos/:id", handleMemosDelete);
+
+async function handleCommentSave(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const memo_id_raw = readString(req.body, "memo_id");
+    const user_id = readString(req.body, "user_id");
+    const commenter_id = readString(req.body, "commenter_id");
+    const content = readString(req.body, "content");
+    const sender = readString(req.body, "sender") || "commenter";
+
+    if (!memo_id_raw || !user_id || !commenter_id || !content) {
+      return res.status(400).json({ ok: false, error: "missing fields" });
+    }
+
+    const { memoUuid, err: resolveErr } = await resolveMemoUuidForComment(
+      supabase,
+      user_id,
+      memo_id_raw
+    );
+    if (!memoUuid) {
+      console.log("❌ [comment-save] resolve memo_id failed:", resolveErr);
+      return res.status(400).json({ ok: false, error: resolveErr || "memo_id resolve failed" });
+    }
+
+    const { error } = await supabase.from("comments").insert([
+      { memo_id: memoUuid, user_id, commenter_id, sender, content },
+    ]);
+
+    if (error) {
+      logSupabaseErr("[comment-save] insert", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    console.log("✅ [comment-save] saved memo_id(uuid)=", memoUuid);
+    return res.status(201).json({ ok: true });
+  } catch (e) {
+    console.log("[comment-save]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+async function handleAiCommentPost(req, res) {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+
+  try {
+    const supabase = getSupabase();
+    const promptRaw = req.body && req.body.prompt;
+    const memo_id_raw = readString(req.body, "memo_id");
+    const user_id = readString(req.body, "user_id");
+    const commenter_id = readString(req.body, "commenter_id");
+    const sender = readString(req.body, "sender") || "commenter";
+
+    console.log("📩 comment req:", {
+      memo_id: memo_id_raw || null,
+      user_id: user_id || null,
+      commenter_id: commenter_id || null,
+      has_prompt: typeof promptRaw === "string" && !!promptRaw.trim(),
+    });
+
+    if (typeof promptRaw !== "string" || !promptRaw.trim()) {
+      return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+    }
+
+    let cleanedPrompt = sanitizePromptForApi(promptRaw);
+    if (!cleanedPrompt) {
+      return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+    }
+    if (cleanedPrompt.length > MAX_PROMPT_CHARS) {
+      console.log(
+        "[comment] truncating prompt length",
+        cleanedPrompt.length,
+        "->",
+        MAX_PROMPT_CHARS
+      );
+      cleanedPrompt =
+        cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
+    }
+
+    const key = process.env.DEEPSEEK_API_KEY;
+    if (!key || typeof key !== "string" || !key.trim()) {
+      console.log("[comment] DEEPSEEK_API_KEY missing");
+      return res.status(503).json({ text: "서버 설정 오류입니다." });
+    }
+
+    const requestedTemperature = Number(req.body && req.body.temperature);
+    const requestedMaxTokens = Number(req.body && req.body.maxTokens);
+    const temperature =
+      Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
+        ? requestedTemperature
+        : 0.9;
+    const max_tokens =
+      Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
+        ? Math.min(2048, Math.floor(requestedMaxTokens))
+        : 200;
+
+    await acquireDeepSeekSlot();
+    try {
+    let payload;
+    try {
+      payload = JSON.stringify({
+        model: MODEL,
+        temperature,
+        max_tokens,
+        messages: [{ role: "user", content: cleanedPrompt }],
+      });
+    } catch (stringifyErr) {
+      console.error("[comment] JSON.stringify(payload) failed:", stringifyErr);
+      return res.status(400).json({ text: "프롬프트 인코딩에 실패했습니다." });
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    let dsRes;
+    try {
+      dsRes = await fetch(DEEPSEEK_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key.trim()}`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+        body: payload,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const rawText = await dsRes.text();
+    const safeRaw = typeof rawText === "string" ? rawText : String(rawText ?? "");
+    let json = {};
+    if (safeRaw) {
+      try {
+        json = JSON.parse(safeRaw);
+      } catch (parseErr) {
+        console.log("[comment] DeepSeek JSON parse", parseErr.message);
+        return res.status(502).json({ text: "응답을 해석할 수 없습니다." });
+      }
+    }
+
+    if (!dsRes.ok) {
+      const apiMsg =
+        deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
+      const statusOut = dsRes.status >= 500 ? 502 : dsRes.status;
+      let textOut = String(apiMsg);
+      if (dsRes.status === 404) {
+        textOut = `[API 404] 모델을 찾을 수 없습니다. 현재 MODEL=${MODEL}. 환경변수 DEEPSEEK_MODEL을 확인하세요. 원문: ${apiMsg}`;
+      }
+      console.log(
+        "[comment] DeepSeek HTTP",
+        dsRes.status,
+        safeRaw.length ? safeRaw.slice(0, 400) : "(empty body)"
+      );
+      return res.status(statusOut).json({ text: textOut });
+    }
+
+    if (safeRaw.length) {
+      console.log("[comment] DeepSeek ok, raw head:", safeRaw.slice(0, 400));
+    }
+
+    const choices = Array.isArray(json?.choices) ? json.choices : [];
+    const first = choices[0];
+    const msgObj = first && first.message;
+    let text = assistantTextFromMessage(msgObj);
+    if (!text && first && typeof first.text === "string") {
+      text = first.text.trim();
+    }
+
+    if (!text) {
+      console.log("[comment] No assistant content in DeepSeek response");
+      return res.status(502).json({ text: "댓글 생성 실패" });
+    }
+
+    if (isGarbageModelLine(text, MODEL)) {
+      console.log("[comment] rejected garbage model-line reply");
+      return res.status(502).json({ text: "댓글 생성 실패" });
+    }
+
+    // 클라우드 저장 실패는 DM/댓글 응답을 막지 않는다(예외 삼킴 + 로그).
+    if (supabase && memo_id_raw && user_id && commenter_id) {
+      try {
+        const { memoUuid, err: resolveErr } = await resolveMemoUuidForComment(
+          supabase,
+          user_id,
+          memo_id_raw
+        );
+        if (!memoUuid) {
+          console.log("❌ [comment] Supabase 저장 생략 — memo_id 해석 실패:", resolveErr);
+        } else {
+          const { error } = await supabase.from("comments").insert([
+            {
+              memo_id: memoUuid,
+              user_id,
+              commenter_id,
+              sender,
+              content: text,
+            },
+          ]);
+
+          if (error) {
+            logSupabaseErr("[comment] comments insert", error);
+          } else {
+            console.log("✅ [comment] comment saved memo_id(uuid)=", memoUuid);
+          }
+        }
+      } catch (sbErr) {
+        console.log("❌ [comment] Supabase 저장 중 예외(응답은 정상 반환):", sbErr?.message || sbErr);
+        if (sbErr?.stack) console.log(sbErr.stack);
+      }
+    }
+
+    res.json({ text });
+    } finally {
+      releaseDeepSeekSlot();
+    }
+  } catch (e) {
+    const msg = e && e.message ? String(e.message) : String(e);
+    const cause = e && e.cause != null ? e.cause : null;
+    const causeMsg =
+      cause && typeof cause === "object" && typeof cause.message === "string"
+        ? cause.message
+        : "";
+    const combined = `${msg} ${causeMsg}`.trim();
+    console.error("[ai-server] POST /comment error:", combined);
+    if (e && e.stack) console.error(e.stack);
+    if (e && e.name === "AbortError") {
+      return res.status(504).json({ text: "요청 시간이 초과되었습니다." });
+    }
+    if (
+      /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket|certificate|timed out|TTFB|ECONN/i.test(
+        combined
+      )
+    ) {
+      return res.status(502).json({
+        text: "AI 서버 연결이 불안정합니다. 잠시 후 다시 시도해 주세요.",
       });
     }
-
-    const commentMap = {};
-
-    for (const c of comments || []) {
-      if (!commentMap[c.memo_id]) {
-        commentMap[c.memo_id] = [];
-      }
-
-      commentMap[c.memo_id].push(c);
-    }
-
-    const result = memos.map((m) => ({
-      ...m,
-      comments: commentMap[m.id] || [],
-    }));
-
-    res.json(result);
-
-  } catch (e) {
-    console.error("[memo get server error]", e);
-
-    res.status(500).json({
-      ok: false,
-      error: e.message,
-    });
+    res.status(500).json({ text: "server error" });
   }
-});
-
-// =========================
-// MEMO DELETE
-// =========================
-app.delete("/api/memos/:id", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const { id } = req.params;
-
-const { error } = await supabase
-  .from("memos")
-  .delete()
-  .eq("id", id);
-
-if (error) {
-  console.error("[memo delete error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
 }
 
-res.json({ ok: true });
-
-
-} catch (e) {
-console.error("[memo delete server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
-
-// =========================
-// =========================
-// MEMO LIKE
-// =========================
-app.post("/api/memo-like", async (req, res) => {
-try {
-
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-const { memo_id, user_id } = req.body;
-
-if (!memo_id) {
-  return res.status(400).json({
-    ok: false,
-    error: "no memo_id"
-  });
-}
-
-if (!user_id) {
-  return res.status(400).json({
-    ok: false,
-    error: "no user_id"
-  });
-}
-
-let realMemoId = memo_id;
-
-const uuidLike =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    memo_id
-  );
-
-if (!uuidLike) {
-
-  const { data: memo, error: memoError } = await supabase
-    .from("memos")
-    .select("id")
-    .eq("user_id", user_id)
-    .eq("local_id", memo_id)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (memoError || !memo) {
-
-    console.error("[memo-like memo lookup error]", memoError);
-
-    return res.status(400).json({
-      ok: false,
-      error: "memo not found"
-    });
-  }
-
-  realMemoId = memo.id;
-}
-
-const { error: insertError } = await supabase
-  .from("memo_likes")
-  .insert([
-    {
-      memo_id: realMemoId,
-      user_id
-    }
-  ]);
-
-if (
-  insertError &&
-  !insertError.message.includes("duplicate")
-) {
-
-  console.error("[memo-like insert error]", insertError);
-
-  return res.status(500).json({
-    ok: false,
-    error: insertError.message
-  });
-}
-
-const { count, error: countError } = await supabase
-  .from("memo_likes")
-  .select("*", {
-    count: "exact",
-    head: true
-  })
-  .eq("memo_id", realMemoId);
-
-if (countError) {
-
-  console.error("[memo-like count error]", countError);
-
-  return res.status(500).json({
-    ok: false,
-    error: countError.message
-  });
-}
-
-res.json({
-  ok: true,
-  heart_count: count || 0
-});
-
-} catch (e) {
-
-console.error("[memo-like server error]", e);
-
-res.status(500).json({
-  ok: false,
-  error: e.message
-});
-
-}
-});
-
-// =========================
-// COMMENT SAVE
-// =========================
-app.post("/api/comment-save", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const { memo_id, user_id, commenter_id, sender, content } = req.body;
-
-if (!memo_id) return res.status(400).json({ ok: false, error: "no memo_id" });
-if (!user_id) return res.status(400).json({ ok: false, error: "no user_id" });
-if (!content) return res.status(400).json({ ok: false, error: "no content" });
-
-let realMemoId = memo_id;
-
-const uuidLike =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    memo_id
-  );
-
-if (!uuidLike) {
-  const { data: memo, error: memoError } = await supabase
-    .from("memos")
-    .select("id")
-    .eq("user_id", user_id)
-    .eq("local_id", memo_id)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (memoError || !memo) {
-    console.error("[comment-save memo lookup error]", memoError);
-    return res.status(400).json({
-      ok: false,
-      error: "memo not found: " + memo_id
-    });
-  }
-
-  realMemoId = memo.id;
-}
-
-const { data, error } = await supabase
-  .from("comments")
-  .insert([
-    {
-      memo_id: realMemoId,
-      user_id,
-      commenter_id: commenter_id || null,
-      sender: sender || "commenter",
-      content
-    }
-  ])
-  .select()
-  .single();
-
-if (error) {
-  console.error("[comment-save error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json({ ok: true, data });
-
-
-} catch (e) {
-console.error("[comment-save server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
-
-// =========================
-// COMMENT GET
-// =========================
-app.get("/api/comments/:userId", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const { userId } = req.params;
-
-const { data, error } = await supabase
-  .from("comments")
-  .select("*")
-  .eq("user_id", userId)
-  .order("created_at", { ascending: true });
-
-if (error) {
-  console.error("[comments get error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json(data || []);
-
-
-} catch (e) {
-console.error("[comments get server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
-
-// =========================
-// COMMENTS BY MEMO GET
-// =========================
-
-function isUuid(v) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
-}
-
-async function handleCommentsByMemoGet(req, res) {
+// 댓글러 XP/잠금/즐겨찾기 — 앱 `GET /api/commenter-states/:userId`
+async function handleCommenterStatesGet(req, res) {
   try {
-    const supabase = requireSupabase(res);
-    if (!supabase) return;
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
 
-    const raw = decodeURIComponent(
-      req.params.memoId || ""
-    ).trim();
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json([]);
 
-    if (!raw) {
+    const { data, error } = await supabase
+      .from("commenter_state")
+      .select("commenter_id, exp, level, is_unlocked, is_favorite, user_id")
+      .eq("user_id", userId);
+
+    if (error) {
+      console.log("❌ [commenter-states]", error?.message || error);
       return res.json([]);
     }
+    res.json(data || []);
+  } catch (e) {
+    console.log("[commenter-states]", e);
+    res.json([]);
+  }
+}
 
-    let memoUuid = raw;
+app.get("/api/commenter-states/:userId", handleCommenterStatesGet);
+app.get("/commenter-states/:userId", handleCommenterStatesGet);
 
-    // local_id → 실제 UUID 변환
-    if (!isUuid(raw)) {
-      const userId =
-        typeof req.query.user_id === "string"
-          ? req.query.user_id.trim()
+// 댓글러 상태 upsert — `handleCommenterStatePost` (아래 POST `/api/commenter-state` · `/commenter-state`).
+async function handleCommenterStatePost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const commenter_id = readString(req.body, "commenter_id");
+    if (!user_id || !commenter_id) {
+      return res.status(400).json({ ok: false, error: "user_id, commenter_id 필요" });
+    }
+
+    const exp = readInt(req.body, "exp", 0);
+    const level = readInt(req.body, "level", 1);
+    const is_unlocked = readBool(req.body, "is_unlocked");
+    const is_favorite = readBool(req.body, "is_favorite");
+
+    const row = {
+      user_id,
+      commenter_id,
+      exp: Math.max(0, exp),
+      level: Math.max(1, level),
+      is_unlocked,
+      is_favorite,
+    };
+
+    const { error } = await supabase.from("commenter_state").upsert([row], {
+      onConflict: "user_id,commenter_id",
+    });
+
+    if (error) {
+      logSupabaseErr("[commenter-state] upsert", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    console.log("✅ [commenter-state] upsert", user_id, commenter_id);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("[commenter-state]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+// POST 별칭: 동일 핸들러를 `/api/*` 와 루트 경로에 각각 한 번만 등록
+app.post("/api/comment", handleAiCommentPost);
+app.post("/comment", handleAiCommentPost);
+
+app.post("/api/comment-save", handleCommentSave);
+app.post("/comment-save", handleCommentSave);
+
+app.post("/api/commenter-state", handleCommenterStatePost);
+app.post("/commenter-state", handleCommenterStatePost);
+
+// 커스텀 댓글러 프롬프트 — 앱 `POST /api/custom-prompt` · 배포별칭 `POST /api/custom-prompts`
+async function handleCustomPromptPost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const commenter_id = readString(req.body, "commenter_id");
+    const prompt = readString(req.body, "prompt");
+    if (!user_id || !commenter_id || !prompt) {
+      return res.status(400).json({ ok: false, error: "user_id, commenter_id, prompt 필요" });
+    }
+
+    const row = {
+      user_id,
+      commenter_id,
+      prompt,
+      updated_at: new Date().toISOString(),
+    };
+
+    let { error } = await supabase
+      .from("custom_prompts")
+      .upsert(row, { onConflict: "user_id,commenter_id" });
+
+    if (error) {
+      logSupabaseErr("[custom-prompt] upsert (retry delete+insert)", error);
+      await supabase
+        .from("custom_prompts")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("commenter_id", commenter_id);
+      const ins = await supabase.from("custom_prompts").insert([row]);
+      error = ins.error;
+    }
+
+    if (error) {
+      logSupabaseErr("[custom-prompt] save failed", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("[custom-prompt]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+app.post("/api/custom-prompt", handleCustomPromptPost);
+app.post("/api/custom-prompts", handleCustomPromptPost);
+app.post("/custom-prompt", handleCustomPromptPost);
+app.post("/custom-prompts", handleCustomPromptPost);
+
+// 구버전 `GET /api/custom-prompts?user_id=` — `:userId` 라우트보다 먼저 등록
+async function handleCustomPromptsQueryGet(req, res) {
+  try {
+    const raw = req.query && req.query.user_id;
+    const userId =
+      typeof raw === "string"
+        ? decodeURIComponent(raw).trim()
+        : Array.isArray(raw) && typeof raw[0] === "string"
+          ? decodeURIComponent(raw[0]).trim()
           : "";
+    if (!userId) {
+      return res.status(400).json({ error: "user_id required" });
+    }
 
-      let q = supabase
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
+
+    const { data, error } = await supabase
+      .from("custom_prompts")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (error) {
+      console.log("❌ [custom-prompts ?user_id]", error?.message || error);
+      return res.json([]);
+    }
+    res.json(data || []);
+  } catch (e) {
+    console.log("[custom-prompts query]", e);
+    res.json([]);
+  }
+}
+
+app.get("/api/custom-prompts", handleCustomPromptsQueryGet);
+app.get("/custom-prompts", handleCustomPromptsQueryGet);
+
+// 앱 `GET /api/custom-prompts/:userId` — [game_cloud_sync] gameCloudFetchCustomPrompts
+async function handleCustomPromptsByUserGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
+
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json([]);
+
+    const { data, error } = await supabase
+      .from("custom_prompts")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (error) {
+      console.log("❌ [custom-prompts]", error?.message || error);
+      return res.json([]);
+    }
+    res.json(data || []);
+  } catch (e) {
+    console.log("[custom-prompts]", e);
+    res.json([]);
+  }
+}
+
+app.get("/api/custom-prompts/:userId", handleCustomPromptsByUserGet);
+app.get("/custom-prompts/:userId", handleCustomPromptsByUserGet);
+
+// 쿠키 거래 1건 — 앱 `POST /api/cookie-tx`
+async function handleCookieTxPost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    if (!user_id) {
+      return res.status(400).json({ ok: false, error: "user_id 필요" });
+    }
+
+    const deltaRaw = req.body && req.body.delta;
+    const delta =
+      typeof deltaRaw === "number" && Number.isFinite(deltaRaw)
+        ? Math.trunc(deltaRaw)
+        : parseInt(String(deltaRaw || "").trim(), 10);
+    if (!Number.isFinite(delta) || delta === 0) {
+      return res.status(400).json({ ok: false, error: "delta 필요(0 제외)" });
+    }
+
+    const reason = readString(req.body, "reason") || "unknown";
+    const platformRaw = readString(req.body, "platform");
+    const platform = platformRaw || null;
+
+    const { error } = await supabase.from("cookie_transactions").insert([
+      {
+        user_id,
+        delta,
+        reason,
+        platform,
+      },
+    ]);
+
+    if (error) {
+      logSupabaseErr("[cookie-tx] insert", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    return res.status(201).json({ ok: true });
+  } catch (e) {
+    console.log("[cookie-tx]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+app.post("/api/cookie-tx", handleCookieTxPost);
+app.post("/cookie-tx", handleCookieTxPost);
+
+// 쿠키 잔액(SUM) — 앱 `GET /api/cookie-balance/:userId`
+async function handleCookieBalanceGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
+
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json({ balance: 0, count: 0 });
+
+    const { data, error } = await supabase
+      .from("cookie_transactions")
+      .select("delta")
+      .eq("user_id", userId);
+
+    if (error) {
+      logSupabaseErr("[cookie-balance]", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const rows = data || [];
+    let balance = 0;
+    for (const r of rows) {
+      balance += Number(r.delta) || 0;
+    }
+    res.json({ balance, count: rows.length });
+  } catch (e) {
+    console.log("[cookie-balance]", e);
+    res.status(500).json({ error: "server error" });
+  }
+}
+
+app.get("/api/cookie-balance/:userId", handleCookieBalanceGet);
+app.get("/cookie-balance/:userId", handleCookieBalanceGet);
+
+// 재설치·복원용 — 앱 GET 스냅샷
+async function handleCommentsListGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json([]);
+
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json([]);
+
+    const { data, error } = await supabase
+      .from("comments")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true });
+
+    if (error) return res.status(500).json([]);
+
+    res.json(data || []);
+  } catch (e) {
+    console.log("[comments-list]", e);
+    res.status(500).json([]);
+  }
+}
+
+app.get("/api/comments/:userId", handleCommentsListGet);
+app.get("/comments/:userId", handleCommentsListGet);
+
+// 메모( uuid 또는 memos.local_id )별 댓글 — `GET /api/comments-by-memo/:memoId`
+async function handleCommentsByMemoGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json([]);
+
+    const raw = decodeURIComponent(req.params.memoId || "").trim();
+    if (!raw) return res.status(400).json([]);
+
+    let memoUuid = null;
+    if (isUuid(raw)) {
+      memoUuid = raw;
+    } else {
+      const { data, error } = await supabase
         .from("memos")
         .select("id")
-        .eq("local_id", raw);
-
-      if (userId) {
-        q = q.eq("user_id", userId);
-      }
-
-      const { data: memo, error: memoError } = await q
+        .eq("local_id", raw)
         .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+        .limit(1);
 
-      if (memoError || !memo) {
-        console.error(
-          "[comments-by-memo memo lookup error]",
-          memoError
-        );
-
-        return res.json([]);
+      if (error) {
+        logSupabaseErr("[comments-by-memo] memos lookup", error);
+        return res.status(500).json([]);
       }
+      const row = Array.isArray(data) && data.length ? data[0] : null;
+      memoUuid = row?.id ?? null;
+    }
 
-      memoUuid = memo.id;
+    if (!memoUuid) {
+      return res.json([]);
     }
 
     const { data, error } = await supabase
@@ -1043,392 +1132,511 @@ async function handleCommentsByMemoGet(req, res) {
       .order("created_at", { ascending: true });
 
     if (error) {
-      console.error(
-        "[comments-by-memo error]",
-        error
-      );
-
-      return res.status(500).json({
-        ok: false,
-        error: error.message
-      });
+      logSupabaseErr("[comments-by-memo] select", error);
+      return res.status(500).json([]);
     }
 
     res.json(data || []);
-
   } catch (e) {
-
-    console.error(
-      "[comments-by-memo server error]",
-      e
-    );
-
-    res.status(500).json({
-      ok: false,
-      error: e.message
-    });
+    console.log("[comments-by-memo]", e);
+    res.status(500).json([]);
   }
 }
 
-app.get(
-  "/api/comments-by-memo/:memoId",
-  handleCommentsByMemoGet
-);
+app.get("/api/comments-by-memo/:memoId", handleCommentsByMemoGet);
+app.get("/comments-by-memo/:memoId", handleCommentsByMemoGet);
 
-app.get(
-  "/comments-by-memo/:memoId",
-  handleCommentsByMemoGet
-);
+async function handleChatMessagesListGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json([]);
 
-// =========================
-// COMMENTER STATE SAVE
-// =========================
-app.post("/api/commenter-state", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json([]);
 
+    const { data, error } = await supabase
+      .from("chat_messages")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true });
 
-const {
-  user_id,
-  commenter_id,
-  exp,
-  level,
-  is_unlocked,
-  is_favorite
-} = req.body;
+    if (error) return res.status(500).json([]);
 
-if (!user_id) return res.status(400).json({ ok: false, error: "no user_id" });
-if (!commenter_id) {
-  return res.status(400).json({ ok: false, error: "no commenter_id" });
+    res.json(data || []);
+  } catch (e) {
+    console.log("[chat-messages-list]", e);
+    res.status(500).json([]);
+  }
 }
 
-const row = {
-  user_id,
-  commenter_id,
-  updated_at: new Date().toISOString()
-};
+app.get("/api/chat-messages/:userId", handleChatMessagesListGet);
+app.get("/chat-messages/:userId", handleChatMessagesListGet);
 
-if (exp !== undefined) row.exp = exp;
-if (level !== undefined) row.level = level;
-if (is_unlocked !== undefined) row.is_unlocked = is_unlocked;
-if (is_favorite !== undefined) row.is_favorite = is_favorite;
+async function handleCookieTransactionsListGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json([]);
 
-const { data, error } = await supabase
-  .from("commenter_state")
-  .upsert(row, { onConflict: "user_id,commenter_id" })
-  .select()
-  .single();
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) return res.status(400).json([]);
 
-if (error) {
-  console.error("[commenter-state save error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
+    const { data, error } = await supabase
+      .from("cookie_transactions")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+
+    if (error) return res.status(500).json([]);
+
+    res.json(data || []);
+  } catch (e) {
+    console.log("[cookie-transactions-list]", e);
+    res.status(500).json([]);
+  }
 }
 
-res.json({ ok: true, data });
+app.get("/api/cookie-transactions/:userId", handleCookieTransactionsListGet);
+app.get("/cookie-transactions/:userId", handleCookieTransactionsListGet);
 
+// 1:1 채팅 메시지 — 앱 `POST /api/chat/message` · 별칭 `POST /api/chat-message`
+// Flutter(game_cloud_sync): session_key, commenter_id, sender, content
+// GPT 스펙(/api/chat-message): user_id, session_key, role, content → sender=role, commenter_id=session_key(또는 body)
+async function handleChatMessagePost(req, res, opts) {
+  const requireSessionKey = opts && opts.requireSessionKey;
+  /** GPT 스펙 경로만 session_key·role 컬럼까지 넣음(테이블에 컬럼 없으면 앱 경로는 4필드만 유지). */
+  const extendRow = opts && opts.extendRow;
+  try {
+    console.log("📩 chat message body keys:", req.body && Object.keys(req.body));
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
 
-} catch (e) {
-console.error("[commenter-state server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
+    const user_id = readString(req.body, "user_id");
+    const content = readString(req.body, "content");
+    const session_key = readString(req.body, "session_key");
+    const role = readString(req.body, "role");
+    const commenter_id = readString(req.body, "commenter_id");
+    const sender = readString(req.body, "sender");
 
-// =========================
-// COMMENTER STATE GET
-// =========================
-async function handleGetCommenterState(req, res) {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const { userId } = req.params;
-
-const { data, error } = await supabase
-  .from("commenter_state")
-  .select("*")
-  .eq("user_id", userId)
-  .order("updated_at", { ascending: false });
-
-if (error) {
-  console.error("[commenter-state get error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json(data || []);
-
-
-} catch (e) {
-console.error("[commenter-state get server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-}
-
-app.get("/api/commenter-state/:userId", handleGetCommenterState);
-app.get("/api/commenter-states/:userId", handleGetCommenterState);
-
-// =========================
-// CUSTOM PROMPTS SAVE
-// =========================
-app.post("/api/custom-prompts", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const {
-  user_id,
-  commenter_id,
-  prompt,
-  name,
-  description,
-  image_url,
-  is_public,
-  payload
-} = req.body;
-
-if (!user_id) return res.status(400).json({ ok: false, error: "no user_id" });
-if (!commenter_id) {
-  return res.status(400).json({ ok: false, error: "no commenter_id" });
-}
-
-const row = {
-  user_id,
-  commenter_id,
-  updated_at: new Date().toISOString()
-};
-
-if (prompt !== undefined) row.prompt = prompt;
-if (name !== undefined) row.name = name;
-if (description !== undefined) row.description = description;
-if (image_url !== undefined) row.image_url = image_url;
-if (is_public !== undefined) row.is_public = is_public;
-if (payload !== undefined) row.payload = payload;
-
-const { data, error } = await supabase
-  .from("custom_prompts")
-  .upsert(row, { onConflict: "user_id,commenter_id" })
-  .select()
-  .single();
-
-if (error) {
-  console.error("[custom-prompts save error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json({ ok: true, data });
-
-
-} catch (e) {
-console.error("[custom-prompts server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
-
-// =========================
-// CUSTOM PROMPTS GET
-// =========================
-app.get("/api/custom-prompts/:userId", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const { userId } = req.params;
-
-const { data, error } = await supabase
-  .from("custom_prompts")
-  .select("*")
-  .eq("user_id", userId)
-  .order("updated_at", { ascending: false });
-
-if (error) {
-  console.error("[custom-prompts get error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json(data || []);
-
-
-} catch (e) {
-console.error("[custom-prompts get server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
-
-// =========================
-// CHAT MESSAGE SAVE
-// =========================
-app.post("/api/chat-message", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const {
-  user_id,
-  session_key,
-  role,
-  content,
-  commenter_id
-} = req.body;
-
-if (!user_id) return res.status(400).json({ ok: false, error: "no user_id" });
-if (!content) return res.status(400).json({ ok: false, error: "no content" });
-
-const row = {
-  user_id,
-  session_key: session_key || "default",
-  role: role || "user",
-  content
-};
-
-if (commenter_id !== undefined) row.commenter_id = commenter_id;
-
-const { data, error } = await supabase
-  .from("chat_messages")
-  .insert([row])
-  .select()
-  .single();
-
-if (error) {
-  console.error("[chat-message save error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json({ ok: true, data });
-
-
-} catch (e) {
-console.error("[chat-message server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
-
-// =========================
-// CHAT MESSAGE GET
-// =========================
-app.get("/api/chat-messages/:userId", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const { userId } = req.params;
-const { session_key } = req.query;
-
-let query = supabase
-  .from("chat_messages")
-  .select("*")
-  .eq("user_id", userId)
-  .order("created_at", { ascending: true });
-
-if (session_key) {
-  query = query.eq("session_key", session_key);
-}
-
-const { data, error } = await query;
-
-if (error) {
-  console.error("[chat-messages get error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json(data || []);
-
-
-} catch (e) {
-console.error("[chat-messages get server error]", e);
-res.status(500).json({ ok: false, error: e.message });
-}
-});
-
-// =========================
-// COOKIE TX SAVE
-// =========================
-app.post("/api/cookie-tx", async (req, res) => {
-try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const {
-  user_id,
-  delta,
-  reason,
-  platform
-} = req.body;
-
-if (!user_id) return res.status(400).json({ ok: false, error: "no user_id" });
-if (delta === undefined || delta === null) {
-  return res.status(400).json({ ok: false, error: "no delta" });
-}
-
-const { data, error } = await supabase
-  .from("cookie_transactions")
-  .insert([
-    {
-      user_id,
-      delta,
-      reason: reason || null,
-      platform: platform || null
+    if (!user_id || !content) {
+      return res.status(400).json({ ok: false, error: "user_id, content 필요" });
     }
-  ])
-  .select()
-  .single();
+    if (requireSessionKey && !session_key) {
+      return res.status(400).json({ ok: false, error: "session_key 필요" });
+    }
 
-if (error) {
-  console.error("[cookie-tx save error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
+    const senderOut = (sender || role || "user").trim() || "user";
+    const commenterOut = (commenter_id || session_key).trim();
+    if (!commenterOut) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "commenter_id 또는 session_key 필요" });
+    }
+
+    const row = {
+      user_id,
+      commenter_id: commenterOut,
+      sender: senderOut,
+      content,
+    };
+    if (extendRow) {
+      if (session_key) row.session_key = session_key;
+      if (role) row.role = role;
+    }
+
+    const { error } = await supabase.from("chat_messages").insert([row]);
+
+    if (error) {
+      logSupabaseErr("[chat/message] insert", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    return res.status(201).json({ ok: true });
+  } catch (e) {
+    console.log("[chat/message]", e);
+    return res.status(500).json({ ok: false });
+  }
 }
 
-res.json({ ok: true, data });
+app.post("/api/chat/message", (req, res) =>
+  handleChatMessagePost(req, res, { requireSessionKey: false, extendRow: false }),
+);
+app.post("/api/chat-message", (req, res) =>
+  handleChatMessagePost(req, res, { requireSessionKey: true, extendRow: true }),
+);
+app.post("/chat-message", (req, res) =>
+  handleChatMessagePost(req, res, { requireSessionKey: true, extendRow: true }),
+);
 
+// =========================
+// STORY IMAGE GENERATION (GPT cover + scene backgrounds)
+// =========================
 
-} catch (e) {
-console.error("[cookie-tx server error]", e);
-res.status(500).json({ ok: false, error: e.message });
+const STORY_IMAGE_REFERENCE_RULES = `IMPORTANT:
+
+Use the provided reference images as the source of truth for all characters.
+
+Maintain the exact appearance of referenced characters.
+
+Do not redesign faces.
+Do not change hairstyle.
+Do not change age.
+Do not change ethnicity.
+Do not change body type.
+
+Only change pose, expression, scene, lighting and environment according to the story.`;
+
+const STORY_IMAGE_COMMON_RULES = `Visual rules:
+- vertical 9:16 composition
+- cinematic lighting
+- full background scene
+- no speech bubbles
+- no text
+- no watermark
+- no UI elements
+- emotionally clear storytelling`;
+
+const STORY_CATEGORY_STYLES = {
+  fantasy:
+    "fantasy cinematic illustration, epic fantasy atmosphere, magical world, enchanted lighting, ancient ruins, castles, forests, mythical creatures, glowing magic effects, dramatic composition, high detail, storybook fantasy, immersive adventure scene",
+  romance:
+    "romantic cinematic illustration, warm emotional atmosphere, soft natural lighting, expressive characters, intimate moment, modern daily life, cafe, bedroom, street at night, school, office, subtle facial expression, gentle mood, beautiful composition, no magic effects, no dragons",
+  movie:
+    "cinematic movie still, dramatic lighting, realistic film composition, wide angle shot, strong visual storytelling, atmospheric scene, high contrast, professional cinematography, dynamic camera angle, movie poster quality, immersive scene",
+  royal:
+    "cinematic historical drama still, elegant palace atmosphere, period drama lighting, suspenseful composition, ornate interiors, dramatic shadows, film-quality storytelling",
+  science:
+    "curious intellectual cinematic illustration, modern science atmosphere, clean dramatic lighting",
+  issue:
+    "dramatic newsroom cinematic illustration, tense atmosphere, professional lighting",
+};
+
+const STORY_CATEGORY_FOCUS = {
+  fantasy:
+    "Focus: Visualize the current location as an epic fantasy scene. Emphasize world-building, magical atmosphere, and adventure tension. Location-first composition.",
+  romance:
+    "Focus: Visualize emotional distance and mood between characters. Soft lighting, intimate spaces, subtle expressions. Emotion-first; avoid fantasy magic effects.",
+  movie:
+    "Focus: Visualize as a cinematic film still. Strong camera angle, dramatic lighting, and genre-appropriate tension. Composition-first.",
+  royal:
+    "Focus: Visualize as a historical drama film still. Palace corridors, period atmosphere, elegant suspense.",
+  science:
+    "Focus: Visualize curiosity and discovery in a cinematic educational scene.",
+  issue:
+    "Focus: Visualize a dramatic debate or newsroom atmosphere.",
+};
+
+function normalizeStoryProgramType(raw) {
+  const t = String(raw || "fantasy")
+    .trim()
+    .toLowerCase();
+  if (t === "movie" || t === "film" || t === "영화" || t === "드라마") return "movie";
+  if (Object.prototype.hasOwnProperty.call(STORY_CATEGORY_STYLES, t)) return t;
+  return "fantasy";
 }
+
+function parseStoryReferenceImages(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item, i) => {
+      if (!item || typeof item !== "object") return null;
+      const name = String(item.name || `character${i + 1}`).trim();
+      const data = String(item.data || "").trim();
+      if (!data) return null;
+      return { name, data };
+    })
+    .filter(Boolean)
+    .slice(0, 4);
+}
+
+function buildStoryImagePrompt({
+  programType,
+  title = "",
+  opening = "",
+  partner = "",
+  mood = "",
+  recentTurns = "",
+  sceneSummary = "",
+  characters = "",
+  emotion = "",
+  referenceCharacterNames = [],
+  isCover = false,
+}) {
+  const program = normalizeStoryProgramType(programType);
+  const style = STORY_CATEGORY_STYLES[program] || STORY_CATEGORY_STYLES.fantasy;
+  const focus = STORY_CATEGORY_FOCUS[program] || STORY_CATEGORY_FOCUS.fantasy;
+  const t = String(title || "").trim().slice(0, 200);
+  const op = String(opening || "").trim().slice(0, 600);
+  const p = String(partner || "").trim().slice(0, 80);
+  const m = String(mood || "cinematic dramatic").trim().slice(0, 120);
+  const turns = String(recentTurns || "").trim().slice(0, 2000);
+  const scene = String(sceneSummary || "").trim().slice(0, 400);
+  const chars = String(characters || "").trim().slice(0, 300);
+  const emo = String(emotion || "").trim().slice(0, 120);
+  const refNames = Array.isArray(referenceCharacterNames)
+    ? referenceCharacterNames.map((n) => String(n || "").trim()).filter(Boolean)
+    : [];
+
+  const kind = isCover
+    ? "Create one high-quality vertical story cover background."
+    : "Create one high-quality vertical story scene background.";
+
+  const refBlock =
+    refNames.length > 0
+      ? `\nReference characters (uploaded images in order):\n${refNames.map((n, i) => `image${i + 1}: ${n}`).join("\n")}`
+      : "";
+
+  return `${STORY_IMAGE_REFERENCE_RULES}
+${refBlock}
+
+${kind}
+
+Category style:
+${style}
+
+${focus}
+
+${STORY_IMAGE_COMMON_RULES}
+
+Program: ${program}
+Title: ${t}
+Opening: ${op}
+Partner: ${p}
+Mood: ${m}
+${turns ? `\nRecent Story (last user turns):\n${turns}` : ""}
+${scene ? `\nScene Summary:\n${scene}` : ""}
+${chars ? `\nCharacters:\n${chars}` : ""}
+${emo ? `\nEmotion:\n${emo}` : ""}`.trim();
+}
+
+function sanitizeStoryImagePathSegment(raw, maxLen = 80) {
+  return String(raw || "scene")
+    .replace(/[^a-zA-Z0-9._\u3131-\uD79D-]/g, "_")
+    .slice(0, maxLen) || "scene";
+}
+
+async function uploadStoryImageToSupabase(sessionKey, subfolder, fileStem, pngBuffer) {
+  const supabase = getSupabase();
+  if (!supabase || !sessionKey || !pngBuffer?.length) return null;
+
+  const safeKey = sanitizeStoryImagePathSegment(sessionKey, 120);
+  const safeStem = sanitizeStoryImagePathSegment(fileStem, 80);
+  const path = `${subfolder}/${safeKey}_${safeStem}.png`;
+
+  const { error } = await supabase.storage.from("story-covers").upload(path, pngBuffer, {
+    contentType: "image/png",
+    upsert: true,
+  });
+
+  if (error) {
+    console.error("[story-image upload error]", error.message);
+    return null;
+  }
+
+  const { data } = supabase.storage.from("story-covers").getPublicUrl(path);
+  return data?.publicUrl || null;
+}
+
+async function generateStoryImageFromPrompt(
+  prompt,
+  sessionKey,
+  fileStem,
+  referenceImages = [],
+) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("no OPENAI_API_KEY");
+  }
+
+  let imageRes;
+  if (referenceImages.length > 0) {
+    const form = new FormData();
+    form.append("model", OPENAI_IMAGE_MODEL);
+    form.append("prompt", prompt);
+    form.append("size", "1024x1536");
+    form.append("n", "1");
+    form.append("input_fidelity", "high");
+    for (const ref of referenceImages) {
+      const buf = Buffer.from(ref.data, "base64");
+      const blob = new Blob([buf], { type: "image/png" });
+      form.append(
+        "image",
+        blob,
+        `${sanitizeStoryImagePathSegment(ref.name, 40)}.png`,
+      );
+    }
+    imageRes = await fetch("https://api.openai.com/v1/images/edits", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: form,
+    });
+  } else {
+    imageRes = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_IMAGE_MODEL,
+        prompt,
+        size: "1024x1536",
+        n: 1,
+      }),
+    });
+  }
+
+  const raw = await imageRes.text();
+  if (!imageRes.ok) {
+    console.error("[story-image openai error]", imageRes.status, raw.slice(0, 500));
+    throw new Error(`image generation failed (${imageRes.status})`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_e) {
+    throw new Error("invalid openai response");
+  }
+
+  const item = parsed?.data?.[0];
+  let imageUrl = item?.url || "";
+  const b64 = item?.b64_json;
+
+  if (!imageUrl && b64) {
+    const pngBuffer = Buffer.from(b64, "base64");
+    const uploaded = await uploadStoryImageToSupabase(
+      sessionKey,
+      "covers",
+      fileStem,
+      pngBuffer,
+    );
+    imageUrl = uploaded || `data:image/png;base64,${b64}`;
+  }
+
+  if (!imageUrl) {
+    throw new Error("no image in response");
+  }
+
+  return imageUrl;
+}
+
+app.post("/api/story-cover-image", async (req, res) => {
+  try {
+    const {
+      program_type = "fantasy",
+      title = "",
+      opening = "",
+      partner = "",
+      persona = "",
+      mood = "",
+      session_key = "",
+      recent_turns = "",
+      scene_summary = "",
+      characters = "",
+      reference_images = [],
+    } = req.body || {};
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
+    }
+
+    const refs = parseStoryReferenceImages(reference_images);
+    const refNames = refs.map((r) => r.name);
+
+    const promptUsed = buildStoryImagePrompt({
+      programType: program_type,
+      title,
+      opening,
+      partner: partner || persona,
+      mood,
+      recentTurns: recent_turns || opening,
+      sceneSummary: scene_summary,
+      characters: characters || refNames.join(", "),
+      referenceCharacterNames: refNames,
+      isCover: true,
+    });
+
+    const imageUrl = await generateStoryImageFromPrompt(
+      promptUsed,
+      session_key || "cover",
+      "cover",
+      refs,
+    );
+
+    return res.json({ ok: true, image_url: imageUrl, prompt_used: promptUsed });
+  } catch (e) {
+    console.error("[story-cover server error]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-// =========================
-// COOKIE TX GET
-// =========================
-app.get("/api/cookie-tx/:userId", async (req, res) => {
+app.post("/api/story-scene-image", async (req, res) => {
+  try {
+    const {
+      program_type = "fantasy",
+      title = "",
+      session_key = "",
+      scene_label = "",
+      recent_turns = "",
+      characters = "",
+      emotion = "",
+      narrator_hint = "",
+      scene_summary = "",
+      reference_images = [],
+      mood = "",
+    } = req.body || {};
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
+    }
+
+    const refs = parseStoryReferenceImages(reference_images);
+    const refNames = refs.map((r) => r.name);
+    const sceneSummary =
+      String(scene_summary || "").trim() ||
+      [scene_label, narrator_hint, emotion ? `Emotion: ${emotion}` : ""]
+        .filter(Boolean)
+        .join("\n");
+
+    const promptUsed = buildStoryImagePrompt({
+      programType: program_type,
+      title,
+      recentTurns: recent_turns,
+      sceneSummary,
+      characters: characters || refNames.join(", "),
+      emotion,
+      referenceCharacterNames: refNames,
+      isCover: false,
+    });
+
+    const fileStem = `scene_${sanitizeStoryImagePathSegment(scene_label || "scene", 48)}`;
+    const imageUrl = await generateStoryImageFromPrompt(
+      promptUsed,
+      session_key || "scene",
+      fileStem,
+      refs,
+    );
+
+    return res.json({ ok: true, image_url: imageUrl, prompt_used: promptUsed });
+  } catch (e) {
+    console.error("[story-scene server error]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+const PORT = Number(process.env.PORT) || 3000;
+
+logSupabaseInit();
+
 try {
-const supabase = requireSupabase(res);
-if (!supabase) return;
-
-
-const { userId } = req.params;
-
-const { data, error } = await supabase
-  .from("cookie_transactions")
-  .select("*")
-  .eq("user_id", userId)
-  .order("created_at", { ascending: false });
-
-if (error) {
-  console.error("[cookie-tx get error]", error);
-  return res.status(500).json({ ok: false, error: error.message });
-}
-
-res.json(data || []);
-
-
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log("server running on " + PORT);
+  });
+  server.on("error", (err) => {
+    console.log("[ai-server] listen error:", err.message);
+    process.exit(1);
+  });
 } catch (e) {
-console.error("[cookie-tx get server error]", e);
-res.status(500).json({ ok: false, error: e.message });
+  console.log("[ai-server] failed to start:", e && e.message ? e.message : e);
+  process.exit(1);
 }
-});
-
-// =========================
-// START
-// =========================
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, "0.0.0.0", () => {
-console.log("server running on " + PORT);
-console.log("rev:", SERVER_REV);
-});
