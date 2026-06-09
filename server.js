@@ -8,7 +8,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v40-story-image-formdata-array";
+const SERVER_REV = "v41-story-image-edits-fidelity";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -1783,6 +1783,7 @@ async function requestOpenAiStoryImageEdits(prompt, referenceImages) {
   form.append("prompt", prompt);
   form.append("size", "1024x1536");
   form.append("n", "1");
+  form.append("input_fidelity", "high");
   for (const ref of refs) {
     form.append("image[]", ref.buf, {
       filename: `${sanitizeStoryImagePathSegment(ref.name, 40)}.png`,
