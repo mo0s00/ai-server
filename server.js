@@ -8,7 +8,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v41-story-image-edits-fidelity";
+const SERVER_REV = "chat delete api";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -1179,6 +1179,84 @@ async function handleChatMessagesListGet(req, res) {
 
 app.get("/api/chat-messages/:userId", handleChatMessagesListGet);
 app.get("/chat-messages/:userId", handleChatMessagesListGet);
+
+async function deleteChatMessagesForUserSession(
+  supabase,
+  userId,
+  sessionKey,
+  extraCommenterIds,
+) {
+  const keys = new Set(
+    [sessionKey, ...(extraCommenterIds || [])]
+      .map((v) => String(v || "").trim())
+      .filter(Boolean),
+  );
+  for (const key of keys) {
+    const bySession = await supabase
+      .from("chat_messages")
+      .delete()
+      .eq("user_id", userId)
+      .eq("session_key", key);
+    if (bySession.error) {
+      logSupabaseErr("[chat-messages/delete] session_key", bySession.error);
+    }
+
+    const byCommenter = await supabase
+      .from("chat_messages")
+      .delete()
+      .eq("user_id", userId)
+      .eq("commenter_id", key);
+    if (byCommenter.error) {
+      logSupabaseErr("[chat-messages/delete] commenter_id", byCommenter.error);
+    }
+  }
+}
+
+async function handleChatMessagesSessionDelete(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    const sessionKey = decodeURIComponent(req.params.sessionKey || "").trim();
+    const commenterIdRaw = req.query && req.query.commenter_id;
+    const commenterId =
+      typeof commenterIdRaw === "string" ? commenterIdRaw.trim() : "";
+
+    if (!userId || !sessionKey) {
+      return res.status(400).json({ ok: false, error: "userId, sessionKey 필요" });
+    }
+
+    const extra = [];
+    if (commenterId) extra.push(commenterId);
+    const dmPrefix = "direct_dm:";
+    if (sessionKey.startsWith(dmPrefix)) {
+      const moniker = sessionKey.substring(dmPrefix.length).trim();
+      if (moniker) extra.push(moniker);
+    }
+
+    await deleteChatMessagesForUserSession(
+      supabase,
+      userId,
+      sessionKey,
+      extra,
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("[chat-messages/delete]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+app.delete(
+  "/api/chat-messages/:userId/:sessionKey",
+  handleChatMessagesSessionDelete,
+);
+app.delete(
+  "/chat-messages/:userId/:sessionKey",
+  handleChatMessagesSessionDelete,
+);
 
 async function handleCookieTransactionsListGet(req, res) {
   try {
