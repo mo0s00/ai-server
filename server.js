@@ -8,7 +8,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "chat delete api";
+const SERVER_REV = "user stories api";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -117,6 +117,9 @@ app.get("/health", (_req, res) => {
       "POST /api/story-chat",
       "POST /api/story-cover-image",
       "POST /api/story-scene-image",
+      "POST /api/user-stories",
+      "GET /api/user-stories",
+      "GET /api/user-stories/:id",
     ],
   });
 });
@@ -2053,6 +2056,137 @@ app.post("/api/story-scene-image", async (req, res) => {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// 유저 제작 스토리 — 앱 `POST/GET /api/user-stories`
+async function handleUserStoriesPost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const title = readString(req.body, "title");
+    const summary = readString(req.body, "summary");
+    const category = readString(req.body, "category") || "fantasy";
+    const visibility = readString(req.body, "visibility") || "private";
+    const cover_url = readString(req.body, "cover_url");
+    const background_url = readString(req.body, "background_url");
+    const draft_json = req.body && req.body.draft_json;
+    const id = readString(req.body, "id");
+
+    if (!user_id || !title) {
+      return res.status(400).json({ ok: false, error: "user_id, title 필요" });
+    }
+    if (draft_json == null || typeof draft_json !== "object") {
+      return res.status(400).json({ ok: false, error: "draft_json 필요" });
+    }
+
+    const now = new Date().toISOString();
+    const row = {
+      user_id,
+      title,
+      summary,
+      category,
+      visibility,
+      cover_url,
+      background_url,
+      draft_json,
+      updated_at: now,
+    };
+    if (id) row.id = id;
+
+    let result;
+    if (id) {
+      result = await supabase
+        .from("user_stories")
+        .upsert(row, { onConflict: "id" })
+        .select("id")
+        .single();
+    } else {
+      row.created_at = now;
+      result = await supabase.from("user_stories").insert([row]).select("id").single();
+    }
+
+    if (result.error) {
+      logSupabaseErr("[user-stories] save failed", result.error);
+      return res.status(500).json({ ok: false, error: result.error.message });
+    }
+
+    return res.json({ ok: true, id: result.data?.id || id || null });
+  } catch (e) {
+    console.error("[user-stories post]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+async function handleUserStoriesQueryGet(req, res) {
+  try {
+    const raw = req.query && req.query.user_id;
+    const userId =
+      typeof raw === "string"
+        ? decodeURIComponent(raw).trim()
+        : Array.isArray(raw) && typeof raw[0] === "string"
+          ? decodeURIComponent(raw[0]).trim()
+          : "";
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: "user_id required" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const { data, error } = await supabase
+      .from("user_stories")
+      .select("*")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false });
+
+    if (error) {
+      logSupabaseErr("[user-stories list]", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    return res.json({ ok: true, stories: data || [] });
+  } catch (e) {
+    console.error("[user-stories list]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+async function handleUserStoryByIdGet(req, res) {
+  try {
+    const storyId = decodeURIComponent(req.params.id || "").trim();
+    if (!storyId) {
+      return res.status(400).json({ ok: false, error: "id required" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const { data, error } = await supabase
+      .from("user_stories")
+      .select("*")
+      .eq("id", storyId)
+      .maybeSingle();
+
+    if (error) {
+      logSupabaseErr("[user-stories get]", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    if (!data) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
+    return res.json({ ok: true, story: data });
+  } catch (e) {
+    console.error("[user-stories get]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+app.post("/api/user-stories", handleUserStoriesPost);
+app.post("/user-stories", handleUserStoriesPost);
+app.get("/api/user-stories", handleUserStoriesQueryGet);
+app.get("/user-stories", handleUserStoriesQueryGet);
+app.get("/api/user-stories/:id", handleUserStoryByIdGet);
+app.get("/user-stories/:id", handleUserStoryByIdGet);
 
 const PORT = Number(process.env.PORT) || 3000;
 
