@@ -8,7 +8,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "user stories api";
+const SERVER_REV = "v43-story-tts";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -17,6 +17,12 @@ const OPENAI_API_KEY = (
 ).trim();
 const OPENAI_IMAGE_MODEL = (process.env.OPENAI_IMAGE_MODEL || "gpt-image-1").trim();
 const OPENAI_SCENE_MODEL = (process.env.OPENAI_SCENE_MODEL || "gpt-4o-mini").trim();
+
+/** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
+function storyImageGenerationEnabled() {
+  const v = (process.env.STORY_IMAGE_GENERATION || "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
 
 let supabaseEnvLogged = false;
 
@@ -99,6 +105,7 @@ app.get("/health", (_req, res) => {
     rev: SERVER_REV,
     model: MODEL,
     openaiConfigured: !!OPENAI_API_KEY,
+    storyImageGeneration: storyImageGenerationEnabled(),
     supabaseConfigured: !!(url && key),
     supabasePostPaths: [
       "POST /api/cookie-tx",
@@ -115,6 +122,7 @@ app.get("/health", (_req, res) => {
       "POST /api/comment-save",
       "POST /comment-save",
       "POST /api/story-chat",
+      "POST /api/story-tts",
       "POST /api/story-cover-image",
       "POST /api/story-scene-image",
       "POST /api/user-stories",
@@ -1638,6 +1646,72 @@ app.post("/api/story-chat", async (req, res) => {
   }
 });
 
+const OPENAI_TTS_MODEL = (process.env.OPENAI_TTS_MODEL || "tts-1").trim();
+const OPENAI_TTS_VOICES = new Set([
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "fable",
+  "onyx",
+  "nova",
+  "sage",
+  "shimmer",
+  "verse",
+]);
+
+app.post("/api/story-tts", async (req, res) => {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+
+  try {
+    const text = readString(req.body, "text");
+    const voiceRaw = readString(req.body, "voice") || "alloy";
+    const provider = (readString(req.body, "provider") || "openai").toLowerCase();
+
+    if (!text) {
+      return res.status(400).json({ ok: false, error: "no text" });
+    }
+    if (provider !== "openai") {
+      return res.status(400).json({ ok: false, error: "unsupported provider" });
+    }
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
+    }
+
+    const voice = OPENAI_TTS_VOICES.has(voiceRaw) ? voiceRaw : "alloy";
+    const input = text.length > 4096 ? text.slice(0, 4096) : text;
+
+    const ttsRes = await fetch("https://api.openai.com/v1/audio/speech", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_TTS_MODEL,
+        input,
+        voice,
+        response_format: "mp3",
+      }),
+    });
+
+    if (!ttsRes.ok) {
+      const raw = await ttsRes.text();
+      console.error("[story-tts] openai error", ttsRes.status, raw.slice(0, 400));
+      return res.status(502).json({ ok: false, error: raw.slice(0, 200) || "tts failed" });
+    }
+
+    const buffer = Buffer.from(await ttsRes.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    return res.send(buffer);
+  } catch (e) {
+    console.error("[story-tts] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "tts failed" });
+  }
+});
+
 // =========================
 // STORY IMAGE GENERATION (GPT cover + scene backgrounds)
 // =========================
@@ -1719,6 +1793,14 @@ function parseStoryReferenceImages(raw) {
     .slice(0, 4);
 }
 
+const STORY_BANNER_TITLE_RULES = `Visual rules for story banner card:
+- horizontal 16:9 composition (landscape banner card)
+- cinematic lighting, full background scene
+- render the story title text prominently at the top center, integrated into the artwork like a movie or game poster
+- title must be bold, readable, cinematic typography with dramatic lighting or texture
+- no speech bubbles, no subtitles, no caption text, no watermark, no UI elements
+- emotionally clear storytelling`;
+
 function buildStoryImagePrompt({
   programType,
   title = "",
@@ -1731,6 +1813,7 @@ function buildStoryImagePrompt({
   emotion = "",
   referenceCharacterNames = [],
   isCover = false,
+  renderTitleInImage = false,
 }) {
   const program = normalizeStoryProgramType(programType);
   const style = STORY_CATEGORY_STYLES[program] || STORY_CATEGORY_STYLES.fantasy;
@@ -1748,8 +1831,20 @@ function buildStoryImagePrompt({
     : [];
 
   const kind = isCover
-    ? "Create one high-quality vertical story cover background."
+    ? renderTitleInImage
+      ? "Create one high-quality horizontal story banner cover with the title text rendered inside the image."
+      : "Create one high-quality vertical story cover background."
     : "Create one high-quality vertical story scene background.";
+
+  const visualRules = isCover && renderTitleInImage
+    ? `${STORY_BANNER_TITLE_RULES}
+- only text allowed in the image is the story title shown below`
+    : STORY_IMAGE_COMMON_RULES;
+
+  const titleBlock =
+    isCover && renderTitleInImage && t
+      ? `\nTitle text to render in the image (Korean, exact spelling): 「${t}」`
+      : "";
 
   const refBlock =
     refNames.length > 0
@@ -1766,7 +1861,7 @@ ${style}
 
 ${focus}
 
-${STORY_IMAGE_COMMON_RULES}
+${visualRules}${titleBlock}
 
 Program: ${program}
 Title: ${t}
@@ -1955,6 +2050,10 @@ async function generateStoryImageFromPrompt(
 
 app.post("/api/story-cover-image", async (req, res) => {
   try {
+    if (!storyImageGenerationEnabled()) {
+      return res.status(503).json({ ok: false, error: "story image generation disabled" });
+    }
+
     const {
       program_type = "fantasy",
       title = "",
@@ -1967,6 +2066,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       scene_summary = "",
       characters = "",
       reference_images = [],
+      render_title_in_image = false,
     } = req.body || {};
 
     if (!OPENAI_API_KEY) {
@@ -1987,6 +2087,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       characters: characters || refNames.join(", "),
       referenceCharacterNames: refNames,
       isCover: true,
+      renderTitleInImage: !!render_title_in_image,
     });
 
     const imageUrl = await generateStoryImageFromPrompt(
@@ -2005,6 +2106,10 @@ app.post("/api/story-cover-image", async (req, res) => {
 
 app.post("/api/story-scene-image", async (req, res) => {
   try {
+    if (!storyImageGenerationEnabled()) {
+      return res.status(503).json({ ok: false, error: "story image generation disabled" });
+    }
+
     const {
       program_type = "fantasy",
       title = "",
