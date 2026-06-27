@@ -8,7 +8,7 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "v43-story-tts";
+const SERVER_REV = "add delete user story api";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -17,12 +17,6 @@ const OPENAI_API_KEY = (
 ).trim();
 const OPENAI_IMAGE_MODEL = (process.env.OPENAI_IMAGE_MODEL || "gpt-image-1").trim();
 const OPENAI_SCENE_MODEL = (process.env.OPENAI_SCENE_MODEL || "gpt-4o-mini").trim();
-
-/** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
-function storyImageGenerationEnabled() {
-  const v = (process.env.STORY_IMAGE_GENERATION || "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "yes";
-}
 
 let supabaseEnvLogged = false;
 
@@ -105,7 +99,6 @@ app.get("/health", (_req, res) => {
     rev: SERVER_REV,
     model: MODEL,
     openaiConfigured: !!OPENAI_API_KEY,
-    storyImageGeneration: storyImageGenerationEnabled(),
     supabaseConfigured: !!(url && key),
     supabasePostPaths: [
       "POST /api/cookie-tx",
@@ -122,12 +115,13 @@ app.get("/health", (_req, res) => {
       "POST /api/comment-save",
       "POST /comment-save",
       "POST /api/story-chat",
-      "POST /api/story-tts",
       "POST /api/story-cover-image",
       "POST /api/story-scene-image",
       "POST /api/user-stories",
       "GET /api/user-stories",
+      "GET /api/user-stories?scope=public",
       "GET /api/user-stories/:id",
+      "DELETE /api/user-stories/:id",
     ],
   });
 });
@@ -1646,72 +1640,6 @@ app.post("/api/story-chat", async (req, res) => {
   }
 });
 
-const OPENAI_TTS_MODEL = (process.env.OPENAI_TTS_MODEL || "tts-1").trim();
-const OPENAI_TTS_VOICES = new Set([
-  "alloy",
-  "ash",
-  "ballad",
-  "coral",
-  "echo",
-  "fable",
-  "onyx",
-  "nova",
-  "sage",
-  "shimmer",
-  "verse",
-]);
-
-app.post("/api/story-tts", async (req, res) => {
-  res.setHeader("X-AI-Server-Rev", SERVER_REV);
-
-  try {
-    const text = readString(req.body, "text");
-    const voiceRaw = readString(req.body, "voice") || "alloy";
-    const provider = (readString(req.body, "provider") || "openai").toLowerCase();
-
-    if (!text) {
-      return res.status(400).json({ ok: false, error: "no text" });
-    }
-    if (provider !== "openai") {
-      return res.status(400).json({ ok: false, error: "unsupported provider" });
-    }
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
-    }
-
-    const voice = OPENAI_TTS_VOICES.has(voiceRaw) ? voiceRaw : "alloy";
-    const input = text.length > 4096 ? text.slice(0, 4096) : text;
-
-    const ttsRes = await fetch("https://api.openai.com/v1/audio/speech", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: OPENAI_TTS_MODEL,
-        input,
-        voice,
-        response_format: "mp3",
-      }),
-    });
-
-    if (!ttsRes.ok) {
-      const raw = await ttsRes.text();
-      console.error("[story-tts] openai error", ttsRes.status, raw.slice(0, 400));
-      return res.status(502).json({ ok: false, error: raw.slice(0, 200) || "tts failed" });
-    }
-
-    const buffer = Buffer.from(await ttsRes.arrayBuffer());
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "private, max-age=86400");
-    return res.send(buffer);
-  } catch (e) {
-    console.error("[story-tts] error", e);
-    return res.status(500).json({ ok: false, error: e?.message || "tts failed" });
-  }
-});
-
 // =========================
 // STORY IMAGE GENERATION (GPT cover + scene backgrounds)
 // =========================
@@ -1793,14 +1721,6 @@ function parseStoryReferenceImages(raw) {
     .slice(0, 4);
 }
 
-const STORY_BANNER_TITLE_RULES = `Visual rules for story banner card:
-- horizontal 16:9 composition (landscape banner card)
-- cinematic lighting, full background scene
-- render the story title text prominently at the top center, integrated into the artwork like a movie or game poster
-- title must be bold, readable, cinematic typography with dramatic lighting or texture
-- no speech bubbles, no subtitles, no caption text, no watermark, no UI elements
-- emotionally clear storytelling`;
-
 function buildStoryImagePrompt({
   programType,
   title = "",
@@ -1813,7 +1733,6 @@ function buildStoryImagePrompt({
   emotion = "",
   referenceCharacterNames = [],
   isCover = false,
-  renderTitleInImage = false,
 }) {
   const program = normalizeStoryProgramType(programType);
   const style = STORY_CATEGORY_STYLES[program] || STORY_CATEGORY_STYLES.fantasy;
@@ -1831,20 +1750,8 @@ function buildStoryImagePrompt({
     : [];
 
   const kind = isCover
-    ? renderTitleInImage
-      ? "Create one high-quality horizontal story banner cover with the title text rendered inside the image."
-      : "Create one high-quality vertical story cover background."
+    ? "Create one high-quality vertical story cover background."
     : "Create one high-quality vertical story scene background.";
-
-  const visualRules = isCover && renderTitleInImage
-    ? `${STORY_BANNER_TITLE_RULES}
-- only text allowed in the image is the story title shown below`
-    : STORY_IMAGE_COMMON_RULES;
-
-  const titleBlock =
-    isCover && renderTitleInImage && t
-      ? `\nTitle text to render in the image (Korean, exact spelling): 「${t}」`
-      : "";
 
   const refBlock =
     refNames.length > 0
@@ -1861,7 +1768,7 @@ ${style}
 
 ${focus}
 
-${visualRules}${titleBlock}
+${STORY_IMAGE_COMMON_RULES}
 
 Program: ${program}
 Title: ${t}
@@ -2050,10 +1957,6 @@ async function generateStoryImageFromPrompt(
 
 app.post("/api/story-cover-image", async (req, res) => {
   try {
-    if (!storyImageGenerationEnabled()) {
-      return res.status(503).json({ ok: false, error: "story image generation disabled" });
-    }
-
     const {
       program_type = "fantasy",
       title = "",
@@ -2066,7 +1969,6 @@ app.post("/api/story-cover-image", async (req, res) => {
       scene_summary = "",
       characters = "",
       reference_images = [],
-      render_title_in_image = false,
     } = req.body || {};
 
     if (!OPENAI_API_KEY) {
@@ -2087,7 +1989,6 @@ app.post("/api/story-cover-image", async (req, res) => {
       characters: characters || refNames.join(", "),
       referenceCharacterNames: refNames,
       isCover: true,
-      renderTitleInImage: !!render_title_in_image,
     });
 
     const imageUrl = await generateStoryImageFromPrompt(
@@ -2106,10 +2007,6 @@ app.post("/api/story-cover-image", async (req, res) => {
 
 app.post("/api/story-scene-image", async (req, res) => {
   try {
-    if (!storyImageGenerationEnabled()) {
-      return res.status(503).json({ ok: false, error: "story image generation disabled" });
-    }
-
     const {
       program_type = "fantasy",
       title = "",
@@ -2225,6 +2122,42 @@ async function handleUserStoriesPost(req, res) {
 
 async function handleUserStoriesQueryGet(req, res) {
   try {
+    const scopeRaw = req.query && req.query.scope;
+    const scope =
+      typeof scopeRaw === "string"
+        ? decodeURIComponent(scopeRaw).trim().toLowerCase()
+        : Array.isArray(scopeRaw) && typeof scopeRaw[0] === "string"
+          ? decodeURIComponent(scopeRaw[0]).trim().toLowerCase()
+          : "";
+
+    const categoryRaw = req.query && req.query.category;
+    const category =
+      typeof categoryRaw === "string"
+        ? decodeURIComponent(categoryRaw).trim()
+        : Array.isArray(categoryRaw) && typeof categoryRaw[0] === "string"
+          ? decodeURIComponent(categoryRaw[0]).trim()
+          : "";
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    if (scope === "public") {
+      let query = supabase
+        .from("user_stories")
+        .select("*")
+        .eq("visibility", "public")
+        .order("updated_at", { ascending: false });
+      if (category) {
+        query = query.eq("category", category);
+      }
+      const { data, error } = await query;
+      if (error) {
+        logSupabaseErr("[user-stories public list]", error);
+        return res.status(500).json({ ok: false, error: error.message });
+      }
+      return res.json({ ok: true, stories: data || [] });
+    }
+
     const raw = req.query && req.query.user_id;
     const userId =
       typeof raw === "string"
@@ -2235,9 +2168,6 @@ async function handleUserStoriesQueryGet(req, res) {
     if (!userId) {
       return res.status(400).json({ ok: false, error: "user_id required" });
     }
-
-    const supabase = getSupabase();
-    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
 
     const { data, error } = await supabase
       .from("user_stories")
@@ -2286,12 +2216,69 @@ async function handleUserStoryByIdGet(req, res) {
   }
 }
 
+async function handleUserStoryByIdDelete(req, res) {
+  try {
+    const storyId = decodeURIComponent(req.params.id || "").trim();
+    if (!storyId) {
+      return res.status(400).json({ ok: false, error: "id required" });
+    }
+
+    const raw = req.query && req.query.user_id;
+    const userId =
+      typeof raw === "string"
+        ? decodeURIComponent(raw).trim()
+        : Array.isArray(raw) && typeof raw[0] === "string"
+          ? decodeURIComponent(raw[0]).trim()
+          : "";
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: "user_id required" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from("user_stories")
+      .select("user_id")
+      .eq("id", storyId)
+      .maybeSingle();
+
+    if (fetchErr) {
+      logSupabaseErr("[user-stories delete fetch]", fetchErr);
+      return res.status(500).json({ ok: false, error: fetchErr.message });
+    }
+    if (!existing) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
+    if ((existing.user_id || "").trim() !== userId) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    const { error: deleteErr } = await supabase
+      .from("user_stories")
+      .delete()
+      .eq("id", storyId);
+
+    if (deleteErr) {
+      logSupabaseErr("[user-stories delete]", deleteErr);
+      return res.status(500).json({ ok: false, error: deleteErr.message });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[user-stories delete]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
 app.post("/api/user-stories", handleUserStoriesPost);
 app.post("/user-stories", handleUserStoriesPost);
 app.get("/api/user-stories", handleUserStoriesQueryGet);
 app.get("/user-stories", handleUserStoriesQueryGet);
 app.get("/api/user-stories/:id", handleUserStoryByIdGet);
 app.get("/user-stories/:id", handleUserStoryByIdGet);
+app.delete("/api/user-stories/:id", handleUserStoryByIdDelete);
+app.delete("/user-stories/:id", handleUserStoryByIdDelete);
 
 const PORT = Number(process.env.PORT) || 3000;
 
