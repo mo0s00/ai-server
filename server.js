@@ -7,7 +7,7 @@ import { createClient } from "@supabase/supabase-js";
 
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
-const ANTHROPIC_MODEL_DEFAULT = "claude-sonnet-4-6";
+const ANTHROPIC_MODEL_DEFAULT = "claude-sonnet-5";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
 const SERVER_REV = "story-apis-anthropic-primary";
