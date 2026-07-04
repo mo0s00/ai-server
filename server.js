@@ -7,7 +7,8 @@ import { createClient } from "@supabase/supabase-js";
 
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
-const ANTHROPIC_MODEL_DEFAULT = "claude-sonnet-5";
+/** Story APIs default — Anthropic Claude Sonnet 4.6 (Claude API ID). Override with STORY_MODEL. */
+const ANTHROPIC_STORY_MODEL_DEFAULT = "claude-sonnet-4-6";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
 const SERVER_REV = "story-apis-anthropic-primary";
@@ -96,11 +97,7 @@ app.get("/health", (_req, res) => {
     process.env.SUPABASE_ANON_KEY ||
     ""
   ).trim();
-  const anthropicConfigured = !!(process.env.ANTHROPIC_API_KEY || "").trim();
-  const storyModel = anthropicConfigured
-    ? (process.env.ANTHROPIC_MODEL || "").trim() || ANTHROPIC_MODEL_DEFAULT
-    : MODEL;
-  const storyProvider = anthropicConfigured ? "anthropic" : "deepseek";
+  const { anthropicConfigured, storyProvider, storyModel } = getStoryProviderConfig();
   res.json({
     ok: true,
     rev: SERVER_REV,
@@ -319,27 +316,48 @@ function releaseDeepSeekSlot() {
 }
 
 let anthropicClient = null;
-let anthropicModelEnvLogged = false;
+let storyModelEnvLogged = false;
 
-function logAnthropicModelEnvOnce() {
-  if (anthropicModelEnvLogged) return;
-  anthropicModelEnvLogged = true;
-  const fromEnv = (process.env.ANTHROPIC_MODEL || "").trim();
-  if (!fromEnv) {
-    console.warn(
-      "[ai-server] ANTHROPIC_MODEL is not set in environment — " +
-        `using default "${ANTHROPIC_MODEL_DEFAULT}". ` +
-        "Set ANTHROPIC_MODEL on Render to override."
-    );
+function getStoryAnthropicModelId() {
+  logStoryModelEnvOnce();
+  const storyEnv = (process.env.STORY_MODEL || "").trim();
+  if (storyEnv) return storyEnv;
+  return ANTHROPIC_STORY_MODEL_DEFAULT;
+}
+
+function getStoryProviderConfig() {
+  const anthropicConfigured = !!(process.env.ANTHROPIC_API_KEY || "").trim();
+  const storyProvider = anthropicConfigured ? "anthropic" : "deepseek";
+  const storyModel = anthropicConfigured ? getStoryAnthropicModelId() : MODEL;
+  return { anthropicConfigured, storyProvider, storyModel };
+}
+
+function logStoryModelEnvOnce() {
+  if (storyModelEnvLogged) return;
+  storyModelEnvLogged = true;
+  const storyEnv = (process.env.STORY_MODEL || "").trim();
+  const anthropicModelEnv = (process.env.ANTHROPIC_MODEL || "").trim();
+  if (storyEnv) {
+    console.log("[ai-server] STORY_MODEL:", storyEnv);
   } else {
-    console.log("[ai-server] ANTHROPIC_MODEL:", fromEnv);
+    console.log(
+      "[ai-server] STORY_MODEL is not set — story APIs use default:",
+      ANTHROPIC_STORY_MODEL_DEFAULT
+    );
+  }
+  if (anthropicModelEnv && anthropicModelEnv !== getStoryAnthropicModelId()) {
+    console.warn(
+      "[ai-server] ANTHROPIC_MODEL=" +
+        anthropicModelEnv +
+        " is ignored for story APIs (POST /api/story-chat, POST /api/story-suggestions). " +
+        "Set STORY_MODEL to override the story model."
+    );
   }
 }
 
-function getAnthropicModelId() {
-  logAnthropicModelEnvOnce();
-  const fromEnv = (process.env.ANTHROPIC_MODEL || "").trim();
-  return fromEnv || ANTHROPIC_MODEL_DEFAULT;
+function logStoryProviderOnStartup() {
+  const { storyProvider, storyModel } = getStoryProviderConfig();
+  console.log(`[ai-server] storyProvider=${storyProvider} storyModel=${storyModel}`);
 }
 
 function getAnthropicClient() {
@@ -536,7 +554,7 @@ async function callAnthropicCompletion({
     };
   }
 
-  const model = getAnthropicModelId();
+  const model = getStoryAnthropicModelId();
   const request = {
     model,
     max_tokens,
@@ -612,10 +630,10 @@ async function callStoryLlmWithFallback({
 
   if (!anthropicResult.skipped) {
     console.warn(
-      `[${logTag}] Anthropic failed (${anthropicResult.errorText}) — falling back to DeepSeek`
+      `[${logTag}] Anthropic failed (${anthropicResult.errorText}) — fallback=deepseek`
     );
   } else {
-    console.log(`[${logTag}] Anthropic unavailable — using DeepSeek`);
+    console.log(`[${logTag}] Anthropic unavailable — fallback=deepseek`);
   }
 
   const deepseekResult = await callDeepSeekCompletion({
@@ -2713,6 +2731,7 @@ app.delete("/user-stories/:id", handleUserStoryByIdDelete);
 const PORT = Number(process.env.PORT) || 3000;
 
 logSupabaseInit();
+logStoryProviderOnStartup();
 
 try {
   const server = app.listen(PORT, "0.0.0.0", () => {
