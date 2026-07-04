@@ -863,6 +863,7 @@ async function handleStorySuggestionsPost(req, res) {
       try {
         payload = JSON.stringify({
           model: MODEL,
+          thinking: { type: "disabled" },
           temperature,
           max_tokens,
           messages: [{ role: "user", content: cleanedPrompt }],
@@ -1755,6 +1756,7 @@ app.post("/api/story-chat", async (req, res) => {
           },
           body: JSON.stringify({
             model: MODEL,
+            thinking: { type: "disabled" },
             temperature,
             max_tokens,
             messages: [{ role: "user", content: cleanedPrompt }],
