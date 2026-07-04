@@ -115,6 +115,7 @@ app.get("/health", (_req, res) => {
       "POST /api/comment-save",
       "POST /comment-save",
       "POST /api/story-chat",
+      "POST /api/story-suggestions",
       "POST /api/story-cover-image",
       "POST /api/story-scene-image",
       "POST /api/user-stories",
@@ -803,6 +804,148 @@ async function handleAiCommentPost(req, res) {
   }
 }
 
+function resolveStorySuggestionMaxTokens(requested) {
+  const n = Number(requested);
+  if (!Number.isFinite(n) || n <= 0) return 350;
+  return Math.min(2048, Math.max(220, Math.floor(n)));
+}
+
+/** 스토리 beat 추천 재작성 — DeepSeek only, scene prediction 없음. */
+async function handleStorySuggestionsPost(req, res) {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+
+  try {
+    const promptRaw = req.body && req.body.prompt;
+    if (typeof promptRaw !== "string" || !promptRaw.trim()) {
+      return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+    }
+
+    let cleanedPrompt = sanitizePromptForApi(promptRaw);
+    if (!cleanedPrompt) {
+      return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+    }
+    if (cleanedPrompt.length > MAX_PROMPT_CHARS) {
+      console.log(
+        "[story-suggestions] truncating prompt length",
+        cleanedPrompt.length,
+        "->",
+        MAX_PROMPT_CHARS
+      );
+      cleanedPrompt =
+        cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
+    }
+
+    const key = process.env.DEEPSEEK_API_KEY;
+    if (!key || typeof key !== "string" || !key.trim()) {
+      console.log("[story-suggestions] DEEPSEEK_API_KEY missing");
+      return res.status(503).json({ text: "서버 설정 오류입니다." });
+    }
+
+    const storyId = readString(req.body, "story_id");
+    const programId = readString(req.body, "program_id");
+    const slotCount = readInt(req.body, "slot_count", 2);
+    const requestedTemperature = Number(req.body && req.body.temperature);
+    const max_tokens = resolveStorySuggestionMaxTokens(req.body && req.body.maxTokens);
+
+    const temperature =
+      Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
+        ? requestedTemperature
+        : 0.72;
+
+    console.log(
+      `[story-suggestions] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
+        `slotCount=${slotCount} promptLen=${cleanedPrompt.length} maxTokens=${max_tokens}`,
+    );
+
+    await acquireDeepSeekSlot();
+    try {
+      let payload;
+      try {
+        payload = JSON.stringify({
+          model: MODEL,
+          temperature,
+          max_tokens,
+          messages: [{ role: "user", content: cleanedPrompt }],
+        });
+      } catch (stringifyErr) {
+        console.error("[story-suggestions] JSON.stringify(payload) failed:", stringifyErr);
+        return res.status(400).json({ text: "프롬프트 인코딩에 실패했습니다." });
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+      let dsRes;
+      try {
+        dsRes = await fetch(DEEPSEEK_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key.trim()}`,
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: payload,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const rawText = await dsRes.text();
+      const safeRaw = typeof rawText === "string" ? rawText : String(rawText ?? "");
+      let json = {};
+      if (safeRaw) {
+        try {
+          json = JSON.parse(safeRaw);
+        } catch (parseErr) {
+          console.log("[story-suggestions] DeepSeek JSON parse", parseErr.message);
+          return res.status(502).json({ text: "응답을 해석할 수 없습니다." });
+        }
+      }
+
+      if (!dsRes.ok) {
+        const apiMsg =
+          deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
+        const statusOut = dsRes.status >= 500 ? 502 : dsRes.status;
+        console.log(
+          "[story-suggestions] DeepSeek HTTP",
+          dsRes.status,
+          safeRaw.length ? safeRaw.slice(0, 400) : "(empty body)"
+        );
+        return res.status(statusOut).json({ text: apiMsg });
+      }
+
+      const choices = Array.isArray(json?.choices) ? json.choices : [];
+      const first = choices[0];
+      const msgObj = first && first.message;
+      let text = assistantTextFromMessage(msgObj);
+      if (!text && first && typeof first.text === "string") {
+        text = first.text.trim();
+      }
+
+      if (!text) {
+        console.log("[story-suggestions] No assistant content in DeepSeek response");
+        return res.status(502).json({ text: "추천문 생성 실패" });
+      }
+
+      if (isGarbageModelLine(text, MODEL)) {
+        console.log("[story-suggestions] rejected garbage model-line reply");
+        return res.status(502).json({ text: "추천문 생성 실패" });
+      }
+
+      return res.json({ text, raw: json });
+    } finally {
+      releaseDeepSeekSlot();
+    }
+  } catch (e) {
+    const msg = e && e.message ? String(e.message) : String(e);
+    console.error("[ai-server] POST /api/story-suggestions error:", msg);
+    if (e && e.name === "AbortError") {
+      return res.status(504).json({ text: "요청 시간이 초과되었습니다." });
+    }
+    return res.status(500).json({ text: "server error" });
+  }
+}
+
 // 댓글러 XP/잠금/즐겨찾기 — 앱 `GET /api/commenter-states/:userId`
 async function handleCommenterStatesGet(req, res) {
   try {
@@ -876,6 +1019,9 @@ async function handleCommenterStatePost(req, res) {
 // POST 별칭: 동일 핸들러를 `/api/*` 와 루트 경로에 각각 한 번만 등록
 app.post("/api/comment", handleAiCommentPost);
 app.post("/comment", handleAiCommentPost);
+
+app.post("/api/story-suggestions", handleStorySuggestionsPost);
+app.post("/story-suggestions", handleStorySuggestionsPost);
 
 app.post("/api/comment-save", handleCommentSave);
 app.post("/comment-save", handleCommentSave);
@@ -1442,6 +1588,12 @@ function normalizeStoryScenePreload(value, scene) {
   return out;
 }
 
+function storyChatSkipsScenePrediction(storyId, programId) {
+  const sid = String(storyId || "").trim();
+  const pid = String(programId || "").trim();
+  return sid === "movie_alien_x" || sid.startsWith("movie_") || pid === "movie_story";
+}
+
 async function predictStoryScene(contextText) {
   if (!OPENAI_API_KEY) {
     return {
@@ -1575,11 +1727,25 @@ app.post("/api/story-chat", async (req, res) => {
     }
 
     const sceneContext = storyContext || cleanedPrompt;
+    const storyId = readString(req.body, "story_id");
+    const programId = readString(req.body, "program_id");
+    const beatScene = readString(req.body, "beat_scene");
+    const skipScenePrediction =
+      (req.body && req.body.skip_scene_prediction === true) ||
+      storyChatSkipsScenePrediction(storyId, programId);
 
     await acquireDeepSeekSlot();
     let deepseekRes;
     let sceneData;
     try {
+      const scenePromise = skipScenePrediction
+        ? Promise.resolve({
+            scene: "default",
+            preload: [],
+            source: "beat_scene_only",
+          })
+        : predictStoryScene(sceneContext);
+
       [deepseekRes, sceneData] = await Promise.all([
         fetch(DEEPSEEK_URL, {
           method: "POST",
@@ -1594,7 +1760,7 @@ app.post("/api/story-chat", async (req, res) => {
             messages: [{ role: "user", content: cleanedPrompt }],
           }),
         }),
-        predictStoryScene(sceneContext),
+        scenePromise,
       ]);
     } finally {
       releaseDeepSeekSlot();
@@ -1625,6 +1791,12 @@ app.post("/api/story-chat", async (req, res) => {
     if (!reply) {
       return res.status(502).json({ ok: false, error: "empty deepseek reply" });
     }
+
+    console.log(
+      `[story-chat] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
+        `currentBeat.scene=${beatScene || "(none)"} appliedScenePreset=${sceneData.scene} ` +
+        `preload=${JSON.stringify(sceneData.preload)} source=${sceneData.source}`,
+    );
 
     return res.json({
       ok: true,
