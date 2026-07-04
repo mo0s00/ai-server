@@ -2,13 +2,15 @@
 
 import express from "express";
 import FormData from "form-data";
+import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
+const ANTHROPIC_MODEL_DEFAULT = "claude-sonnet-4-6";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health). */
-const SERVER_REV = "add delete user story api";
+const SERVER_REV = "story-apis-anthropic-primary";
 
 const OPENAI_API_KEY = (
   process.env.OPENAI_API_KEY ||
@@ -94,12 +96,20 @@ app.get("/health", (_req, res) => {
     process.env.SUPABASE_ANON_KEY ||
     ""
   ).trim();
+  const anthropicConfigured = !!(process.env.ANTHROPIC_API_KEY || "").trim();
+  const storyModel = anthropicConfigured
+    ? (process.env.ANTHROPIC_MODEL || "").trim() || ANTHROPIC_MODEL_DEFAULT
+    : MODEL;
+  const storyProvider = anthropicConfigured ? "anthropic" : "deepseek";
   res.json({
     ok: true,
     rev: SERVER_REV,
     model: MODEL,
     openaiConfigured: !!OPENAI_API_KEY,
     supabaseConfigured: !!(url && key),
+    storyProvider,
+    storyModel,
+    anthropicConfigured,
     supabasePostPaths: [
       "POST /api/cookie-tx",
       "POST /api/commenter-state",
@@ -306,6 +316,318 @@ function releaseDeepSeekSlot() {
   } else {
     dsPermits++;
   }
+}
+
+let anthropicClient = null;
+let anthropicModelEnvLogged = false;
+
+function logAnthropicModelEnvOnce() {
+  if (anthropicModelEnvLogged) return;
+  anthropicModelEnvLogged = true;
+  const fromEnv = (process.env.ANTHROPIC_MODEL || "").trim();
+  if (!fromEnv) {
+    console.warn(
+      "[ai-server] ANTHROPIC_MODEL is not set in environment — " +
+        `using default "${ANTHROPIC_MODEL_DEFAULT}". ` +
+        "Set ANTHROPIC_MODEL on Render to override."
+    );
+  } else {
+    console.log("[ai-server] ANTHROPIC_MODEL:", fromEnv);
+  }
+}
+
+function getAnthropicModelId() {
+  logAnthropicModelEnvOnce();
+  const fromEnv = (process.env.ANTHROPIC_MODEL || "").trim();
+  return fromEnv || ANTHROPIC_MODEL_DEFAULT;
+}
+
+function getAnthropicClient() {
+  const apiKey = (process.env.ANTHROPIC_API_KEY || "").trim();
+  if (!apiKey) return null;
+  if (!anthropicClient) {
+    anthropicClient = new Anthropic({ apiKey });
+  }
+  return anthropicClient;
+}
+
+function anthropicErrorMessage(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  if (typeof err.message === "string" && err.message.trim()) return err.message.trim();
+  const body = err.error || err.response?.data?.error;
+  if (typeof body === "string") return body;
+  if (body && typeof body === "object" && typeof body.message === "string") {
+    return body.message;
+  }
+  return "";
+}
+
+function textFromAnthropicMessage(message) {
+  if (!message || !Array.isArray(message.content)) return "";
+  const parts = [];
+  for (const block of message.content) {
+    if (block && block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    }
+  }
+  return parts.join("").trim();
+}
+
+function logAnthropicFailure(logTag, err) {
+  const status = err?.status ?? err?.statusCode ?? "(unknown)";
+  const msg = anthropicErrorMessage(err) || err?.message || String(err);
+  let bodyStr = "";
+  try {
+    if (err?.error) {
+      bodyStr = typeof err.error === "string" ? err.error : JSON.stringify(err.error);
+    } else if (err?.response?.data) {
+      bodyStr =
+        typeof err.response.data === "string"
+          ? err.response.data
+          : JSON.stringify(err.response.data);
+    }
+  } catch (_e) {
+    bodyStr = "[unserializable error body]";
+  }
+  console.error(`[${logTag}] Anthropic HTTP`, status, msg);
+  if (bodyStr) {
+    console.error(`[${logTag}] Anthropic error body:`, bodyStr.slice(0, 800));
+  }
+}
+
+async function callDeepSeekCompletion({ userPrompt, temperature, max_tokens, logTag }) {
+  const key = (process.env.DEEPSEEK_API_KEY || "").trim();
+  if (!key) {
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: 503,
+      errorText: "서버 설정 오류입니다.",
+      skipped: true,
+    };
+  }
+
+  let payload;
+  try {
+    payload = JSON.stringify({
+      model: MODEL,
+      thinking: { type: "disabled" },
+      temperature,
+      max_tokens,
+      messages: [{ role: "user", content: userPrompt }],
+    });
+  } catch (stringifyErr) {
+    console.error(`[${logTag}] JSON.stringify(deepseek payload) failed:`, stringifyErr);
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: 400,
+      errorText: "프롬프트 인코딩에 실패했습니다.",
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  let dsRes;
+  try {
+    dsRes = await fetch(DEEPSEEK_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: payload,
+      signal: controller.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(timer);
+    const msg = fetchErr?.message || String(fetchErr);
+    console.error(`[${logTag}] DeepSeek fetch error:`, msg);
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: fetchErr?.name === "AbortError" ? 504 : 502,
+      errorText:
+        fetchErr?.name === "AbortError"
+          ? "요청 시간이 초과되었습니다."
+          : "AI 서버 연결이 불안정합니다. 잠시 후 다시 시도해 주세요.",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const rawText = await dsRes.text();
+  const safeRaw = typeof rawText === "string" ? rawText : String(rawText ?? "");
+  let json = {};
+  if (safeRaw) {
+    try {
+      json = JSON.parse(safeRaw);
+    } catch (parseErr) {
+      console.log(`[${logTag}] DeepSeek JSON parse`, parseErr.message);
+      return {
+        ok: false,
+        provider: "deepseek",
+        status: 502,
+        errorText: "응답을 해석할 수 없습니다.",
+      };
+    }
+  }
+
+  if (!dsRes.ok) {
+    const apiMsg = deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
+    const statusOut = dsRes.status >= 500 ? 502 : dsRes.status;
+    console.log(
+      `[${logTag}] DeepSeek HTTP`,
+      dsRes.status,
+      safeRaw.length ? safeRaw.slice(0, 400) : "(empty body)"
+    );
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: statusOut,
+      errorText: apiMsg,
+    };
+  }
+
+  const choices = Array.isArray(json?.choices) ? json.choices : [];
+  const first = choices[0];
+  const msgObj = first && first.message;
+  let text = assistantTextFromMessage(msgObj);
+  if (!text && first && typeof first.text === "string") {
+    text = first.text.trim();
+  }
+
+  if (!text) {
+    console.log(`[${logTag}] No assistant content in DeepSeek response`);
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: 502,
+      errorText: "추천문 생성 실패",
+    };
+  }
+
+  return {
+    ok: true,
+    provider: "deepseek",
+    model: MODEL,
+    text,
+    raw: json,
+  };
+}
+
+async function callAnthropicCompletion({
+  userPrompt,
+  temperature,
+  max_tokens,
+  logTag,
+  systemPrompt,
+}) {
+  const client = getAnthropicClient();
+  if (!client) {
+    return {
+      ok: false,
+      provider: "anthropic",
+      status: 503,
+      errorText: "no ANTHROPIC_API_KEY",
+      skipped: true,
+    };
+  }
+
+  const model = getAnthropicModelId();
+  const request = {
+    model,
+    max_tokens,
+    temperature,
+    messages: [{ role: "user", content: userPrompt }],
+  };
+  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
+    request.system = systemPrompt.trim();
+  }
+
+  try {
+    const message = await client.messages.create(request, { timeout: FETCH_TIMEOUT_MS });
+    const text = textFromAnthropicMessage(message);
+    if (!text) {
+      console.log(`[${logTag}] No text content in Anthropic response`);
+      return {
+        ok: false,
+        provider: "anthropic",
+        status: 502,
+        errorText: "추천문 생성 실패",
+        raw: message,
+      };
+    }
+    return {
+      ok: true,
+      provider: "anthropic",
+      model,
+      text,
+      raw: message,
+    };
+  } catch (err) {
+    logAnthropicFailure(logTag, err);
+    const statusRaw = err?.status ?? err?.statusCode;
+    const statusOut =
+      typeof statusRaw === "number" && statusRaw >= 500
+        ? 502
+        : typeof statusRaw === "number"
+          ? statusRaw
+          : err?.name === "AbortError"
+            ? 504
+            : 502;
+    const errorText =
+      err?.name === "AbortError"
+        ? "요청 시간이 초과되었습니다."
+        : anthropicErrorMessage(err) || "Anthropic 요청에 실패했습니다.";
+    return {
+      ok: false,
+      provider: "anthropic",
+      status: statusOut,
+      errorText,
+    };
+  }
+}
+
+async function callStoryLlmWithFallback({
+  userPrompt,
+  temperature,
+  max_tokens,
+  logTag,
+  systemPrompt,
+}) {
+  const anthropicResult = await callAnthropicCompletion({
+    userPrompt,
+    temperature,
+    max_tokens,
+    logTag,
+    systemPrompt,
+  });
+  if (anthropicResult.ok) {
+    console.log(`[${logTag}] provider=anthropic model=${anthropicResult.model}`);
+    return anthropicResult;
+  }
+
+  if (!anthropicResult.skipped) {
+    console.warn(
+      `[${logTag}] Anthropic failed (${anthropicResult.errorText}) — falling back to DeepSeek`
+    );
+  } else {
+    console.log(`[${logTag}] Anthropic unavailable — using DeepSeek`);
+  }
+
+  const deepseekResult = await callDeepSeekCompletion({
+    userPrompt,
+    temperature,
+    max_tokens,
+    logTag,
+  });
+  if (deepseekResult.ok) {
+    console.log(`[${logTag}] provider=deepseek model=${deepseekResult.model}`);
+  }
+  return deepseekResult;
 }
 
 /** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
@@ -810,7 +1132,7 @@ function resolveStorySuggestionMaxTokens(requested) {
   return Math.min(2048, Math.max(220, Math.floor(n)));
 }
 
-/** 스토리 beat 추천 재작성 — DeepSeek only, scene prediction 없음. */
+/** 스토리 beat 추천 재작성 — Anthropic 우선, DeepSeek fallback, scene prediction 없음. */
 async function handleStorySuggestionsPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
@@ -835,9 +1157,10 @@ async function handleStorySuggestionsPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    const key = process.env.DEEPSEEK_API_KEY;
-    if (!key || typeof key !== "string" || !key.trim()) {
-      console.log("[story-suggestions] DEEPSEEK_API_KEY missing");
+    const anthropicKey = (process.env.ANTHROPIC_API_KEY || "").trim();
+    const deepseekKey = (process.env.DEEPSEEK_API_KEY || "").trim();
+    if (!anthropicKey && !deepseekKey) {
+      console.log("[story-suggestions] ANTHROPIC_API_KEY and DEEPSEEK_API_KEY missing");
       return res.status(503).json({ text: "서버 설정 오류입니다." });
     }
 
@@ -859,81 +1182,31 @@ async function handleStorySuggestionsPost(req, res) {
 
     await acquireDeepSeekSlot();
     try {
-      let payload;
-      try {
-        payload = JSON.stringify({
-          model: MODEL,
-          thinking: { type: "disabled" },
-          temperature,
-          max_tokens,
-          messages: [{ role: "user", content: cleanedPrompt }],
-        });
-      } catch (stringifyErr) {
-        console.error("[story-suggestions] JSON.stringify(payload) failed:", stringifyErr);
-        return res.status(400).json({ text: "프롬프트 인코딩에 실패했습니다." });
+      const llmResult = await callStoryLlmWithFallback({
+        userPrompt: cleanedPrompt,
+        temperature,
+        max_tokens,
+        logTag: "story-suggestions",
+      });
+
+      if (!llmResult.ok) {
+        const statusOut = llmResult.status || 502;
+        const errorText =
+          llmResult.errorText ||
+          (llmResult.provider === "deepseek"
+            ? "DeepSeek 요청에 실패했습니다."
+            : "Anthropic 요청에 실패했습니다.");
+        return res.status(statusOut).json({ text: errorText });
       }
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-      let dsRes;
-      try {
-        dsRes = await fetch(DEEPSEEK_URL, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${key.trim()}`,
-            "Content-Type": "application/json; charset=utf-8",
-          },
-          body: payload,
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-
-      const rawText = await dsRes.text();
-      const safeRaw = typeof rawText === "string" ? rawText : String(rawText ?? "");
-      let json = {};
-      if (safeRaw) {
-        try {
-          json = JSON.parse(safeRaw);
-        } catch (parseErr) {
-          console.log("[story-suggestions] DeepSeek JSON parse", parseErr.message);
-          return res.status(502).json({ text: "응답을 해석할 수 없습니다." });
-        }
-      }
-
-      if (!dsRes.ok) {
-        const apiMsg =
-          deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
-        const statusOut = dsRes.status >= 500 ? 502 : dsRes.status;
-        console.log(
-          "[story-suggestions] DeepSeek HTTP",
-          dsRes.status,
-          safeRaw.length ? safeRaw.slice(0, 400) : "(empty body)"
-        );
-        return res.status(statusOut).json({ text: apiMsg });
-      }
-
-      const choices = Array.isArray(json?.choices) ? json.choices : [];
-      const first = choices[0];
-      const msgObj = first && first.message;
-      let text = assistantTextFromMessage(msgObj);
-      if (!text && first && typeof first.text === "string") {
-        text = first.text.trim();
-      }
-
-      if (!text) {
-        console.log("[story-suggestions] No assistant content in DeepSeek response");
-        return res.status(502).json({ text: "추천문 생성 실패" });
-      }
-
-      if (isGarbageModelLine(text, MODEL)) {
+      const text = llmResult.text;
+      const modelForGarbage = llmResult.model || MODEL;
+      if (isGarbageModelLine(text, modelForGarbage)) {
         console.log("[story-suggestions] rejected garbage model-line reply");
         return res.status(502).json({ text: "추천문 생성 실패" });
       }
 
-      return res.json({ text, raw: json });
+      return res.json({ text, raw: llmResult.raw });
     } finally {
       releaseDeepSeekSlot();
     }
@@ -1505,7 +1778,7 @@ app.post("/chat-message", (req, res) =>
 );
 
 // =========================
-// STORY CHAT (DeepSeek reply + OpenAI scene prediction)
+// STORY CHAT (Anthropic/DeepSeek reply + OpenAI scene prediction)
 // =========================
 
 const STORY_SCENE_KEYS = [
@@ -1717,9 +1990,10 @@ app.post("/api/story-chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "no prompt" });
     }
 
+    const anthropicKey = (process.env.ANTHROPIC_API_KEY || "").trim();
     const deepseekKey = (process.env.DEEPSEEK_API_KEY || "").trim();
-    if (!deepseekKey) {
-      return res.status(500).json({ ok: false, error: "no DEEPSEEK_API_KEY" });
+    if (!anthropicKey && !deepseekKey) {
+      return res.status(500).json({ ok: false, error: "no ANTHROPIC_API_KEY or DEEPSEEK_API_KEY" });
     }
 
     const cleanedPrompt = sanitizePromptForApi(promptRaw);
@@ -1736,7 +2010,7 @@ app.post("/api/story-chat", async (req, res) => {
       storyChatSkipsScenePrediction(storyId, programId);
 
     await acquireDeepSeekSlot();
-    let deepseekRes;
+    let llmResult;
     let sceneData;
     try {
       const scenePromise = skipScenePrediction
@@ -1747,20 +2021,12 @@ app.post("/api/story-chat", async (req, res) => {
           })
         : predictStoryScene(sceneContext);
 
-      [deepseekRes, sceneData] = await Promise.all([
-        fetch(DEEPSEEK_URL, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${deepseekKey}`,
-            "Content-Type": "application/json; charset=utf-8",
-          },
-          body: JSON.stringify({
-            model: MODEL,
-            thinking: { type: "disabled" },
-            temperature,
-            max_tokens,
-            messages: [{ role: "user", content: cleanedPrompt }],
-          }),
+      [llmResult, sceneData] = await Promise.all([
+        callStoryLlmWithFallback({
+          userPrompt: cleanedPrompt,
+          temperature,
+          max_tokens,
+          logTag: "story-chat",
         }),
         scenePromise,
       ]);
@@ -1768,31 +2034,21 @@ app.post("/api/story-chat", async (req, res) => {
       releaseDeepSeekSlot();
     }
 
-    const raw = await deepseekRes.text();
-
-    if (!deepseekRes.ok) {
-      console.error("[story-chat deepseek error]", deepseekRes.status, raw.slice(0, 400));
-      const statusOut = deepseekRes.status >= 500 ? 502 : deepseekRes.status;
-      let errMsg = "deepseek failed";
-      try {
-        errMsg = deepSeekErrorMessage(JSON.parse(raw)) || errMsg;
-      } catch (_e) {
-        if (raw.trim()) errMsg = raw.slice(0, 200);
-      }
+    if (!llmResult.ok) {
+      const statusOut = llmResult.status || 502;
+      const errMsg =
+        llmResult.errorText ||
+        (llmResult.provider === "deepseek" ? "deepseek failed" : "anthropic failed");
+      console.error("[story-chat llm error]", llmResult.provider, statusOut, errMsg);
       return res.status(statusOut).json({ ok: false, error: errMsg });
     }
 
-    let deepseekJson;
-    try {
-      deepseekJson = JSON.parse(raw);
-    } catch (_e) {
-      deepseekJson = { text: raw };
+    const reply = llmResult.text;
+    if (!reply) {
+      return res.status(502).json({ ok: false, error: "empty reply" });
     }
 
-    const reply = plainTextFromDeepSeekJson(deepseekJson);
-    if (!reply) {
-      return res.status(502).json({ ok: false, error: "empty deepseek reply" });
-    }
+    const upstreamRaw = llmResult.raw;
 
     console.log(
       `[story-chat] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
@@ -1806,7 +2062,7 @@ app.post("/api/story-chat", async (req, res) => {
       scene: sceneData.scene,
       preload: sceneData.preload,
       scene_source: sceneData.source,
-      raw: deepseekJson,
+      raw: upstreamRaw,
     });
   } catch (e) {
     console.error("[story-chat server error]", e);
