@@ -5,15 +5,16 @@ import FormData from "form-data";
 import { createClient } from "@supabase/supabase-js";
 import { handleIapCookieVerifyPost } from "./iap-cookie.js";
 
-const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
+const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || "").trim();
+const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-v4-flash").trim();
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
-const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-5.4-nano").trim();
-/** Non-chat OpenAI APIs — fixed in code (env: OPENAI_API_KEY + OPENAI_MODEL only). */
+/** OpenAI — TTS·이미지 생성 전용 (스토리채팅·추천·comment는 DeepSeek). */
 const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-1";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "iap-cookie-productId-grants";
+const SERVER_REV = "story-chat-deepseek-v4-flash";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -99,10 +100,13 @@ function buildHealthPayload() {
   ).trim();
   return {
     ok: true,
-    openaiConfigured: !!OPENAI_API_KEY,
-    provider: "openai",
-    model: OPENAI_MODEL,
     rev: SERVER_REV,
+    provider: "deepseek",
+    model: DEEPSEEK_MODEL,
+    storyProvider: "deepseek",
+    storyModel: DEEPSEEK_MODEL,
+    deepseekConfigured: !!DEEPSEEK_API_KEY,
+    openaiConfigured: !!OPENAI_API_KEY,
     storyImageGeneration: storyImageGenerationEnabled(),
     supabaseConfigured: !!(url && key),
   };
@@ -187,6 +191,16 @@ function logSupabaseErr(label, err) {
   }
 }
 
+/** DeepSeek/호환 API 오류 본문에서 사람이 읽을 문자열만 뽑는다. */
+function deepSeekErrorMessage(json) {
+  if (!json || typeof json !== "object") return "";
+  const e = json.error;
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object" && typeof e.message === "string") return e.message;
+  if (typeof json.message === "string") return json.message;
+  return "";
+}
+
 /** OpenAI/호환 API 오류 본문에서 사람이 읽을 문자열만 뽑는다. */
 function openAiErrorMessage(json) {
   if (!json || typeof json !== "object") return "";
@@ -269,18 +283,46 @@ function assistantTextFromMessage(msgObj) {
   return "";
 }
 
-/** OpenAI Chat Completions — story-chat, story-suggestions, comment 등 공통. */
-async function callOpenAiCompletion({
+/** DeepSeek 동시 outbound 제한(Render·API 과부하·일시 차단 완화) */
+const DEEPSEEK_MAX_CONCURRENT = Math.max(
+  1,
+  Number.parseInt(process.env.DEEPSEEK_MAX_CONCURRENT || "3", 10) || 3
+);
+let dsPermits = DEEPSEEK_MAX_CONCURRENT;
+const dsWaitQueue = [];
+
+function acquireDeepSeekSlot() {
+  return new Promise((resolve) => {
+    if (dsPermits > 0) {
+      dsPermits--;
+      resolve();
+    } else {
+      dsWaitQueue.push(resolve);
+    }
+  });
+}
+
+function releaseDeepSeekSlot() {
+  if (dsWaitQueue.length > 0) {
+    const next = dsWaitQueue.shift();
+    next();
+  } else {
+    dsPermits++;
+  }
+}
+
+/** DeepSeek Chat Completions — story-chat, story-suggestions, comment 공통. */
+async function callDeepSeekCompletion({
   userPrompt,
   temperature,
   max_tokens,
   logTag,
   systemPrompt,
 }) {
-  if (!OPENAI_API_KEY) {
+  if (!DEEPSEEK_API_KEY) {
     return {
       ok: false,
-      provider: "openai",
+      provider: "deepseek",
       status: 503,
       errorText: "서버 설정 오류입니다.",
       skipped: true,
@@ -296,16 +338,17 @@ async function callOpenAiCompletion({
   let payload;
   try {
     payload = JSON.stringify({
-      model: OPENAI_MODEL,
+      model: DEEPSEEK_MODEL,
+      thinking: { type: "disabled" },
       temperature,
       max_tokens,
       messages,
     });
   } catch (stringifyErr) {
-    console.error(`[${logTag}] JSON.stringify(openai payload) failed:`, stringifyErr);
+    console.error(`[${logTag}] JSON.stringify(deepseek payload) failed:`, stringifyErr);
     return {
       ok: false,
-      provider: "openai",
+      provider: "deepseek",
       status: 400,
       errorText: "프롬프트 인코딩에 실패했습니다.",
     };
@@ -314,12 +357,12 @@ async function callOpenAiCompletion({
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  let oaiRes;
+  let dsRes;
   try {
-    oaiRes = await fetch(OPENAI_CHAT_URL, {
+    dsRes = await fetch(DEEPSEEK_URL, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
         "Content-Type": "application/json; charset=utf-8",
       },
       body: payload,
@@ -328,10 +371,10 @@ async function callOpenAiCompletion({
   } catch (fetchErr) {
     clearTimeout(timer);
     const msg = fetchErr?.message || String(fetchErr);
-    console.error(`[${logTag}] OpenAI fetch error:`, msg);
+    console.error(`[${logTag}] DeepSeek fetch error:`, msg);
     return {
       ok: false,
-      provider: "openai",
+      provider: "deepseek",
       status: fetchErr?.name === "AbortError" ? 504 : 502,
       errorText:
         fetchErr?.name === "AbortError"
@@ -342,32 +385,33 @@ async function callOpenAiCompletion({
     clearTimeout(timer);
   }
 
-  const rawText = await oaiRes.text();
+  const rawText = await dsRes.text();
   const safeRaw = typeof rawText === "string" ? rawText : String(rawText ?? "");
   let json = {};
   if (safeRaw) {
     try {
       json = JSON.parse(safeRaw);
     } catch (parseErr) {
-      console.log(`[${logTag}] OpenAI JSON parse`, parseErr.message);
+      console.log(`[${logTag}] DeepSeek JSON parse`, parseErr.message);
       return {
         ok: false,
-        provider: "openai",
+        provider: "deepseek",
         status: 502,
         errorText: "응답을 해석할 수 없습니다.",
       };
     }
   }
 
-  if (!oaiRes.ok) {
-    const apiMsg = openAiErrorMessage(json) || "OpenAI 요청에 실패했습니다.";
-    const statusOut = oaiRes.status >= 500 ? 502 : oaiRes.status;
+  if (!dsRes.ok) {
+    const apiMsg = deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
+    const statusOut = dsRes.status >= 500 ? 502 : dsRes.status;
     console.log(
-      `[${logTag}] OpenAI HTTP ${oaiRes.status} provider=openai model=${OPENAI_MODEL}`,
+      `[${logTag}] DeepSeek HTTP ${dsRes.status} provider=deepseek model=${DEEPSEEK_MODEL}`,
+      safeRaw.length ? safeRaw.slice(0, 400) : "(empty body)"
     );
     return {
       ok: false,
-      provider: "openai",
+      provider: "deepseek",
       status: statusOut,
       errorText: apiMsg,
     };
@@ -383,21 +427,21 @@ async function callOpenAiCompletion({
 
   if (!text) {
     console.log(
-      `[${logTag}] No assistant content in OpenAI response provider=openai model=${OPENAI_MODEL}`,
+      `[${logTag}] No assistant content in DeepSeek response provider=deepseek model=${DEEPSEEK_MODEL}`,
     );
     return {
       ok: false,
-      provider: "openai",
+      provider: "deepseek",
       status: 502,
       errorText: "추천문 생성 실패",
     };
   }
 
-  console.log(`[${logTag}] provider=openai model=${OPENAI_MODEL}`);
+  console.log(`[${logTag}] provider=deepseek model=${DEEPSEEK_MODEL}`);
   return {
     ok: true,
-    provider: "openai",
-    model: OPENAI_MODEL,
+    provider: "deepseek",
+    model: DEEPSEEK_MODEL,
     text,
     raw: json,
   };
@@ -405,7 +449,7 @@ async function callOpenAiCompletion({
 /** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
 function isGarbageModelLine(s, modelStr) {
   const model =
-    typeof modelStr === "string" && modelStr.trim() ? modelStr.trim() : OPENAI_MODEL;
+    typeof modelStr === "string" && modelStr.trim() ? modelStr.trim() : DEEPSEEK_MODEL;
   if (!s || typeof s !== "string") return false;
   let t = s
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
@@ -736,8 +780,8 @@ async function handleAiCommentPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    if (!OPENAI_API_KEY) {
-      console.log("[comment] OPENAI_API_KEY missing");
+    if (!DEEPSEEK_API_KEY) {
+      console.log("[comment] DEEPSEEK_API_KEY missing");
       return res.status(503).json({ text: "서버 설정 오류입니다." });
     }
 
@@ -752,23 +796,29 @@ async function handleAiCommentPost(req, res) {
         ? Math.min(2048, Math.floor(requestedMaxTokens))
         : 200;
 
-    const llmResult = await callOpenAiCompletion({
-      userPrompt: cleanedPrompt,
-      temperature,
-      max_tokens,
-      logTag: "comment",
-    });
+    await acquireDeepSeekSlot();
+    let llmResult;
+    try {
+      llmResult = await callDeepSeekCompletion({
+        userPrompt: cleanedPrompt,
+        temperature,
+        max_tokens,
+        logTag: "comment",
+      });
+    } finally {
+      releaseDeepSeekSlot();
+    }
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
       return res.status(statusOut).json({
-        text: llmResult.errorText || "OpenAI 요청에 실패했습니다.",
+        text: llmResult.errorText || "DeepSeek 요청에 실패했습니다.",
       });
     }
 
     const text = llmResult.text;
 
-    if (isGarbageModelLine(text, OPENAI_MODEL)) {
+    if (isGarbageModelLine(text, DEEPSEEK_MODEL)) {
       console.log("[comment] rejected garbage model-line reply");
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
@@ -839,7 +889,7 @@ function resolveStorySuggestionMaxTokens(requested) {
   return Math.min(2048, Math.max(220, Math.floor(n)));
 }
 
-/** 스토리 beat 추천 재작성 — OpenAI only. */
+/** 스토리 beat 추천 재작성 — DeepSeek only. */
 async function handleStorySuggestionsPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
@@ -864,8 +914,8 @@ async function handleStorySuggestionsPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    if (!OPENAI_API_KEY) {
-      console.log("[story-suggestions] OPENAI_API_KEY missing");
+    if (!DEEPSEEK_API_KEY) {
+      console.log("[story-suggestions] DEEPSEEK_API_KEY missing");
       return res.status(503).json({ text: "서버 설정 오류입니다." });
     }
 
@@ -883,24 +933,30 @@ async function handleStorySuggestionsPost(req, res) {
     console.log(
       `[story-suggestions] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
         `slotCount=${slotCount} promptLen=${cleanedPrompt.length} maxTokens=${max_tokens} ` +
-        `provider=openai model=${OPENAI_MODEL}`,
+        `provider=deepseek model=${DEEPSEEK_MODEL}`,
     );
 
-    const llmResult = await callOpenAiCompletion({
-      userPrompt: cleanedPrompt,
-      temperature,
-      max_tokens,
-      logTag: "story-suggestions",
-    });
+    await acquireDeepSeekSlot();
+    let llmResult;
+    try {
+      llmResult = await callDeepSeekCompletion({
+        userPrompt: cleanedPrompt,
+        temperature,
+        max_tokens,
+        logTag: "story-suggestions",
+      });
+    } finally {
+      releaseDeepSeekSlot();
+    }
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
-      const errorText = llmResult.errorText || "OpenAI 요청에 실패했습니다.";
+      const errorText = llmResult.errorText || "DeepSeek 요청에 실패했습니다.";
       return res.status(statusOut).json({ text: errorText });
     }
 
     const text = llmResult.text;
-    if (isGarbageModelLine(text, OPENAI_MODEL)) {
+    if (isGarbageModelLine(text, DEEPSEEK_MODEL)) {
       console.log("[story-suggestions] rejected garbage model-line reply");
       return res.status(502).json({ text: "추천문 생성 실패" });
     }
@@ -1577,11 +1633,11 @@ function storyChatSkipsScenePrediction(storyId, programId) {
 }
 
 async function predictStoryScene(contextText) {
-  if (!OPENAI_API_KEY) {
+  if (!DEEPSEEK_API_KEY) {
     return {
       scene: "default",
       preload: [],
-      source: "fallback_no_openai_key",
+      source: "fallback_no_deepseek_key",
     };
   }
 
@@ -1594,20 +1650,7 @@ async function predictStoryScene(contextText) {
     };
   }
 
-  const sceneRes = await fetch(OPENAI_CHAT_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0.25,
-      max_tokens: 220,
-      messages: [
-        {
-          role: "system",
-          content: `You are the scene director for an AI story chat.
+  const sceneSystemPrompt = `You are the scene director for an AI story chat.
 
 Goals:
 - Pick the background scene key for the next character reply.
@@ -1623,36 +1666,34 @@ Output rules:
 - preload: up to 3 allowed keys.
 
 Format:
-{"scene":"royal_banquet","preload":["palace_corridor","palace_garden"]}`,
-        },
-        {
-          role: "user",
-          content: safeContext,
-        },
-      ],
-    }),
+{"scene":"royal_banquet","preload":["palace_corridor","palace_garden"]}`;
+
+  const llmResult = await callDeepSeekCompletion({
+    userPrompt: safeContext,
+    temperature: 0.25,
+    max_tokens: 220,
+    logTag: "story-chat-scene",
+    systemPrompt: sceneSystemPrompt,
   });
 
-  const raw = await sceneRes.text();
-  if (!sceneRes.ok) {
-    console.error("[story-chat scene error]", sceneRes.status, raw.slice(0, 400));
+  if (!llmResult.ok) {
+    console.error("[story-chat scene error]", llmResult.status, llmResult.errorText);
     return {
       scene: "default",
       preload: [],
-      source: "fallback_openai_error",
+      source: "fallback_deepseek_error",
     };
   }
 
   try {
-    const upstream = JSON.parse(raw);
-    const content = upstream?.choices?.[0]?.message?.content || "";
+    const content = llmResult.text || "";
     const parsed = safeJsonObjectFromText(content);
     const scene = normalizeStorySceneKey(parsed?.scene);
 
     return {
       scene,
       preload: normalizeStoryScenePreload(parsed?.preload, scene),
-      source: "openai",
+      source: "deepseek",
     };
   } catch (e) {
     console.error("[story-chat scene parse error]", e?.message || e);
@@ -1685,8 +1726,8 @@ app.post("/api/story-chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "no prompt" });
     }
 
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
+    if (!DEEPSEEK_API_KEY) {
+      return res.status(500).json({ ok: false, error: "no DEEPSEEK_API_KEY" });
     }
 
     const cleanedPrompt = sanitizePromptForApi(promptRaw);
@@ -1702,30 +1743,37 @@ app.post("/api/story-chat", async (req, res) => {
       (req.body && req.body.skip_scene_prediction === true) ||
       storyChatSkipsScenePrediction(storyId, programId);
 
-    const scenePromise = skipScenePrediction
-      ? Promise.resolve({
-          scene: "default",
-          preload: [],
-          source: "beat_scene_only",
-        })
-      : predictStoryScene(sceneContext);
+    await acquireDeepSeekSlot();
+    let llmResult;
+    let sceneData;
+    try {
+      const scenePromise = skipScenePrediction
+        ? Promise.resolve({
+            scene: "default",
+            preload: [],
+            source: "beat_scene_only",
+          })
+        : predictStoryScene(sceneContext);
 
-    const [llmResult, sceneData] = await Promise.all([
-      callOpenAiCompletion({
-        userPrompt: cleanedPrompt,
-        temperature,
-        max_tokens,
-        logTag: "story-chat",
-      }),
-      scenePromise,
-    ]);
+      [llmResult, sceneData] = await Promise.all([
+        callDeepSeekCompletion({
+          userPrompt: cleanedPrompt,
+          temperature,
+          max_tokens,
+          logTag: "story-chat",
+        }),
+        scenePromise,
+      ]);
+    } finally {
+      releaseDeepSeekSlot();
+    }
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
-      const errMsg = llmResult.errorText || "openai failed";
+      const errMsg = llmResult.errorText || "deepseek failed";
       console.error(
         "[story-chat llm error]",
-        `provider=openai model=${OPENAI_MODEL}`,
+        `provider=deepseek model=${DEEPSEEK_MODEL}`,
         statusOut,
         errMsg,
       );
@@ -1743,7 +1791,7 @@ app.post("/api/story-chat", async (req, res) => {
       `[story-chat] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
         `currentBeat.scene=${beatScene || "(none)"} appliedScenePreset=${sceneData.scene} ` +
         `preload=${JSON.stringify(sceneData.preload)} source=${sceneData.source} ` +
-        `provider=openai model=${OPENAI_MODEL}`,
+        `provider=deepseek model=${DEEPSEEK_MODEL}`,
     );
 
     return res.json({
@@ -2511,7 +2559,7 @@ const PORT = Number(process.env.PORT) || 3000;
 
 logSupabaseInit();
 console.log(
-  `[ai-server] provider=openai model=${OPENAI_MODEL} openaiConfigured=${!!OPENAI_API_KEY}`,
+  `[ai-server] storyProvider=deepseek storyModel=${DEEPSEEK_MODEL} deepseekConfigured=${!!DEEPSEEK_API_KEY} openaiConfigured=${!!OPENAI_API_KEY}`,
 );
 
 try {
