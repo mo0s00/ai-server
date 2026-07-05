@@ -268,6 +268,16 @@ function assistantTextFromMessage(msgObj) {
   return "";
 }
 
+/** gpt-5.x 등 신형 모델은 max_tokens 대신 max_completion_tokens 사용. */
+function buildOpenAiChatBody({ temperature, max_tokens, messages }) {
+  return {
+    model: OPENAI_MODEL,
+    temperature,
+    max_completion_tokens: max_tokens,
+    messages,
+  };
+}
+
 /** OpenAI Chat Completions — story-chat, story-suggestions, comment 등 공통. */
 async function callOpenAiCompletion({
   userPrompt,
@@ -294,12 +304,9 @@ async function callOpenAiCompletion({
 
   let payload;
   try {
-    payload = JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature,
-      max_tokens,
-      messages,
-    });
+    payload = JSON.stringify(
+      buildOpenAiChatBody({ temperature, max_tokens, messages }),
+    );
   } catch (stringifyErr) {
     console.error(`[${logTag}] JSON.stringify(openai payload) failed:`, stringifyErr);
     return {
@@ -1587,11 +1594,11 @@ async function predictStoryScene(contextText) {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0.25,
-      max_tokens: 220,
-      messages: [
+    body: JSON.stringify(
+      buildOpenAiChatBody({
+        temperature: 0.25,
+        max_tokens: 220,
+        messages: [
         {
           role: "system",
           content: `You are the scene director for an AI story chat.
@@ -1617,7 +1624,8 @@ Format:
           content: safeContext,
         },
       ],
-    }),
+      }),
+    ),
   });
 
   const raw = await sceneRes.text();
