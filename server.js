@@ -12,9 +12,12 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 /** OpenAI — TTS·이미지 생성 전용 (스토리채팅·추천·comment는 DeepSeek). */
 const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-1";
+const OPENAI_IMAGE_QUALITY = "high";
+const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
+const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-chat-deepseek-v4-flash";
+const SERVER_REV = "story-image-quality-high";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -1914,6 +1917,8 @@ const STORY_CATEGORY_STYLES = {
     "curious intellectual cinematic illustration, modern science atmosphere, clean dramatic lighting",
   issue:
     "dramatic newsroom cinematic illustration, tense atmosphere, professional lighting",
+  character_chat:
+    "high-quality character portrait illustration for mobile chat background, upper-body portrait, expressive face with clean detailed features, soft atmospheric background, cinematic lighting, art-style faithful to reference, no text, no UI, no watermark",
 };
 
 const STORY_CATEGORY_FOCUS = {
@@ -1929,7 +1934,13 @@ const STORY_CATEGORY_FOCUS = {
     "Focus: Visualize curiosity and discovery in a cinematic educational scene.",
   issue:
     "Focus: Visualize a dramatic debate or newsroom atmosphere.",
+  character_chat:
+    "Focus: Single character portrait for vertical mobile chat wallpaper. Center face and upper body, match reference art style, keep background atmospheric but non-distracting.",
 };
+
+function storyImageApiSize({ landscape = false } = {}) {
+  return landscape ? STORY_IMAGE_SIZE_LANDSCAPE : STORY_IMAGE_SIZE_PORTRAIT;
+}
 
 function normalizeStoryProgramType(raw) {
   const t = String(raw || "fantasy")
@@ -2088,7 +2099,7 @@ function filterStoryReferenceImagesForApi(referenceImages) {
   return out;
 }
 
-async function requestOpenAiStoryImageGeneration(prompt) {
+async function requestOpenAiStoryImageGeneration(prompt, imageSize = STORY_IMAGE_SIZE_PORTRAIT) {
   return fetch("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: {
@@ -2098,7 +2109,8 @@ async function requestOpenAiStoryImageGeneration(prompt) {
     body: JSON.stringify({
       model: OPENAI_IMAGE_MODEL,
       prompt,
-      size: "1024x1536",
+      size: imageSize,
+      quality: OPENAI_IMAGE_QUALITY,
       n: 1,
     }),
   });
@@ -2111,14 +2123,19 @@ async function readOpenAiStoryImageResponse(res, label) {
   return { ok: res.ok, status: res.status, raw };
 }
 
-async function requestOpenAiStoryImageEdits(prompt, referenceImages) {
+async function requestOpenAiStoryImageEdits(
+  prompt,
+  referenceImages,
+  imageSize = STORY_IMAGE_SIZE_PORTRAIT,
+) {
   const refs = filterStoryReferenceImagesForApi(referenceImages);
   if (!refs.length) return null;
 
   const form = new FormData();
   form.append("model", OPENAI_IMAGE_MODEL);
   form.append("prompt", prompt);
-  form.append("size", "1024x1536");
+  form.append("size", imageSize);
+  form.append("quality", OPENAI_IMAGE_QUALITY);
   form.append("n", "1");
   form.append("input_fidelity", "high");
   for (const ref of refs) {
@@ -2150,6 +2167,7 @@ async function generateStoryImageFromPrompt(
   sessionKey,
   fileStem,
   referenceImages = [],
+  imageSize = STORY_IMAGE_SIZE_PORTRAIT,
 ) {
   if (!OPENAI_API_KEY) {
     throw new Error("no OPENAI_API_KEY");
@@ -2158,20 +2176,20 @@ async function generateStoryImageFromPrompt(
   let result;
 
   if (referenceImages.length > 0) {
-    const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages);
+    const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages, imageSize);
     if (editsRes) {
       result = await readOpenAiStoryImageResponse(editsRes, "edits");
       if (!result.ok) {
         console.warn("[story-image edits failed, fallback to generations]");
-        const genRes = await requestOpenAiStoryImageGeneration(prompt);
+        const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
         result = await readOpenAiStoryImageResponse(genRes, "generations-fallback");
       }
     } else {
-      const genRes = await requestOpenAiStoryImageGeneration(prompt);
+      const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
       result = await readOpenAiStoryImageResponse(genRes, "generations");
     }
   } else {
-    const genRes = await requestOpenAiStoryImageGeneration(prompt);
+    const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
     result = await readOpenAiStoryImageResponse(genRes, "generations");
   }
 
@@ -2251,14 +2269,22 @@ app.post("/api/story-cover-image", async (req, res) => {
       renderTitleInImage: !!render_title_in_image,
     });
 
+    const imageSize = storyImageApiSize({ landscape: !!render_title_in_image });
     const imageUrl = await generateStoryImageFromPrompt(
       promptUsed,
       session_key || "cover",
       "cover",
       refs,
+      imageSize,
     );
 
-    return res.json({ ok: true, image_url: imageUrl, prompt_used: promptUsed });
+    return res.json({
+      ok: true,
+      image_url: imageUrl,
+      prompt_used: promptUsed,
+      image_size: imageSize,
+      image_quality: OPENAI_IMAGE_QUALITY,
+    });
   } catch (e) {
     console.error("[story-cover server error]", e);
     return res.status(500).json({ ok: false, error: e.message });
@@ -2309,14 +2335,22 @@ app.post("/api/story-scene-image", async (req, res) => {
     });
 
     const fileStem = `scene_${sanitizeStoryImagePathSegment(scene_label || "scene", 48)}`;
+    const imageSize = storyImageApiSize({ landscape: false });
     const imageUrl = await generateStoryImageFromPrompt(
       promptUsed,
       session_key || "scene",
       fileStem,
       refs,
+      imageSize,
     );
 
-    return res.json({ ok: true, image_url: imageUrl, prompt_used: promptUsed });
+    return res.json({
+      ok: true,
+      image_url: imageUrl,
+      prompt_used: promptUsed,
+      image_size: imageSize,
+      image_quality: OPENAI_IMAGE_QUALITY,
+    });
   } catch (e) {
     console.error("[story-scene server error]", e);
     return res.status(500).json({ ok: false, error: e.message });
