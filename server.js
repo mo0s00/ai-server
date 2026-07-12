@@ -1894,6 +1894,16 @@ Do not change body type.
 
 Only change pose, expression, scene, lighting and environment according to the story.`;
 
+const STORY_STYLE_REFERENCE_RULES = `IMPORTANT:
+
+Use the provided reference image as a VISUAL STYLE guide only.
+
+Match the rendering quality, color palette, lighting mood, composition style, and art direction from the reference.
+
+Do NOT copy the person's face, identity, hairstyle, age, ethnicity, or exact pose from the reference.
+
+Create a NEW original character based on the prompt while matching the reference aesthetic.`;
+
 const STORY_IMAGE_COMMON_RULES = `Visual rules:
 - vertical 9:16 composition
 - cinematic lighting
@@ -1973,6 +1983,47 @@ const STORY_BANNER_TITLE_RULES = `Visual rules for story banner card:
 - no speech bubbles, no subtitles, no caption text, no watermark, no UI elements
 - emotionally clear storytelling`;
 
+function characterChatVisualStyle(styleType, mood = "") {
+  const m = String(mood || "").trim() || "cinematic dramatic";
+  if (String(styleType || "").trim().toLowerCase() === "photo") {
+    return (
+      "photorealistic portrait photography for mobile chat background, upper-body portrait, " +
+      "realistic skin texture, natural lighting, soft cinematic color grading, shallow depth of field, " +
+      "no illustration, no anime, no watercolor, no painting. Mood: " +
+      m
+    );
+  }
+  return (
+    "high-quality character portrait illustration for mobile chat background, upper-body portrait, " +
+    "expressive illustrated rendering, soft atmospheric background, cinematic lighting, " +
+    "no text, no UI, no watermark. Mood: " +
+    m
+  );
+}
+
+function characterChatVisualFocus(styleType, referenceMode = "") {
+  const mode = String(referenceMode || "").trim().toLowerCase();
+  if (mode === "style") {
+    return (
+      "Focus: Single character portrait for vertical mobile chat wallpaper. " +
+      "Match the visual style and rendering quality from the style reference image. " +
+      "Create a new original character per the prompt — do not copy the reference person's identity."
+    );
+  }
+  if (String(styleType || "").trim().toLowerCase() === "photo") {
+    return (
+      "Focus: Single photorealistic character portrait for vertical mobile chat wallpaper. " +
+      "Center face and upper body, match character appearance from reference if provided, " +
+      "keep background atmospheric but non-distracting."
+    );
+  }
+  return (
+    "Focus: Single illustrated character portrait for vertical mobile chat wallpaper. " +
+    "Center face and upper body, match reference character appearance if provided, " +
+    "keep background atmospheric but non-distracting."
+  );
+}
+
 function buildStoryImagePrompt({
   programType,
   title = "",
@@ -1986,10 +2037,16 @@ function buildStoryImagePrompt({
   referenceCharacterNames = [],
   isCover = false,
   renderTitleInImage = false,
+  styleType = "",
+  referenceMode = "",
 }) {
   const program = normalizeStoryProgramType(programType);
-  const style = STORY_CATEGORY_STYLES[program] || STORY_CATEGORY_STYLES.fantasy;
-  const focus = STORY_CATEGORY_FOCUS[program] || STORY_CATEGORY_FOCUS.fantasy;
+  let style = STORY_CATEGORY_STYLES[program] || STORY_CATEGORY_STYLES.fantasy;
+  let focus = STORY_CATEGORY_FOCUS[program] || STORY_CATEGORY_FOCUS.fantasy;
+  if (program === "character_chat") {
+    style = characterChatVisualStyle(styleType, mood);
+    focus = characterChatVisualFocus(styleType, referenceMode);
+  }
   const t = String(title || "").trim().slice(0, 200);
   const op = String(opening || "").trim().slice(0, 600);
   const p = String(partner || "").trim().slice(0, 80);
@@ -2023,7 +2080,15 @@ function buildStoryImagePrompt({
       ? `\nReference characters (uploaded images in order):\n${refNames.map((n, i) => `image${i + 1}: ${n}`).join("\n")}`
       : "";
 
-  return `${STORY_IMAGE_REFERENCE_RULES}
+  const refMode = String(referenceMode || "").trim().toLowerCase();
+  const refRules =
+    refNames.length > 0
+      ? refMode === "style"
+        ? STORY_STYLE_REFERENCE_RULES
+        : STORY_IMAGE_REFERENCE_RULES
+      : "";
+
+  return `${refRules}
 ${refBlock}
 
 ${kind}
@@ -2116,11 +2181,34 @@ async function requestOpenAiStoryImageGeneration(prompt, imageSize = STORY_IMAGE
   });
 }
 
+function parseOpenAiImageError(raw, status = 0) {
+  const body = String(raw || "").trim();
+  if (!body) return `image generation failed (${status || "unknown"})`;
+  try {
+    const parsed = JSON.parse(body);
+    const err = parsed?.error;
+    if (err && typeof err === "object") {
+      const msg = String(err.message || err.code || "").trim();
+      if (msg) return msg;
+    }
+    const top = String(parsed?.message || parsed?.error || "").trim();
+    if (top) return top;
+  } catch (_e) {
+    // keep raw fallback below
+  }
+  return body.length > 320 ? `${body.slice(0, 320)}…` : body;
+}
+
 async function readOpenAiStoryImageResponse(res, label) {
   const raw = await res.text();
   console.log(`[story-image openai ${label}] status=${res.status}`);
   console.log(`[story-image openai ${label}] body=${raw}`);
-  return { ok: res.ok, status: res.status, raw };
+  return {
+    ok: res.ok,
+    status: res.status,
+    raw,
+    errorMessage: res.ok ? "" : parseOpenAiImageError(raw, res.status),
+  };
 }
 
 async function requestOpenAiStoryImageEdits(
@@ -2135,7 +2223,6 @@ async function requestOpenAiStoryImageEdits(
   form.append("model", OPENAI_IMAGE_MODEL);
   form.append("prompt", prompt);
   form.append("size", imageSize);
-  form.append("quality", OPENAI_IMAGE_QUALITY);
   form.append("n", "1");
   form.append("input_fidelity", "high");
   for (const ref of refs) {
@@ -2173,29 +2260,55 @@ async function generateStoryImageFromPrompt(
     throw new Error("no OPENAI_API_KEY");
   }
 
+  const parsedReferenceCount = Array.isArray(referenceImages) ? referenceImages.length : 0;
+  let generationMode = "generations";
+  let referenceApplied = false;
+  const fallbackUsed = false;
   let result;
 
-  if (referenceImages.length > 0) {
+  if (parsedReferenceCount > 0) {
     const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages, imageSize);
-    if (editsRes) {
-      result = await readOpenAiStoryImageResponse(editsRes, "edits");
-      if (!result.ok) {
-        console.warn("[story-image edits failed, fallback to generations]");
-        const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
-        result = await readOpenAiStoryImageResponse(genRes, "generations-fallback");
-      }
-    } else {
-      const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
-      result = await readOpenAiStoryImageResponse(genRes, "generations");
+    if (!editsRes) {
+      throw new Error("reference images provided but edits request could not be built");
     }
+    result = await readOpenAiStoryImageResponse(editsRes, "edits");
+    console.log(
+      "[imageGen]",
+      `parsedReferenceCount=${parsedReferenceCount}`,
+      `refSizes=${referenceImages
+        .map((r) => {
+          if (r.buf?.length) return r.buf.length;
+          try {
+            return Buffer.from(r.data || "", "base64").length;
+          } catch (_e) {
+            return 0;
+          }
+        })
+        .join(",")}`,
+      `editsStatus=${result.status}`,
+      "generationMode=edits",
+      "fallbackUsed=false",
+    );
+    if (!result.ok) {
+      throw new Error(result.errorMessage || `image edits failed (${result.status})`);
+    }
+    generationMode = "edits";
+    referenceApplied = true;
   } else {
     const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
     result = await readOpenAiStoryImageResponse(genRes, "generations");
+    console.log(
+      "[imageGen]",
+      "parsedReferenceCount=0",
+      `generationsStatus=${result.status}`,
+      "generationMode=generations",
+      "fallbackUsed=false",
+    );
   }
 
   const raw = result.raw;
   if (!result.ok) {
-    throw new Error(`image generation failed (${result.status})`);
+    throw new Error(result.errorMessage || `image generation failed (${result.status})`);
   }
 
   let parsed;
@@ -2224,7 +2337,12 @@ async function generateStoryImageFromPrompt(
     throw new Error("no image in response");
   }
 
-  return imageUrl;
+  return {
+    imageUrl,
+    generationMode,
+    referenceApplied,
+    fallbackUsed,
+  };
 }
 
 app.post("/api/story-cover-image", async (req, res) => {
@@ -2246,6 +2364,8 @@ app.post("/api/story-cover-image", async (req, res) => {
       characters = "",
       reference_images = [],
       render_title_in_image = false,
+      style_type = "",
+      reference_mode = "",
     } = req.body || {};
 
     if (!OPENAI_API_KEY) {
@@ -2254,6 +2374,12 @@ app.post("/api/story-cover-image", async (req, res) => {
 
     const refs = parseStoryReferenceImages(reference_images);
     const refNames = refs.map((r) => r.name);
+    console.log(
+      "[imageGen] story-cover-image",
+      `styleType=${String(style_type || "").trim() || "(default)"}`,
+      `referenceMode=${String(reference_mode || "").trim() || "(default)"}`,
+      `parsedReferenceCount=${refs.length}`,
+    );
 
     const promptUsed = buildStoryImagePrompt({
       programType: program_type,
@@ -2267,10 +2393,12 @@ app.post("/api/story-cover-image", async (req, res) => {
       referenceCharacterNames: refNames,
       isCover: true,
       renderTitleInImage: !!render_title_in_image,
+      styleType: style_type,
+      referenceMode: reference_mode,
     });
 
     const imageSize = storyImageApiSize({ landscape: !!render_title_in_image });
-    const imageUrl = await generateStoryImageFromPrompt(
+    const genResult = await generateStoryImageFromPrompt(
       promptUsed,
       session_key || "cover",
       "cover",
@@ -2280,10 +2408,13 @@ app.post("/api/story-cover-image", async (req, res) => {
 
     return res.json({
       ok: true,
-      image_url: imageUrl,
+      image_url: genResult.imageUrl,
       prompt_used: promptUsed,
       image_size: imageSize,
       image_quality: OPENAI_IMAGE_QUALITY,
+      generation_mode: genResult.generationMode,
+      reference_applied: genResult.referenceApplied,
+      fallback_used: genResult.fallbackUsed,
     });
   } catch (e) {
     console.error("[story-cover server error]", e);
@@ -2336,7 +2467,7 @@ app.post("/api/story-scene-image", async (req, res) => {
 
     const fileStem = `scene_${sanitizeStoryImagePathSegment(scene_label || "scene", 48)}`;
     const imageSize = storyImageApiSize({ landscape: false });
-    const imageUrl = await generateStoryImageFromPrompt(
+    const genResult = await generateStoryImageFromPrompt(
       promptUsed,
       session_key || "scene",
       fileStem,
@@ -2346,10 +2477,13 @@ app.post("/api/story-scene-image", async (req, res) => {
 
     return res.json({
       ok: true,
-      image_url: imageUrl,
+      image_url: genResult.imageUrl,
       prompt_used: promptUsed,
       image_size: imageSize,
       image_quality: OPENAI_IMAGE_QUALITY,
+      generation_mode: genResult.generationMode,
+      reference_applied: genResult.referenceApplied,
+      fallback_used: genResult.fallbackUsed,
     });
   } catch (e) {
     console.error("[story-scene server error]", e);
