@@ -17,7 +17,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-image-quality-high";
+const SERVER_REV = "story-image-style-fallback";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -2223,6 +2223,7 @@ async function requestOpenAiStoryImageEdits(
   form.append("model", OPENAI_IMAGE_MODEL);
   form.append("prompt", prompt);
   form.append("size", imageSize);
+  form.append("quality", OPENAI_IMAGE_QUALITY);
   form.append("n", "1");
   form.append("input_fidelity", "high");
   for (const ref of refs) {
@@ -2255,45 +2256,78 @@ async function generateStoryImageFromPrompt(
   fileStem,
   referenceImages = [],
   imageSize = STORY_IMAGE_SIZE_PORTRAIT,
+  { referenceMode = "" } = {},
 ) {
   if (!OPENAI_API_KEY) {
     throw new Error("no OPENAI_API_KEY");
   }
 
   const parsedReferenceCount = Array.isArray(referenceImages) ? referenceImages.length : 0;
+  const refMode = String(referenceMode || "").trim().toLowerCase();
+  const allowStyleFallback = refMode === "style";
   let generationMode = "generations";
   let referenceApplied = false;
-  const fallbackUsed = false;
+  let fallbackUsed = false;
   let result;
 
   if (parsedReferenceCount > 0) {
+    let editsFailed = false;
     const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages, imageSize);
     if (!editsRes) {
-      throw new Error("reference images provided but edits request could not be built");
+      editsFailed = true;
+      console.warn(
+        "[imageGen]",
+        "edits request could not be built",
+        `parsedReferenceCount=${parsedReferenceCount}`,
+      );
+    } else {
+      result = await readOpenAiStoryImageResponse(editsRes, "edits");
+      console.log(
+        "[imageGen]",
+        `parsedReferenceCount=${parsedReferenceCount}`,
+        `refSizes=${referenceImages
+          .map((r) => {
+            if (r.buf?.length) return r.buf.length;
+            try {
+              return Buffer.from(r.data || "", "base64").length;
+            } catch (_e) {
+              return 0;
+            }
+          })
+          .join(",")}`,
+        `editsStatus=${result.status}`,
+        "generationMode=edits",
+      );
+      if (!result.ok) {
+        editsFailed = true;
+        console.warn("[imageGen] edits failed:", result.errorMessage);
+      } else {
+        generationMode = "edits";
+        referenceApplied = true;
+      }
     }
-    result = await readOpenAiStoryImageResponse(editsRes, "edits");
-    console.log(
-      "[imageGen]",
-      `parsedReferenceCount=${parsedReferenceCount}`,
-      `refSizes=${referenceImages
-        .map((r) => {
-          if (r.buf?.length) return r.buf.length;
-          try {
-            return Buffer.from(r.data || "", "base64").length;
-          } catch (_e) {
-            return 0;
-          }
-        })
-        .join(",")}`,
-      `editsStatus=${result.status}`,
-      "generationMode=edits",
-      "fallbackUsed=false",
-    );
-    if (!result.ok) {
-      throw new Error(result.errorMessage || `image edits failed (${result.status})`);
+
+    if (editsFailed) {
+      if (!allowStyleFallback) {
+        throw new Error(
+          result?.errorMessage ||
+            "reference images provided but edits request could not be built",
+        );
+      }
+      console.log(
+        "[imageGen]",
+        "style reference edits failed; falling back to text-only generations",
+      );
+      fallbackUsed = true;
+      const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
+      result = await readOpenAiStoryImageResponse(genRes, "generations-fallback");
+      console.log(
+        "[imageGen]",
+        `generationsStatus=${result.status}`,
+        "generationMode=generations",
+        "fallbackUsed=true",
+      );
     }
-    generationMode = "edits";
-    referenceApplied = true;
   } else {
     const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
     result = await readOpenAiStoryImageResponse(genRes, "generations");
@@ -2404,6 +2438,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       "cover",
       refs,
       imageSize,
+      { referenceMode: reference_mode },
     );
 
     return res.json({
