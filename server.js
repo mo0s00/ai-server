@@ -144,6 +144,92 @@ function readBool(body, key) {
   return false;
 }
 
+function parsePromptJsonIfString(prompt) {
+  if (typeof prompt !== "string") return null;
+  const t = prompt.trim();
+  if (!t) return null;
+  try {
+    const parsed = JSON.parse(t);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function isTruthyPublicFlag(value) {
+  if (value === true) return true;
+  if (typeof value === "string") {
+    const t = value.trim().toLowerCase();
+    return t === "true" || t === "1" || t === "yes";
+  }
+  return false;
+}
+
+function isPublicVisibilityValue(value) {
+  if (typeof value === "string") {
+    return value.trim().toLowerCase() === "public";
+  }
+  return false;
+}
+
+function computeCustomPromptIsPublic(body, parsedPrompt) {
+  if (isTruthyPublicFlag(body && body.is_public)) return true;
+  if (isTruthyPublicFlag(body && body.isPublic)) return true;
+  if (isPublicVisibilityValue(body && body.visibility)) return true;
+  if (parsedPrompt && typeof parsedPrompt === "object") {
+    if (isTruthyPublicFlag(parsedPrompt.is_public)) return true;
+    if (isTruthyPublicFlag(parsedPrompt.isPublic)) return true;
+    if (isPublicVisibilityValue(parsedPrompt.visibility)) return true;
+  }
+  return false;
+}
+
+function isExplicitCustomPromptPrivate(body, parsedPrompt) {
+  const vals = [
+    body && body.is_public,
+    body && body.isPublic,
+    body && body.visibility,
+    parsedPrompt && parsedPrompt.is_public,
+    parsedPrompt && parsedPrompt.isPublic,
+    parsedPrompt && parsedPrompt.visibility,
+  ];
+  for (const v of vals) {
+    if (v === false) return true;
+    if (typeof v === "string") {
+      const t = v.trim().toLowerCase();
+      if (t === "false" || t === "0" || t === "private" || t === "no") return true;
+    }
+  }
+  return false;
+}
+
+function extractCustomPromptColumnString(parsed, keys) {
+  if (!parsed || typeof parsed !== "object") return "";
+  for (const key of keys) {
+    const v = parsed[key];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+function readCustomPromptPayload(body) {
+  const raw = body && body.prompt;
+  if (typeof raw === "string") {
+    const promptStr = raw.trim();
+    return {
+      promptStr,
+      parsedPrompt: parsePromptJsonIfString(promptStr),
+    };
+  }
+  if (raw && typeof raw === "object") {
+    return {
+      promptStr: JSON.stringify(raw),
+      parsedPrompt: raw,
+    };
+  }
+  return { promptStr: "", parsedPrompt: null };
+}
+
 function isUuid(s) {
   return (
     typeof s === "string" &&
@@ -1066,17 +1152,63 @@ async function handleCustomPromptPost(req, res) {
 
     const user_id = readString(req.body, "user_id");
     const commenter_id = readString(req.body, "commenter_id");
-    const prompt = readString(req.body, "prompt");
-    if (!user_id || !commenter_id || !prompt) {
+    const { promptStr, parsedPrompt } = readCustomPromptPayload(req.body);
+    if (!user_id || !commenter_id || !promptStr) {
       return res.status(400).json({ ok: false, error: "user_id, commenter_id, prompt 필요" });
     }
+
+    let finalIsPublic = computeCustomPromptIsPublic(req.body, parsedPrompt);
+
+    const { data: existingRow } = await supabase
+      .from("custom_prompts")
+      .select("is_public")
+      .eq("user_id", user_id)
+      .eq("commenter_id", commenter_id)
+      .maybeSingle();
+
+    if (
+      !finalIsPublic &&
+      existingRow &&
+      existingRow.is_public === true &&
+      !isExplicitCustomPromptPrivate(req.body, parsedPrompt)
+    ) {
+      finalIsPublic = true;
+    }
+
+    const name = extractCustomPromptColumnString(parsedPrompt, ["name"]);
+    const description = extractCustomPromptColumnString(parsedPrompt, [
+      "description",
+      "intro",
+      "summonWizardTaglinePure",
+    ]);
+    const imageUrl = extractCustomPromptColumnString(parsedPrompt, [
+      "image_url",
+      "profileImagePath",
+      "imageUrl",
+    ]);
+    const promptVisibility =
+      parsedPrompt && typeof parsedPrompt.visibility === "string"
+        ? parsedPrompt.visibility.trim()
+        : "";
 
     const row = {
       user_id,
       commenter_id,
-      prompt,
+      prompt: promptStr,
+      is_public: finalIsPublic,
       updated_at: new Date().toISOString(),
     };
+    if (name) row.name = name;
+    if (description) row.description = description;
+    if (imageUrl) row.image_url = imageUrl;
+
+    console.log(
+      "[custom-prompt-save]",
+      "commenterId=" + commenter_id,
+      "promptVisibility=" + promptVisibility,
+      "finalIsPublic=" + finalIsPublic,
+      "imageUrl=" + (imageUrl || ""),
+    );
 
     let { error } = await supabase
       .from("custom_prompts")
@@ -1126,6 +1258,50 @@ function isPublicCustomPromptRow(row) {
   }
 }
 
+/** 공개 목록 API — data URL·과도한 프롬프트 필드 제거(앱 ANR·대역폭 절감). */
+function slimPromptForPublicListing(promptRaw) {
+  try {
+    const obj =
+      typeof promptRaw === "string" ? JSON.parse(promptRaw) : promptRaw;
+    if (!obj || typeof obj !== "object") return promptRaw;
+    const slim = {
+      name: obj.name,
+      age: obj.age,
+      gender: obj.gender,
+      job: obj.job,
+      style: obj.style,
+      profileKey: obj.profileKey,
+      assetFolder: obj.assetFolder,
+      visibility: obj.visibility || obj.finalVisibility,
+      category: obj.category,
+      genre: obj.genre,
+      isExpert: obj.isExpert,
+      createdAtMs: obj.createdAtMs,
+      ownerUserId: obj.ownerUserId,
+      profileImagePath: obj.profileImagePath,
+      chatBackgroundImagePath: obj.chatBackgroundImagePath,
+      dmGenreTopics: obj.dmGenreTopics,
+    };
+    if (Array.isArray(obj.personalityLines)) {
+      slim.personalityLines = obj.personalityLines.slice(0, 4);
+    }
+    if (Array.isArray(obj.introLines)) {
+      slim.introLines = obj.introLines.slice(0, 3);
+    }
+    for (const key of ["profileImagePath", "chatBackgroundImagePath"]) {
+      const v = slim[key];
+      if (typeof v !== "string") continue;
+      const t = v.trim();
+      if (t.startsWith("data:") || (!t.startsWith("http://") && !t.startsWith("https://"))) {
+        delete slim[key];
+      }
+    }
+    return slim;
+  } catch (_) {
+    return promptRaw;
+  }
+}
+
 // 구버전 `GET /api/custom-prompts?user_id=` — `:userId` 라우트보다 먼저 등록
 // `GET /api/custom-prompts?scope=public` — 전체 공개 유저 케릭터 탐색용
 async function handleCustomPromptsQueryGet(req, res) {
@@ -1155,7 +1331,12 @@ async function handleCustomPromptsQueryGet(req, res) {
         return res.json({ ok: false, prompts: [] });
       }
 
-      const prompts = (data || []).filter(isPublicCustomPromptRow);
+      const prompts = (data || [])
+        .filter(isPublicCustomPromptRow)
+        .map((row) => ({
+          ...row,
+          prompt: slimPromptForPublicListing(row.prompt),
+        }));
       return res.json({ ok: true, prompts });
     }
 
