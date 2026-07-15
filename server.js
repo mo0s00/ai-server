@@ -1109,9 +1109,56 @@ app.post("/api/custom-prompts", handleCustomPromptPost);
 app.post("/custom-prompt", handleCustomPromptPost);
 app.post("/custom-prompts", handleCustomPromptPost);
 
+function isPublicCustomPromptRow(row) {
+  try {
+    const raw = row && row.prompt;
+    if (raw == null) return false;
+    const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!obj || typeof obj !== "object") return false;
+    const v = String(obj.visibility || obj.finalVisibility || "")
+      .trim()
+      .toLowerCase();
+    if (v === "private" || v === "friends") return false;
+    if (v === "public") return true;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // 구버전 `GET /api/custom-prompts?user_id=` — `:userId` 라우트보다 먼저 등록
+// `GET /api/custom-prompts?scope=public` — 전체 공개 유저 케릭터 탐색용
 async function handleCustomPromptsQueryGet(req, res) {
   try {
+    const scopeRaw = req.query && req.query.scope;
+    const scope =
+      typeof scopeRaw === "string"
+        ? decodeURIComponent(scopeRaw).trim().toLowerCase()
+        : Array.isArray(scopeRaw) && typeof scopeRaw[0] === "string"
+          ? decodeURIComponent(scopeRaw[0]).trim().toLowerCase()
+          : "";
+
+    if (scope === "public") {
+      const supabase = getSupabase();
+      if (!supabase) {
+        return res.status(500).json({ ok: false, error: "supabase 없음", prompts: [] });
+      }
+
+      const { data, error } = await supabase
+        .from("custom_prompts")
+        .select("*")
+        .order("updated_at", { ascending: false })
+        .limit(300);
+
+      if (error) {
+        console.log("❌ [custom-prompts public]", error?.message || error);
+        return res.json({ ok: false, prompts: [] });
+      }
+
+      const prompts = (data || []).filter(isPublicCustomPromptRow);
+      return res.json({ ok: true, prompts });
+    }
+
     const raw = req.query && req.query.user_id;
     const userId =
       typeof raw === "string"
