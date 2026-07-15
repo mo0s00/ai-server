@@ -1220,6 +1220,54 @@ async function handleCustomPromptsByUserGet(req, res) {
 app.get("/api/custom-prompts/:userId", handleCustomPromptsByUserGet);
 app.get("/custom-prompts/:userId", handleCustomPromptsByUserGet);
 
+// 유저 제작 캐릭터 프로필·채팅 배경 — `POST /api/character-image` (Supabase Storage)
+async function handleCharacterImagePost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const commenter_id = readString(req.body, "commenter_id");
+    const kind = readString(req.body, "kind") || "profile";
+    const image_base64 = readString(req.body, "image_base64");
+
+    if (!user_id || !commenter_id || !image_base64) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "user_id, commenter_id, image_base64 필요" });
+    }
+
+    let buffer;
+    try {
+      buffer = Buffer.from(image_base64, "base64");
+    } catch (_e) {
+      return res.status(400).json({ ok: false, error: "image_base64 파싱 실패" });
+    }
+
+    if (!buffer?.length) {
+      return res.status(400).json({ ok: false, error: "이미지 데이터 비어 있음" });
+    }
+
+    const imageUrl = await uploadCharacterImageToSupabase(
+      user_id,
+      commenter_id,
+      kind,
+      buffer,
+    );
+    if (!imageUrl) {
+      return res.status(500).json({ ok: false, error: "storage 업로드 실패" });
+    }
+
+    return res.json({ ok: true, image_url: imageUrl });
+  } catch (e) {
+    console.error("[character-image post]", e);
+    return res.status(500).json({ ok: false, error: e.message || "server error" });
+  }
+}
+
+app.post("/api/character-image", handleCharacterImagePost);
+app.post("/character-image", handleCharacterImagePost);
+
 // 쿠키 거래 1건 — 앱 `POST /api/cookie-tx`
 async function handleCookieTxPost(req, res) {
   try {
@@ -2183,6 +2231,62 @@ async function uploadStoryImageToSupabase(sessionKey, subfolder, fileStem, pngBu
   }
 
   const { data } = supabase.storage.from("story-covers").getPublicUrl(path);
+  return data?.publicUrl || null;
+}
+
+const CHARACTER_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+
+function detectCharacterImageMeta(buffer) {
+  if (!buffer?.length) return { contentType: "image/png", ext: "png" };
+  if (
+    buffer.length >= 4 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return { contentType: "image/png", ext: "png" };
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { contentType: "image/jpeg", ext: "jpg" };
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x46
+  ) {
+    return { contentType: "image/webp", ext: "webp" };
+  }
+  return { contentType: "image/png", ext: "png" };
+}
+
+async function uploadCharacterImageToSupabase(userId, commenterId, kind, imageBuffer) {
+  const supabase = getSupabase();
+  if (!supabase || !userId || !commenterId || !imageBuffer?.length) return null;
+  if (imageBuffer.length > CHARACTER_IMAGE_MAX_BYTES) {
+    console.warn("[character-image] too large", imageBuffer.length);
+    return null;
+  }
+
+  const safeUser = sanitizeStoryImagePathSegment(userId, 80);
+  const safePk = sanitizeStoryImagePathSegment(commenterId, 80);
+  const safeKind = sanitizeStoryImagePathSegment(kind || "profile", 24);
+  const meta = detectCharacterImageMeta(imageBuffer);
+  const path = `${safeUser}/${safePk}_${safeKind}.${meta.ext}`;
+
+  const { error } = await supabase.storage.from("character-profiles").upload(path, imageBuffer, {
+    contentType: meta.contentType,
+    upsert: true,
+  });
+
+  if (error) {
+    console.error("[character-image upload error]", error.message);
+    return null;
+  }
+
+  const { data } = supabase.storage.from("character-profiles").getPublicUrl(path);
   return data?.publicUrl || null;
 }
 
