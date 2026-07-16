@@ -17,7 +17,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-image-style-fallback";
+const SERVER_REV = "story-user-image-upload";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -2471,7 +2471,93 @@ async function uploadCharacterImageToSupabase(userId, commenterId, kind, imageBu
   return data?.publicUrl || null;
 }
 
+async function uploadUserStoryAssetToSupabase(userId, storyId, kind, imageBuffer) {
+  const supabase = getSupabase();
+  if (!supabase || !userId || !storyId || !imageBuffer?.length) return null;
+  if (imageBuffer.length > CHARACTER_IMAGE_MAX_BYTES) {
+    console.warn("[user-story-image] too large", imageBuffer.length);
+    return null;
+  }
+
+  const safeUser = sanitizeStoryImagePathSegment(userId, 80);
+  const safeStory = sanitizeStoryImagePathSegment(storyId, 80);
+  const safeKind = sanitizeStoryImagePathSegment(kind || "cover", 40);
+  const meta = detectCharacterImageMeta(imageBuffer);
+  const path = `user-stories/${safeUser}/${safeStory}/${safeKind}.${meta.ext}`;
+
+  const { error } = await supabase.storage.from("story-covers").upload(path, imageBuffer, {
+    contentType: meta.contentType,
+    upsert: true,
+  });
+
+  if (error) {
+    console.error("[user-story-image upload error]", error.message);
+    return null;
+  }
+
+  const { data } = supabase.storage.from("story-covers").getPublicUrl(path);
+  return data?.publicUrl || null;
+}
+
+// 유저 제작 스토리 배너·배경·캐릭터 초상화 — `POST /api/user-story-image`
+async function handleUserStoryImagePost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const story_id = readString(req.body, "story_id");
+    const kind = readString(req.body, "kind") || "cover";
+    const image_base64 = readString(req.body, "image_base64");
+
+    if (!user_id || !story_id || !image_base64) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "user_id, story_id, image_base64 필요" });
+    }
+
+    let buffer;
+    try {
+      buffer = Buffer.from(image_base64, "base64");
+    } catch (_e) {
+      return res.status(400).json({ ok: false, error: "image_base64 파싱 실패" });
+    }
+
+    if (!buffer?.length) {
+      return res.status(400).json({ ok: false, error: "이미지 데이터 비어 있음" });
+    }
+
+    const imageUrl = await uploadUserStoryAssetToSupabase(
+      user_id,
+      story_id,
+      kind,
+      buffer,
+    );
+    if (!imageUrl) {
+      return res.status(500).json({ ok: false, error: "storage 업로드 실패" });
+    }
+
+    return res.json({ ok: true, image_url: imageUrl });
+  } catch (e) {
+    console.error("[user-story-image post]", e);
+    return res.status(500).json({ ok: false, error: e.message || "server error" });
+  }
+}
+
+app.post("/api/user-story-image", handleUserStoryImagePost);
+app.post("/user-story-image", handleUserStoryImagePost);
+
 const STORY_REF_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+
+function isPngBuffer(buf) {
+  return (
+    buf?.length >= 8 &&
+    buf[0] === 0x89 &&
+    buf[1] === 0x50 &&
+    buf[2] === 0x4e &&
+    buf[3] === 0x47
+  );
+}
 
 function filterStoryReferenceImagesForApi(referenceImages) {
   const out = [];
@@ -2489,6 +2575,10 @@ function filterStoryReferenceImagesForApi(referenceImages) {
         ref.name,
         buf?.length ? `too large (${buf.length})` : "invalid",
       );
+      continue;
+    }
+    if (!isPngBuffer(buf)) {
+      console.warn("[story-image] skip ref", ref.name, "not png");
       continue;
     }
     out.push({ name: ref.name, buf });
@@ -2556,19 +2646,19 @@ async function requestOpenAiStoryImageEdits(
   form.append("prompt", prompt);
   form.append("size", imageSize);
   form.append("quality", OPENAI_IMAGE_QUALITY);
-  form.append("n", "1");
-  form.append("input_fidelity", "high");
-  for (const ref of refs) {
-    form.append("image[]", ref.buf, {
-      filename: `${sanitizeStoryImagePathSegment(ref.name, 40)}.png`,
+  form.append("output_format", "png");
+  refs.forEach((ref, index) => {
+    form.append("image", ref.buf, {
+      filename: `reference_${index + 1}.png`,
       contentType: "image/png",
+      knownLength: ref.buf.length,
     });
-  }
+  });
 
   console.log(
     "[story-image edits request]",
     `refs=${refs.length}`,
-    `names=${refs.map((r) => r.name).join(",")}`,
+    `bytes=${refs.map((r) => r.buf.length).join(",")}`,
   );
 
   return fetch("https://api.openai.com/v1/images/edits", {
