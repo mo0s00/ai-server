@@ -18,7 +18,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-edits-form-data-pipe";
+const SERVER_REV = "story-edits-input-fidelity";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -2560,6 +2560,23 @@ function isPngBuffer(buf) {
   );
 }
 
+function detectStoryReferenceImageMime(buf) {
+  if (isPngBuffer(buf)) {
+    return { ext: "png", contentType: "image/png" };
+  }
+  if (buf?.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return { ext: "jpg", contentType: "image/jpeg" };
+  }
+  if (
+    buf?.length >= 12 &&
+    buf.toString("ascii", 0, 4) === "RIFF" &&
+    buf.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return { ext: "webp", contentType: "image/webp" };
+  }
+  return null;
+}
+
 function filterStoryReferenceImagesForApi(referenceImages) {
   const out = [];
   for (const ref of referenceImages) {
@@ -2578,11 +2595,12 @@ function filterStoryReferenceImagesForApi(referenceImages) {
       );
       continue;
     }
-    if (!isPngBuffer(buf)) {
-      console.warn("[story-image] skip ref", ref.name, "not png");
+    const mime = detectStoryReferenceImageMime(buf);
+    if (!mime) {
+      console.warn("[story-image] skip ref", ref.name, "unsupported format");
       continue;
     }
-    out.push({ name: ref.name, buf });
+    out.push({ name: ref.name, buf, ext: mime.ext, contentType: mime.contentType });
   }
   return out;
 }
@@ -2674,15 +2692,17 @@ async function requestOpenAiStoryImageEdits(
   prompt,
   referenceImages,
   imageSize = STORY_IMAGE_SIZE_PORTRAIT,
+  { referenceMode = "" } = {},
 ) {
   const refs = filterStoryReferenceImagesForApi(referenceImages);
   if (!refs.length) return null;
 
   const form = new FormData();
+  const imageField = refs.length > 1 ? "image[]" : "image";
   refs.forEach((ref, index) => {
-    form.append("image", ref.buf, {
-      filename: `reference_${index + 1}.png`,
-      contentType: "image/png",
+    form.append(imageField, ref.buf, {
+      filename: `reference_${index + 1}.${ref.ext}`,
+      contentType: ref.contentType,
     });
   });
   form.append("model", OPENAI_IMAGE_MODEL);
@@ -2690,10 +2710,16 @@ async function requestOpenAiStoryImageEdits(
   form.append("size", imageSize);
   form.append("quality", OPENAI_IMAGE_QUALITY);
   form.append("output_format", "png");
+  const refMode = String(referenceMode || "").trim().toLowerCase();
+  if (refMode === "character" || refMode === "style" || refs.length > 0) {
+    form.append("input_fidelity", "high");
+  }
 
   console.log(
     "[story-image edits request]",
     `refs=${refs.length}`,
+    `field=${imageField}`,
+    `referenceMode=${refMode || "(default)"}`,
     `bytes=${refs.map((r) => r.buf.length).join(",")}`,
   );
 
@@ -2717,13 +2743,17 @@ async function generateStoryImageFromPrompt(
   let generationMode = "generations";
   let referenceApplied = false;
   let fallbackUsed = false;
+  let editsError = "";
   let result;
 
   if (parsedReferenceCount > 0) {
     let editsFailed = false;
-    const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages, imageSize);
+    const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages, imageSize, {
+      referenceMode: refMode,
+    });
     if (!editsRes) {
       editsFailed = true;
+      editsError = "reference images could not be prepared for edits";
       console.warn(
         "[imageGen]",
         "edits request could not be built",
@@ -2751,7 +2781,8 @@ async function generateStoryImageFromPrompt(
       );
       if (!result.ok) {
         editsFailed = true;
-        console.warn("[imageGen] edits failed:", result.errorMessage);
+        editsError = result.errorMessage || `edits failed (${result.status})`;
+        console.warn("[imageGen] edits failed:", editsError);
       } else {
         generationMode = "edits";
         referenceApplied = true;
@@ -2824,6 +2855,7 @@ async function generateStoryImageFromPrompt(
     generationMode,
     referenceApplied,
     fallbackUsed,
+    editsError,
   };
 }
 
@@ -2898,6 +2930,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
       fallback_used: genResult.fallbackUsed,
+      edits_error: genResult.editsError || "",
     });
   } catch (e) {
     console.error("[story-cover server error]", e);
@@ -2967,6 +3000,7 @@ app.post("/api/story-scene-image", async (req, res) => {
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
       fallback_used: genResult.fallbackUsed,
+      edits_error: genResult.editsError || "",
     });
   } catch (e) {
     console.error("[story-scene server error]", e);
