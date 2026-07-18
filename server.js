@@ -2,6 +2,7 @@
 
 import express from "express";
 import FormData from "form-data";
+import { PassThrough } from "node:stream";
 import { createClient } from "@supabase/supabase-js";
 import { handleIapCookieVerifyPost } from "./iap-cookie.js";
 
@@ -17,7 +18,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-edits-form-data-buffer";
+const SERVER_REV = "story-edits-form-data-pipe";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -2639,11 +2640,15 @@ async function readOpenAiStoryImageResponse(res, label) {
 }
 
 async function readFormDataPackageAsBuffer(form) {
-  const chunks = [];
-  for await (const chunk of form) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const sink = new PassThrough();
+    sink.on("data", (chunk) => chunks.push(chunk));
+    sink.on("end", () => resolve(Buffer.concat(chunks)));
+    sink.on("error", reject);
+    form.on("error", reject);
+    form.pipe(sink);
+  });
 }
 
 async function postOpenAiMultipartForm(form, label) {
