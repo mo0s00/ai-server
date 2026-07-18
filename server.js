@@ -17,7 +17,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-user-image-upload";
+const SERVER_REV = "story-edits-form-data-buffer";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -2625,12 +2625,44 @@ async function readOpenAiStoryImageResponse(res, label) {
   const raw = await res.text();
   console.log(`[story-image openai ${label}] status=${res.status}`);
   console.log(`[story-image openai ${label}] body=${raw}`);
+  if (!res.ok) {
+    console.error(
+      `[story-image openai ${label}] failed status=${res.status} body=${raw}`,
+    );
+  }
   return {
     ok: res.ok,
     status: res.status,
     raw,
     errorMessage: res.ok ? "" : parseOpenAiImageError(raw, res.status),
   };
+}
+
+async function readFormDataPackageAsBuffer(form) {
+  const chunks = [];
+  for await (const chunk of form) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function postOpenAiMultipartForm(form, label) {
+  const body = await readFormDataPackageAsBuffer(form);
+  const headers = {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    ...form.getHeaders(),
+    "Content-Length": String(body.length),
+  };
+
+  console.log(
+    `[story-image ${label}] multipart bytes=${body.length} content-type=${headers["content-type"] || ""}`,
+  );
+
+  return fetch("https://api.openai.com/v1/images/edits", {
+    method: "POST",
+    headers,
+    body,
+  });
 }
 
 async function requestOpenAiStoryImageEdits(
@@ -2642,18 +2674,17 @@ async function requestOpenAiStoryImageEdits(
   if (!refs.length) return null;
 
   const form = new FormData();
+  refs.forEach((ref, index) => {
+    form.append("image", ref.buf, {
+      filename: `reference_${index + 1}.png`,
+      contentType: "image/png",
+    });
+  });
   form.append("model", OPENAI_IMAGE_MODEL);
   form.append("prompt", prompt);
   form.append("size", imageSize);
   form.append("quality", OPENAI_IMAGE_QUALITY);
   form.append("output_format", "png");
-  refs.forEach((ref, index) => {
-    form.append("image", ref.buf, {
-      filename: `reference_${index + 1}.png`,
-      contentType: "image/png",
-      knownLength: ref.buf.length,
-    });
-  });
 
   console.log(
     "[story-image edits request]",
@@ -2661,15 +2692,7 @@ async function requestOpenAiStoryImageEdits(
     `bytes=${refs.map((r) => r.buf.length).join(",")}`,
   );
 
-  return fetch("https://api.openai.com/v1/images/edits", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      ...form.getHeaders(),
-    },
-    body: form,
-    duplex: "half",
-  });
+  return postOpenAiMultipartForm(form, "edits");
 }
 
 async function generateStoryImageFromPrompt(
@@ -2686,7 +2709,6 @@ async function generateStoryImageFromPrompt(
 
   const parsedReferenceCount = Array.isArray(referenceImages) ? referenceImages.length : 0;
   const refMode = String(referenceMode || "").trim().toLowerCase();
-  const allowStyleFallback = refMode === "style";
   let generationMode = "generations";
   let referenceApplied = false;
   let fallbackUsed = false;
@@ -2701,12 +2723,14 @@ async function generateStoryImageFromPrompt(
         "[imageGen]",
         "edits request could not be built",
         `parsedReferenceCount=${parsedReferenceCount}`,
+        `referenceMode=${refMode || "(default)"}`,
       );
     } else {
       result = await readOpenAiStoryImageResponse(editsRes, "edits");
       console.log(
         "[imageGen]",
         `parsedReferenceCount=${parsedReferenceCount}`,
+        `referenceMode=${refMode || "(default)"}`,
         `refSizes=${referenceImages
           .map((r) => {
             if (r.buf?.length) return r.buf.length;
@@ -2730,23 +2754,20 @@ async function generateStoryImageFromPrompt(
     }
 
     if (editsFailed) {
-      if (!allowStyleFallback) {
-        throw new Error(
-          result?.errorMessage ||
-            "reference images provided but edits request could not be built",
-        );
-      }
-      console.log(
+      console.warn(
         "[imageGen]",
-        "style reference edits failed; falling back to text-only generations",
+        "edits failed; falling back to text-only generations",
+        `referenceMode=${refMode || "(default)"}`,
+        result?.errorMessage || "",
       );
       fallbackUsed = true;
+      generationMode = "generations-fallback";
       const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
       result = await readOpenAiStoryImageResponse(genRes, "generations-fallback");
       console.log(
         "[imageGen]",
         `generationsStatus=${result.status}`,
-        "generationMode=generations",
+        "generationMode=generations-fallback",
         "fallbackUsed=true",
       );
     }
