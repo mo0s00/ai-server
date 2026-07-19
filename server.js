@@ -1402,6 +1402,64 @@ async function handleCustomPromptsByUserGet(req, res) {
 app.get("/api/custom-prompts/:userId", handleCustomPromptsByUserGet);
 app.get("/custom-prompts/:userId", handleCustomPromptsByUserGet);
 
+// 앱 `DELETE /api/custom-prompts/:commenterId?user_id=` — 본인 제작 케릭터 삭제
+async function handleCustomPromptDelete(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const commenterId = decodeURIComponent(req.params.userId || "").trim();
+    if (!commenterId) {
+      return res.status(400).json({ ok: false, error: "commenter_id required" });
+    }
+
+    const raw = req.query && req.query.user_id;
+    const userId =
+      typeof raw === "string"
+        ? decodeURIComponent(raw).trim()
+        : Array.isArray(raw) && typeof raw[0] === "string"
+          ? decodeURIComponent(raw[0]).trim()
+          : "";
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: "user_id required" });
+    }
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from("custom_prompts")
+      .select("user_id")
+      .eq("user_id", userId)
+      .eq("commenter_id", commenterId)
+      .maybeSingle();
+
+    if (fetchErr) {
+      logSupabaseErr("[custom-prompt delete fetch]", fetchErr);
+      return res.status(500).json({ ok: false, error: fetchErr.message });
+    }
+    if (!existing) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
+
+    const { error: deleteErr } = await supabase
+      .from("custom_prompts")
+      .delete()
+      .eq("user_id", userId)
+      .eq("commenter_id", commenterId);
+
+    if (deleteErr) {
+      logSupabaseErr("[custom-prompt delete]", deleteErr);
+      return res.status(500).json({ ok: false, error: deleteErr.message });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("[custom-prompt delete]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+app.delete("/api/custom-prompts/:userId", handleCustomPromptDelete);
+app.delete("/custom-prompts/:userId", handleCustomPromptDelete);
+
 // 유저 제작 캐릭터 프로필·채팅 배경 — `POST /api/character-image` (Supabase Storage)
 async function handleCharacterImagePost(req, res) {
   try {
