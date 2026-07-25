@@ -18,7 +18,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-edits-input-fidelity";
+const SERVER_REV = "user-presence-v1";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -1144,6 +1144,117 @@ app.post("/comment-save", handleCommentSave);
 
 app.post("/api/commenter-state", handleCommenterStatePost);
 app.post("/commenter-state", handleCommenterStatePost);
+
+const ADMIN_PRESENCE_PASSWORD = process.env.ADMIN_PASSWORD || "333";
+
+function isAdminPresenceAuthorized(req) {
+  const header = (req.headers["x-admin-password"] || "").toString().trim();
+  const query = readString(req.query || {}, "admin_password");
+  return header === ADMIN_PRESENCE_PASSWORD || query === ADMIN_PRESENCE_PASSWORD;
+}
+
+function kstStartOfTodayIso() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = fmt.formatToParts(new Date());
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+  if (!y || !m || !d) return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  return new Date(`${y}-${m}-${d}T00:00:00+09:00`).toISOString();
+}
+
+async function handleUserPresencePost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    if (!user_id) {
+      return res.status(400).json({ ok: false, error: "user_id 필요" });
+    }
+
+    const nowIso = new Date().toISOString();
+    const row = {
+      user_id,
+      last_seen_at: nowIso,
+      updated_at: nowIso,
+      current_screen: readString(req.body, "current_screen") || null,
+      app_version: readString(req.body, "app_version") || null,
+      platform: readString(req.body, "platform") || null,
+      last_event: readString(req.body, "last_event") || null,
+    };
+
+    const { error } = await supabase.from("user_presence").upsert([row], {
+      onConflict: "user_id",
+    });
+
+    if (error) {
+      logSupabaseErr("[user-presence] upsert", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("[user-presence]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+async function handleAdminPresenceStatsGet(req, res) {
+  try {
+    if (!isAdminPresenceAuthorized(req)) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const now = Date.now();
+    const fiveMinAgo = new Date(now - 5 * 60 * 1000).toISOString();
+    const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+    const todayStart = kstStartOfTodayIso();
+
+    const [active5m, lastHour, today] = await Promise.all([
+      supabase
+        .from("user_presence")
+        .select("*", { count: "exact", head: true })
+        .gte("last_seen_at", fiveMinAgo),
+      supabase
+        .from("user_presence")
+        .select("*", { count: "exact", head: true })
+        .gte("last_seen_at", oneHourAgo),
+      supabase
+        .from("user_presence")
+        .select("*", { count: "exact", head: true })
+        .gte("last_seen_at", todayStart),
+    ]);
+
+    if (active5m.error || lastHour.error || today.error) {
+      const err = active5m.error || lastHour.error || today.error;
+      logSupabaseErr("[admin/presence-stats]", err);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+
+    return res.json({
+      ok: true,
+      active_5m: active5m.count ?? 0,
+      last_hour: lastHour.count ?? 0,
+      today: today.count ?? 0,
+    });
+  } catch (e) {
+    console.log("[admin/presence-stats]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+app.post("/api/user-presence", handleUserPresencePost);
+app.post("/user-presence", handleUserPresencePost);
+app.get("/api/admin/presence-stats", handleAdminPresenceStatsGet);
+app.get("/admin/presence-stats", handleAdminPresenceStatsGet);
 
 // 커스텀 댓글러 프롬프트 — 앱 `POST /api/custom-prompt` · 배포별칭 `POST /api/custom-prompts`
 async function handleCustomPromptPost(req, res) {
