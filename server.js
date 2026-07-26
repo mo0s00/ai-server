@@ -3419,6 +3419,43 @@ async function handleUserStoryByIdDelete(req, res) {
   }
 }
 
+async function handleAdminRestoreUserStoryOwnerPost(req, res) {
+  try {
+    if (!isAdminPresenceAuthorized(req)) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    const storyId = readString(req.body, "story_id") || readString(req.body, "id");
+    const userId = readString(req.body, "user_id");
+    if (!storyId || !userId) {
+      return res.status(400).json({ ok: false, error: "story_id, user_id required" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const { data, error } = await supabase
+      .from("user_stories")
+      .update({ user_id: userId, updated_at: new Date().toISOString() })
+      .eq("id", storyId)
+      .select("id,user_id")
+      .maybeSingle();
+
+    if (error) {
+      logSupabaseErr("[admin/restore-user-story-owner]", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    if (!data) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
+
+    return res.json({ ok: true, story: data });
+  } catch (e) {
+    console.error("[admin/restore-user-story-owner]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
 app.post("/api/user-stories", handleUserStoriesPost);
 app.post("/user-stories", handleUserStoriesPost);
 app.get("/api/user-stories", handleUserStoriesQueryGet);
@@ -3427,6 +3464,8 @@ app.get("/api/user-stories/:id", handleUserStoryByIdGet);
 app.get("/user-stories/:id", handleUserStoryByIdGet);
 app.delete("/api/user-stories/:id", handleUserStoryByIdDelete);
 app.delete("/user-stories/:id", handleUserStoryByIdDelete);
+app.post("/api/admin/restore-user-story-owner", handleAdminRestoreUserStoryOwnerPost);
+app.post("/admin/restore-user-story-owner", handleAdminRestoreUserStoryOwnerPost);
 
 const PORT = Number(process.env.PORT) || 3000;
 
