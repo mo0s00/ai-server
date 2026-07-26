@@ -3227,19 +3227,26 @@ async function handleUserStoriesPost(req, res) {
         return res.status(500).json({ ok: false, error: fetchErr.message });
       }
       if (!existing) {
-        return res.status(404).json({ ok: false, error: "not found" });
-      }
-      if ((existing.user_id || "").trim() !== user_id) {
-        return res.status(403).json({ ok: false, error: "forbidden" });
-      }
+        // 앱이 이미지 업로드용으로 id를 미리 발급한 뒤 첫 저장이 실패한 경우 — insert로 처리.
+        row.created_at = now;
+        result = await supabase
+          .from("user_stories")
+          .insert([row])
+          .select("id")
+          .single();
+      } else {
+        if ((existing.user_id || "").trim() !== user_id) {
+          return res.status(403).json({ ok: false, error: "forbidden" });
+        }
 
-      result = await supabase
-        .from("user_stories")
-        .update(row)
-        .eq("id", id)
-        .eq("user_id", user_id)
-        .select("id")
-        .single();
+        result = await supabase
+          .from("user_stories")
+          .update(row)
+          .eq("id", id)
+          .eq("user_id", user_id)
+          .select("id")
+          .single();
+      }
     } else {
       row.created_at = now;
       result = await supabase.from("user_stories").insert([row]).select("id").single();
