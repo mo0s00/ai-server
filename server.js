@@ -3216,9 +3216,28 @@ async function handleUserStoriesPost(req, res) {
 
     let result;
     if (id) {
+      const { data: existing, error: fetchErr } = await supabase
+        .from("user_stories")
+        .select("user_id")
+        .eq("id", id)
+        .maybeSingle();
+
+      if (fetchErr) {
+        logSupabaseErr("[user-stories] update fetch failed", fetchErr);
+        return res.status(500).json({ ok: false, error: fetchErr.message });
+      }
+      if (!existing) {
+        return res.status(404).json({ ok: false, error: "not found" });
+      }
+      if ((existing.user_id || "").trim() !== user_id) {
+        return res.status(403).json({ ok: false, error: "forbidden" });
+      }
+
       result = await supabase
         .from("user_stories")
-        .upsert(row, { onConflict: "id" })
+        .update(row)
+        .eq("id", id)
+        .eq("user_id", user_id)
         .select("id")
         .single();
     } else {
