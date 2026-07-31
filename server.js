@@ -18,7 +18,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "user-presence-v1";
+const SERVER_REV = "story-chat-stream-v1";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -536,6 +536,172 @@ async function callDeepSeekCompletion({
     raw: json,
   };
 }
+
+/** DeepSeek streaming — SSE delta 콜백. */
+async function callDeepSeekCompletionStream({
+  userPrompt,
+  temperature,
+  max_tokens,
+  logTag,
+  systemPrompt,
+  onDelta,
+  onFirstToken,
+}) {
+  if (!DEEPSEEK_API_KEY) {
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: 503,
+      errorText: "서버 설정 오류입니다.",
+    };
+  }
+
+  const messages = [];
+  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
+    messages.push({ role: "system", content: systemPrompt.trim() });
+  }
+  messages.push({ role: "user", content: userPrompt });
+
+  let payload;
+  try {
+    payload = JSON.stringify({
+      model: DEEPSEEK_MODEL,
+      thinking: { type: "disabled" },
+      temperature,
+      max_tokens,
+      stream: true,
+      messages,
+    });
+  } catch (stringifyErr) {
+    console.error(`[${logTag}] stream payload failed:`, stringifyErr);
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: 400,
+      errorText: "프롬프트 인코딩에 실패했습니다.",
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  let dsRes;
+  try {
+    dsRes = await fetch(DEEPSEEK_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: payload,
+      signal: controller.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(timer);
+    const msg = fetchErr?.message || String(fetchErr);
+    console.error(`[${logTag}] DeepSeek stream fetch error:`, msg);
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: fetchErr?.name === "AbortError" ? 504 : 502,
+      errorText:
+        fetchErr?.name === "AbortError"
+          ? "요청 시간이 초과되었습니다."
+          : "AI 서버 연결이 불안정합니다. 잠시 후 다시 시도해 주세요.",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!dsRes.ok) {
+    const rawText = await dsRes.text().catch(() => "");
+    let json = {};
+    try {
+      json = rawText ? JSON.parse(rawText) : {};
+    } catch (_) {}
+    const apiMsg = deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: dsRes.status >= 500 ? 502 : dsRes.status,
+      errorText: apiMsg,
+    };
+  }
+
+  const reader = dsRes.body?.getReader?.();
+  if (!reader) {
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: 502,
+      errorText: "스트림을 열 수 없습니다.",
+    };
+  }
+
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let fullText = "";
+  let firstTokenSent = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const data = trimmed.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch (_) {
+        continue;
+      }
+      const choices = Array.isArray(chunk?.choices) ? chunk.choices : [];
+      const delta = choices[0]?.delta;
+      let piece = "";
+      if (delta && typeof delta.content === "string") {
+        piece = delta.content;
+      } else if (choices[0]?.text) {
+        piece = String(choices[0].text);
+      }
+      if (!piece) continue;
+      fullText += piece;
+      if (!firstTokenSent) {
+        firstTokenSent = true;
+        if (typeof onFirstToken === "function") onFirstToken();
+      }
+      if (typeof onDelta === "function") onDelta(piece);
+    }
+  }
+
+  fullText = fullText.trim();
+  if (!fullText) {
+    return {
+      ok: false,
+      provider: "deepseek",
+      status: 502,
+      errorText: "empty reply",
+    };
+  }
+
+  console.log(`[${logTag}] stream complete provider=deepseek model=${DEEPSEEK_MODEL}`);
+  return {
+    ok: true,
+    provider: "deepseek",
+    model: DEEPSEEK_MODEL,
+    text: fullText,
+    raw: { stream: true, model: DEEPSEEK_MODEL },
+  };
+}
+
+function writeSse(res, obj) {
+  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
 /** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
 function isGarbageModelLine(s, modelStr) {
   const model =
@@ -2157,11 +2323,18 @@ Format:
 app.post("/api/story-chat", async (req, res) => {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
+  const t0 = Date.now();
+  const logTiming = (label) => {
+    console.log(`[story-chat timing] ${label} +${Date.now() - t0}ms`);
+  };
+  logTiming("request_received");
+
   try {
     const promptRaw = req.body && req.body.prompt;
     const storyContext = readString(req.body, "story_context");
     const requestedTemperature = Number(req.body && req.body.temperature);
     const requestedMaxTokens = Number(req.body && req.body.maxTokens);
+    const wantStream = req.body && req.body.stream === true;
     const temperature =
       Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
         ? requestedTemperature
@@ -2183,6 +2356,7 @@ app.post("/api/story-chat", async (req, res) => {
     if (!cleanedPrompt) {
       return res.status(400).json({ ok: false, error: "no prompt" });
     }
+    logTiming("prompt_ready");
 
     const sceneContext = storyContext || cleanedPrompt;
     const storyId = readString(req.body, "story_id");
@@ -2192,30 +2366,96 @@ app.post("/api/story-chat", async (req, res) => {
       (req.body && req.body.skip_scene_prediction === true) ||
       storyChatSkipsScenePrediction(storyId, programId);
 
+    const scenePromise = skipScenePrediction
+      ? Promise.resolve({
+          scene: "default",
+          preload: [],
+          source: "beat_scene_only",
+        })
+      : predictStoryScene(sceneContext);
+
+    if (wantStream) {
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+
+      let sceneData = {
+        scene: "default",
+        preload: [],
+        source: skipScenePrediction ? "beat_scene_only" : "pending",
+      };
+
+      scenePromise
+        .then((data) => {
+          sceneData = data;
+          writeSse(res, {
+            type: "scene",
+            scene: data.scene,
+            preload: data.preload,
+            scene_source: data.source,
+          });
+        })
+        .catch((e) => {
+          console.error("[story-chat stream scene error]", e?.message || e);
+        });
+
+      await acquireDeepSeekSlot();
+      let llmResult;
+      try {
+        logTiming("provider_started");
+        llmResult = await callDeepSeekCompletionStream({
+          userPrompt: cleanedPrompt,
+          temperature,
+          max_tokens,
+          logTag: "story-chat-stream",
+          onFirstToken: () => logTiming("first_token"),
+          onDelta: (piece) => {
+            writeSse(res, { type: "delta", text: piece });
+          },
+        });
+      } finally {
+        releaseDeepSeekSlot();
+      }
+
+      if (!llmResult.ok) {
+        writeSse(res, {
+          type: "error",
+          error: llmResult.errorText || "deepseek failed",
+        });
+        res.end();
+        return;
+      }
+
+      const reply = llmResult.text;
+      logTiming("completed");
+
+      writeSse(res, {
+        type: "done",
+        reply,
+        scene: sceneData.scene,
+        preload: sceneData.preload,
+        scene_source: sceneData.source,
+        raw: llmResult.raw,
+      });
+      res.end();
+      return;
+    }
+
     await acquireDeepSeekSlot();
     let llmResult;
     let sceneData;
     try {
-      const scenePromise = skipScenePrediction
-        ? Promise.resolve({
-            scene: "default",
-            preload: [],
-            source: "beat_scene_only",
-          })
-        : predictStoryScene(sceneContext);
-
-      [llmResult, sceneData] = await Promise.all([
-        callDeepSeekCompletion({
-          userPrompt: cleanedPrompt,
-          temperature,
-          max_tokens,
-          logTag: "story-chat",
-        }),
-        scenePromise,
-      ]);
+      llmResult = await callDeepSeekCompletion({
+        userPrompt: cleanedPrompt,
+        temperature,
+        max_tokens,
+        logTag: "story-chat",
+      });
     } finally {
       releaseDeepSeekSlot();
     }
+    logTiming("provider_completed");
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
@@ -2233,6 +2473,31 @@ app.post("/api/story-chat", async (req, res) => {
     if (!reply) {
       return res.status(502).json({ ok: false, error: "empty reply" });
     }
+
+    sceneData = {
+      scene: "default",
+      preload: [],
+      source: skipScenePrediction ? "beat_scene_only" : "default_fallback",
+    };
+    try {
+      sceneData = await Promise.race([
+        scenePromise,
+        new Promise((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                scene: "default",
+                preload: [],
+                source: "scene_timeout",
+              }),
+            1200,
+          ),
+        ),
+      ]);
+    } catch (e) {
+      console.error("[story-chat scene wait error]", e?.message || e);
+    }
+    logTiming("completed");
 
     const upstreamRaw = llmResult.raw;
 
@@ -2253,6 +2518,11 @@ app.post("/api/story-chat", async (req, res) => {
     });
   } catch (e) {
     console.error("[story-chat server error]", e);
+    if (req.body && req.body.stream === true && res.headersSent) {
+      writeSse(res, { type: "error", error: e.message });
+      res.end();
+      return;
+    }
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
