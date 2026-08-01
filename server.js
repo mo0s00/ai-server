@@ -9,6 +9,21 @@ import { handleIapCookieVerifyPost } from "./iap-cookie.js";
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-5.4-nano").trim();
+
+/** gpt-5·o 시리즈는 `max_tokens` 대신 `max_completion_tokens`만 허용한다. */
+function openAiCompletionTokenLimit(maxTokens) {
+  const n =
+    typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+      ? Math.floor(maxTokens)
+      : null;
+  if (n == null) return {};
+  const model = OPENAI_MODEL.toLowerCase();
+  if (/gpt-5|^o[0-9]/.test(model)) {
+    return { max_completion_tokens: n };
+  }
+  return { max_tokens: n };
+}
+
 /** Non-chat OpenAI APIs — fixed in code (env: OPENAI_API_KEY + OPENAI_MODEL only). */
 const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-1";
@@ -17,7 +32,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-chat-stream-v1";
+const SERVER_REV = "openai-max-completion-v1";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -388,7 +403,7 @@ async function callOpenAiCompletion({
     payload = JSON.stringify({
       model: OPENAI_MODEL,
       temperature,
-      max_tokens,
+      ...openAiCompletionTokenLimit(max_tokens),
       messages,
     });
   } catch (stringifyErr) {
@@ -525,7 +540,7 @@ async function callOpenAiCompletionStream({
     payload = JSON.stringify({
       model: OPENAI_MODEL,
       temperature,
-      max_tokens,
+      ...openAiCompletionTokenLimit(max_tokens),
       stream: true,
       messages,
     });
@@ -2079,7 +2094,7 @@ async function predictStoryScene(contextText) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       temperature: 0.25,
-      max_tokens: 220,
+      ...openAiCompletionTokenLimit(220),
       messages: [
         {
           role: "system",
