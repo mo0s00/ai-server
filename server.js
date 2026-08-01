@@ -6,11 +6,10 @@ import { PassThrough } from "node:stream";
 import { createClient } from "@supabase/supabase-js";
 import { handleIapCookieVerifyPost } from "./iap-cookie.js";
 
-const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
-const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || "").trim();
-const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-v4-flash").trim();
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
-/** OpenAI — TTS·이미지 생성 전용 (스토리채팅·추천·comment는 DeepSeek). */
+const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-5.4-nano").trim();
+/** Non-chat OpenAI APIs — fixed in code (env: OPENAI_API_KEY + OPENAI_MODEL only). */
 const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-1";
 const OPENAI_IMAGE_QUALITY = "high";
@@ -104,13 +103,10 @@ function buildHealthPayload() {
   ).trim();
   return {
     ok: true,
-    rev: SERVER_REV,
-    provider: "deepseek",
-    model: DEEPSEEK_MODEL,
-    storyProvider: "deepseek",
-    storyModel: DEEPSEEK_MODEL,
-    deepseekConfigured: !!DEEPSEEK_API_KEY,
     openaiConfigured: !!OPENAI_API_KEY,
+    provider: "openai",
+    model: OPENAI_MODEL,
+    rev: SERVER_REV,
     storyImageGeneration: storyImageGenerationEnabled(),
     supabaseConfigured: !!(url && key),
   };
@@ -281,16 +277,6 @@ function logSupabaseErr(label, err) {
   }
 }
 
-/** DeepSeek/호환 API 오류 본문에서 사람이 읽을 문자열만 뽑는다. */
-function deepSeekErrorMessage(json) {
-  if (!json || typeof json !== "object") return "";
-  const e = json.error;
-  if (typeof e === "string") return e;
-  if (e && typeof e === "object" && typeof e.message === "string") return e.message;
-  if (typeof json.message === "string") return json.message;
-  return "";
-}
-
 /** OpenAI/호환 API 오류 본문에서 사람이 읽을 문자열만 뽑는다. */
 function openAiErrorMessage(json) {
   if (!json || typeof json !== "object") return "";
@@ -373,46 +359,18 @@ function assistantTextFromMessage(msgObj) {
   return "";
 }
 
-/** DeepSeek 동시 outbound 제한(Render·API 과부하·일시 차단 완화) */
-const DEEPSEEK_MAX_CONCURRENT = Math.max(
-  1,
-  Number.parseInt(process.env.DEEPSEEK_MAX_CONCURRENT || "3", 10) || 3
-);
-let dsPermits = DEEPSEEK_MAX_CONCURRENT;
-const dsWaitQueue = [];
-
-function acquireDeepSeekSlot() {
-  return new Promise((resolve) => {
-    if (dsPermits > 0) {
-      dsPermits--;
-      resolve();
-    } else {
-      dsWaitQueue.push(resolve);
-    }
-  });
-}
-
-function releaseDeepSeekSlot() {
-  if (dsWaitQueue.length > 0) {
-    const next = dsWaitQueue.shift();
-    next();
-  } else {
-    dsPermits++;
-  }
-}
-
-/** DeepSeek Chat Completions — story-chat, story-suggestions, comment 공통. */
-async function callDeepSeekCompletion({
+/** OpenAI Chat Completions — story-chat, story-suggestions, comment 등 공통. */
+async function callOpenAiCompletion({
   userPrompt,
   temperature,
   max_tokens,
   logTag,
   systemPrompt,
 }) {
-  if (!DEEPSEEK_API_KEY) {
+  if (!OPENAI_API_KEY) {
     return {
       ok: false,
-      provider: "deepseek",
+      provider: "openai",
       status: 503,
       errorText: "서버 설정 오류입니다.",
       skipped: true,
@@ -428,17 +386,16 @@ async function callDeepSeekCompletion({
   let payload;
   try {
     payload = JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      thinking: { type: "disabled" },
+      model: OPENAI_MODEL,
       temperature,
       max_tokens,
       messages,
     });
   } catch (stringifyErr) {
-    console.error(`[${logTag}] JSON.stringify(deepseek payload) failed:`, stringifyErr);
+    console.error(`[${logTag}] JSON.stringify(openai payload) failed:`, stringifyErr);
     return {
       ok: false,
-      provider: "deepseek",
+      provider: "openai",
       status: 400,
       errorText: "프롬프트 인코딩에 실패했습니다.",
     };
@@ -447,12 +404,12 @@ async function callDeepSeekCompletion({
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  let dsRes;
+  let oaiRes;
   try {
-    dsRes = await fetch(DEEPSEEK_URL, {
+    oaiRes = await fetch(OPENAI_CHAT_URL, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json; charset=utf-8",
       },
       body: payload,
@@ -461,10 +418,10 @@ async function callDeepSeekCompletion({
   } catch (fetchErr) {
     clearTimeout(timer);
     const msg = fetchErr?.message || String(fetchErr);
-    console.error(`[${logTag}] DeepSeek fetch error:`, msg);
+    console.error(`[${logTag}] OpenAI fetch error:`, msg);
     return {
       ok: false,
-      provider: "deepseek",
+      provider: "openai",
       status: fetchErr?.name === "AbortError" ? 504 : 502,
       errorText:
         fetchErr?.name === "AbortError"
@@ -475,33 +432,32 @@ async function callDeepSeekCompletion({
     clearTimeout(timer);
   }
 
-  const rawText = await dsRes.text();
+  const rawText = await oaiRes.text();
   const safeRaw = typeof rawText === "string" ? rawText : String(rawText ?? "");
   let json = {};
   if (safeRaw) {
     try {
       json = JSON.parse(safeRaw);
     } catch (parseErr) {
-      console.log(`[${logTag}] DeepSeek JSON parse`, parseErr.message);
+      console.log(`[${logTag}] OpenAI JSON parse`, parseErr.message);
       return {
         ok: false,
-        provider: "deepseek",
+        provider: "openai",
         status: 502,
         errorText: "응답을 해석할 수 없습니다.",
       };
     }
   }
 
-  if (!dsRes.ok) {
-    const apiMsg = deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
-    const statusOut = dsRes.status >= 500 ? 502 : dsRes.status;
+  if (!oaiRes.ok) {
+    const apiMsg = openAiErrorMessage(json) || "OpenAI 요청에 실패했습니다.";
+    const statusOut = oaiRes.status >= 500 ? 502 : oaiRes.status;
     console.log(
-      `[${logTag}] DeepSeek HTTP ${dsRes.status} provider=deepseek model=${DEEPSEEK_MODEL}`,
-      safeRaw.length ? safeRaw.slice(0, 400) : "(empty body)"
+      `[${logTag}] OpenAI HTTP ${oaiRes.status} provider=openai model=${OPENAI_MODEL}`,
     );
     return {
       ok: false,
-      provider: "deepseek",
+      provider: "openai",
       status: statusOut,
       errorText: apiMsg,
     };
@@ -517,28 +473,31 @@ async function callDeepSeekCompletion({
 
   if (!text) {
     console.log(
-      `[${logTag}] No assistant content in DeepSeek response provider=deepseek model=${DEEPSEEK_MODEL}`,
+      `[${logTag}] No assistant content in OpenAI response provider=openai model=${OPENAI_MODEL}`,
     );
     return {
       ok: false,
-      provider: "deepseek",
+      provider: "openai",
       status: 502,
       errorText: "추천문 생성 실패",
     };
   }
 
-  console.log(`[${logTag}] provider=deepseek model=${DEEPSEEK_MODEL}`);
+  console.log(`[${logTag}] provider=openai model=${OPENAI_MODEL}`);
   return {
     ok: true,
-    provider: "deepseek",
-    model: DEEPSEEK_MODEL,
+    provider: "openai",
+    model: OPENAI_MODEL,
     text,
     raw: json,
   };
 }
 
-/** DeepSeek streaming — SSE delta 콜백. */
-async function callDeepSeekCompletionStream({
+/**
+ * OpenAI Chat Completions streaming — delta 콜백으로 전달.
+ * @returns {{ ok: boolean, text?: string, raw?: object, errorText?: string, status?: number }}
+ */
+async function callOpenAiCompletionStream({
   userPrompt,
   temperature,
   max_tokens,
@@ -547,10 +506,9 @@ async function callDeepSeekCompletionStream({
   onDelta,
   onFirstToken,
 }) {
-  if (!DEEPSEEK_API_KEY) {
+  if (!OPENAI_API_KEY) {
     return {
       ok: false,
-      provider: "deepseek",
       status: 503,
       errorText: "서버 설정 오류입니다.",
     };
@@ -565,8 +523,7 @@ async function callDeepSeekCompletionStream({
   let payload;
   try {
     payload = JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      thinking: { type: "disabled" },
+      model: OPENAI_MODEL,
       temperature,
       max_tokens,
       stream: true,
@@ -574,23 +531,18 @@ async function callDeepSeekCompletionStream({
     });
   } catch (stringifyErr) {
     console.error(`[${logTag}] stream payload failed:`, stringifyErr);
-    return {
-      ok: false,
-      provider: "deepseek",
-      status: 400,
-      errorText: "프롬프트 인코딩에 실패했습니다.",
-    };
+    return { ok: false, status: 400, errorText: "프롬프트 인코딩에 실패했습니다." };
   }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  let dsRes;
+  let oaiRes;
   try {
-    dsRes = await fetch(DEEPSEEK_URL, {
+    oaiRes = await fetch(OPENAI_CHAT_URL, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json; charset=utf-8",
       },
       body: payload,
@@ -599,10 +551,9 @@ async function callDeepSeekCompletionStream({
   } catch (fetchErr) {
     clearTimeout(timer);
     const msg = fetchErr?.message || String(fetchErr);
-    console.error(`[${logTag}] DeepSeek stream fetch error:`, msg);
+    console.error(`[${logTag}] OpenAI stream fetch error:`, msg);
     return {
       ok: false,
-      provider: "deepseek",
       status: fetchErr?.name === "AbortError" ? 504 : 502,
       errorText:
         fetchErr?.name === "AbortError"
@@ -613,29 +564,23 @@ async function callDeepSeekCompletionStream({
     clearTimeout(timer);
   }
 
-  if (!dsRes.ok) {
-    const rawText = await dsRes.text().catch(() => "");
+  if (!oaiRes.ok) {
+    const rawText = await oaiRes.text().catch(() => "");
     let json = {};
     try {
       json = rawText ? JSON.parse(rawText) : {};
     } catch (_) {}
-    const apiMsg = deepSeekErrorMessage(json) || "DeepSeek 요청에 실패했습니다.";
+    const apiMsg = openAiErrorMessage(json) || "OpenAI 요청에 실패했습니다.";
     return {
       ok: false,
-      provider: "deepseek",
-      status: dsRes.status >= 500 ? 502 : dsRes.status,
+      status: oaiRes.status >= 500 ? 502 : oaiRes.status,
       errorText: apiMsg,
     };
   }
 
-  const reader = dsRes.body?.getReader?.();
+  const reader = oaiRes.body?.getReader?.();
   if (!reader) {
-    return {
-      ok: false,
-      provider: "deepseek",
-      status: 502,
-      errorText: "스트림을 열 수 없습니다.",
-    };
+    return { ok: false, status: 502, errorText: "스트림을 열 수 없습니다." };
   }
 
   const decoder = new TextDecoder("utf-8");
@@ -680,21 +625,16 @@ async function callDeepSeekCompletionStream({
 
   fullText = fullText.trim();
   if (!fullText) {
-    return {
-      ok: false,
-      provider: "deepseek",
-      status: 502,
-      errorText: "empty reply",
-    };
+    return { ok: false, status: 502, errorText: "empty reply" };
   }
 
-  console.log(`[${logTag}] stream complete provider=deepseek model=${DEEPSEEK_MODEL}`);
+  console.log(`[${logTag}] stream complete provider=openai model=${OPENAI_MODEL}`);
   return {
     ok: true,
-    provider: "deepseek",
-    model: DEEPSEEK_MODEL,
+    provider: "openai",
+    model: OPENAI_MODEL,
     text: fullText,
-    raw: { stream: true, model: DEEPSEEK_MODEL },
+    raw: { stream: true, model: OPENAI_MODEL },
   };
 }
 
@@ -705,7 +645,7 @@ function writeSse(res, obj) {
 /** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
 function isGarbageModelLine(s, modelStr) {
   const model =
-    typeof modelStr === "string" && modelStr.trim() ? modelStr.trim() : DEEPSEEK_MODEL;
+    typeof modelStr === "string" && modelStr.trim() ? modelStr.trim() : OPENAI_MODEL;
   if (!s || typeof s !== "string") return false;
   let t = s
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
@@ -1036,8 +976,8 @@ async function handleAiCommentPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    if (!DEEPSEEK_API_KEY) {
-      console.log("[comment] DEEPSEEK_API_KEY missing");
+    if (!OPENAI_API_KEY) {
+      console.log("[comment] OPENAI_API_KEY missing");
       return res.status(503).json({ text: "서버 설정 오류입니다." });
     }
 
@@ -1052,29 +992,23 @@ async function handleAiCommentPost(req, res) {
         ? Math.min(2048, Math.floor(requestedMaxTokens))
         : 200;
 
-    await acquireDeepSeekSlot();
-    let llmResult;
-    try {
-      llmResult = await callDeepSeekCompletion({
-        userPrompt: cleanedPrompt,
-        temperature,
-        max_tokens,
-        logTag: "comment",
-      });
-    } finally {
-      releaseDeepSeekSlot();
-    }
+    const llmResult = await callOpenAiCompletion({
+      userPrompt: cleanedPrompt,
+      temperature,
+      max_tokens,
+      logTag: "comment",
+    });
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
       return res.status(statusOut).json({
-        text: llmResult.errorText || "DeepSeek 요청에 실패했습니다.",
+        text: llmResult.errorText || "OpenAI 요청에 실패했습니다.",
       });
     }
 
     const text = llmResult.text;
 
-    if (isGarbageModelLine(text, DEEPSEEK_MODEL)) {
+    if (isGarbageModelLine(text, OPENAI_MODEL)) {
       console.log("[comment] rejected garbage model-line reply");
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
@@ -1145,7 +1079,7 @@ function resolveStorySuggestionMaxTokens(requested) {
   return Math.min(2048, Math.max(220, Math.floor(n)));
 }
 
-/** 스토리 beat 추천 재작성 — DeepSeek only. */
+/** 스토리 beat 추천 재작성 — OpenAI only. */
 async function handleStorySuggestionsPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
@@ -1170,8 +1104,8 @@ async function handleStorySuggestionsPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    if (!DEEPSEEK_API_KEY) {
-      console.log("[story-suggestions] DEEPSEEK_API_KEY missing");
+    if (!OPENAI_API_KEY) {
+      console.log("[story-suggestions] OPENAI_API_KEY missing");
       return res.status(503).json({ text: "서버 설정 오류입니다." });
     }
 
@@ -1189,30 +1123,24 @@ async function handleStorySuggestionsPost(req, res) {
     console.log(
       `[story-suggestions] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
         `slotCount=${slotCount} promptLen=${cleanedPrompt.length} maxTokens=${max_tokens} ` +
-        `provider=deepseek model=${DEEPSEEK_MODEL}`,
+        `provider=openai model=${OPENAI_MODEL}`,
     );
 
-    await acquireDeepSeekSlot();
-    let llmResult;
-    try {
-      llmResult = await callDeepSeekCompletion({
-        userPrompt: cleanedPrompt,
-        temperature,
-        max_tokens,
-        logTag: "story-suggestions",
-      });
-    } finally {
-      releaseDeepSeekSlot();
-    }
+    const llmResult = await callOpenAiCompletion({
+      userPrompt: cleanedPrompt,
+      temperature,
+      max_tokens,
+      logTag: "story-suggestions",
+    });
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
-      const errorText = llmResult.errorText || "DeepSeek 요청에 실패했습니다.";
+      const errorText = llmResult.errorText || "OpenAI 요청에 실패했습니다.";
       return res.status(statusOut).json({ text: errorText });
     }
 
     const text = llmResult.text;
-    if (isGarbageModelLine(text, DEEPSEEK_MODEL)) {
+    if (isGarbageModelLine(text, OPENAI_MODEL)) {
       console.log("[story-suggestions] rejected garbage model-line reply");
       return res.status(502).json({ text: "추천문 생성 실패" });
     }
@@ -1519,69 +1447,7 @@ app.post("/api/custom-prompts", handleCustomPromptPost);
 app.post("/custom-prompt", handleCustomPromptPost);
 app.post("/custom-prompts", handleCustomPromptPost);
 
-function isPublicCustomPromptRow(row) {
-  try {
-    const raw = row && row.prompt;
-    if (raw == null) return false;
-    const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (!obj || typeof obj !== "object") return false;
-    const v = String(obj.visibility || obj.finalVisibility || "")
-      .trim()
-      .toLowerCase();
-    if (v === "private" || v === "friends") return false;
-    if (v === "public") return true;
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-/** 공개 목록 API — data URL·과도한 프롬프트 필드 제거(앱 ANR·대역폭 절감). */
-function slimPromptForPublicListing(promptRaw) {
-  try {
-    const obj =
-      typeof promptRaw === "string" ? JSON.parse(promptRaw) : promptRaw;
-    if (!obj || typeof obj !== "object") return promptRaw;
-    const slim = {
-      name: obj.name,
-      age: obj.age,
-      gender: obj.gender,
-      job: obj.job,
-      style: obj.style,
-      profileKey: obj.profileKey,
-      assetFolder: obj.assetFolder,
-      visibility: obj.visibility || obj.finalVisibility,
-      category: obj.category,
-      genre: obj.genre,
-      isExpert: obj.isExpert,
-      createdAtMs: obj.createdAtMs,
-      ownerUserId: obj.ownerUserId,
-      profileImagePath: obj.profileImagePath,
-      chatBackgroundImagePath: obj.chatBackgroundImagePath,
-      dmGenreTopics: obj.dmGenreTopics,
-    };
-    if (Array.isArray(obj.personalityLines)) {
-      slim.personalityLines = obj.personalityLines.slice(0, 4);
-    }
-    if (Array.isArray(obj.introLines)) {
-      slim.introLines = obj.introLines.slice(0, 3);
-    }
-    for (const key of ["profileImagePath", "chatBackgroundImagePath"]) {
-      const v = slim[key];
-      if (typeof v !== "string") continue;
-      const t = v.trim();
-      if (t.startsWith("data:") || (!t.startsWith("http://") && !t.startsWith("https://"))) {
-        delete slim[key];
-      }
-    }
-    return slim;
-  } catch (_) {
-    return promptRaw;
-  }
-}
-
-// 구버전 `GET /api/custom-prompts?user_id=` — `:userId` 라우트보다 먼저 등록
-// `GET /api/custom-prompts?scope=public` — 전체 공개 유저 케릭터 탐색용
+// 구버전 `GET /api/custom-prompts?user_id=` · `?scope=public` — `:userId` 라우트보다 먼저 등록
 async function handleCustomPromptsQueryGet(req, res) {
   try {
     const scopeRaw = req.query && req.query.scope;
@@ -1592,30 +1458,20 @@ async function handleCustomPromptsQueryGet(req, res) {
           ? decodeURIComponent(scopeRaw[0]).trim().toLowerCase()
           : "";
 
-    if (scope === "public") {
-      const supabase = getSupabase();
-      if (!supabase) {
-        return res.status(500).json({ ok: false, error: "supabase 없음", prompts: [] });
-      }
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
 
+    if (scope === "public") {
       const { data, error } = await supabase
         .from("custom_prompts")
         .select("*")
-        .order("updated_at", { ascending: false })
-        .limit(300);
-
+        .eq("is_public", true)
+        .order("updated_at", { ascending: false });
       if (error) {
         console.log("❌ [custom-prompts public]", error?.message || error);
         return res.json({ ok: false, prompts: [] });
       }
-
-      const prompts = (data || [])
-        .filter(isPublicCustomPromptRow)
-        .map((row) => ({
-          ...row,
-          prompt: slimPromptForPublicListing(row.prompt),
-        }));
-      return res.json({ ok: true, prompts });
+      return res.json({ ok: true, prompts: data || [] });
     }
 
     const raw = req.query && req.query.user_id;
@@ -1628,9 +1484,6 @@ async function handleCustomPromptsQueryGet(req, res) {
     if (!userId) {
       return res.status(400).json({ error: "user_id required" });
     }
-
-    const supabase = getSupabase();
-    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
 
     const { data, error } = await supabase
       .from("custom_prompts")
@@ -1736,54 +1589,6 @@ async function handleCustomPromptDelete(req, res) {
 
 app.delete("/api/custom-prompts/:userId", handleCustomPromptDelete);
 app.delete("/custom-prompts/:userId", handleCustomPromptDelete);
-
-// 유저 제작 캐릭터 프로필·채팅 배경 — `POST /api/character-image` (Supabase Storage)
-async function handleCharacterImagePost(req, res) {
-  try {
-    const supabase = getSupabase();
-    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
-
-    const user_id = readString(req.body, "user_id");
-    const commenter_id = readString(req.body, "commenter_id");
-    const kind = readString(req.body, "kind") || "profile";
-    const image_base64 = readString(req.body, "image_base64");
-
-    if (!user_id || !commenter_id || !image_base64) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "user_id, commenter_id, image_base64 필요" });
-    }
-
-    let buffer;
-    try {
-      buffer = Buffer.from(image_base64, "base64");
-    } catch (_e) {
-      return res.status(400).json({ ok: false, error: "image_base64 파싱 실패" });
-    }
-
-    if (!buffer?.length) {
-      return res.status(400).json({ ok: false, error: "이미지 데이터 비어 있음" });
-    }
-
-    const imageUrl = await uploadCharacterImageToSupabase(
-      user_id,
-      commenter_id,
-      kind,
-      buffer,
-    );
-    if (!imageUrl) {
-      return res.status(500).json({ ok: false, error: "storage 업로드 실패" });
-    }
-
-    return res.json({ ok: true, image_url: imageUrl });
-  } catch (e) {
-    console.error("[character-image post]", e);
-    return res.status(500).json({ ok: false, error: e.message || "server error" });
-  }
-}
-
-app.post("/api/character-image", handleCharacterImagePost);
-app.post("/character-image", handleCharacterImagePost);
 
 // 쿠키 거래 1건 — 앱 `POST /api/cookie-tx`
 async function handleCookieTxPost(req, res) {
@@ -2248,11 +2053,11 @@ function storyChatSkipsScenePrediction(storyId, programId) {
 }
 
 async function predictStoryScene(contextText) {
-  if (!DEEPSEEK_API_KEY) {
+  if (!OPENAI_API_KEY) {
     return {
       scene: "default",
       preload: [],
-      source: "fallback_no_deepseek_key",
+      source: "fallback_no_openai_key",
     };
   }
 
@@ -2265,7 +2070,20 @@ async function predictStoryScene(contextText) {
     };
   }
 
-  const sceneSystemPrompt = `You are the scene director for an AI story chat.
+  const sceneRes = await fetch(OPENAI_CHAT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature: 0.25,
+      max_tokens: 220,
+      messages: [
+        {
+          role: "system",
+          content: `You are the scene director for an AI story chat.
 
 Goals:
 - Pick the background scene key for the next character reply.
@@ -2281,34 +2099,36 @@ Output rules:
 - preload: up to 3 allowed keys.
 
 Format:
-{"scene":"royal_banquet","preload":["palace_corridor","palace_garden"]}`;
-
-  const llmResult = await callDeepSeekCompletion({
-    userPrompt: safeContext,
-    temperature: 0.25,
-    max_tokens: 220,
-    logTag: "story-chat-scene",
-    systemPrompt: sceneSystemPrompt,
+{"scene":"royal_banquet","preload":["palace_corridor","palace_garden"]}`,
+        },
+        {
+          role: "user",
+          content: safeContext,
+        },
+      ],
+    }),
   });
 
-  if (!llmResult.ok) {
-    console.error("[story-chat scene error]", llmResult.status, llmResult.errorText);
+  const raw = await sceneRes.text();
+  if (!sceneRes.ok) {
+    console.error("[story-chat scene error]", sceneRes.status, raw.slice(0, 400));
     return {
       scene: "default",
       preload: [],
-      source: "fallback_deepseek_error",
+      source: "fallback_openai_error",
     };
   }
 
   try {
-    const content = llmResult.text || "";
+    const upstream = JSON.parse(raw);
+    const content = upstream?.choices?.[0]?.message?.content || "";
     const parsed = safeJsonObjectFromText(content);
     const scene = normalizeStorySceneKey(parsed?.scene);
 
     return {
       scene,
       preload: normalizeStoryScenePreload(parsed?.preload, scene),
-      source: "deepseek",
+      source: "openai",
     };
   } catch (e) {
     console.error("[story-chat scene parse error]", e?.message || e);
@@ -2348,8 +2168,8 @@ app.post("/api/story-chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "no prompt" });
     }
 
-    if (!DEEPSEEK_API_KEY) {
-      return res.status(500).json({ ok: false, error: "no DEEPSEEK_API_KEY" });
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
     }
 
     const cleanedPrompt = sanitizePromptForApi(promptRaw);
@@ -2400,28 +2220,22 @@ app.post("/api/story-chat", async (req, res) => {
           console.error("[story-chat stream scene error]", e?.message || e);
         });
 
-      await acquireDeepSeekSlot();
-      let llmResult;
-      try {
-        logTiming("provider_started");
-        llmResult = await callDeepSeekCompletionStream({
-          userPrompt: cleanedPrompt,
-          temperature,
-          max_tokens,
-          logTag: "story-chat-stream",
-          onFirstToken: () => logTiming("first_token"),
-          onDelta: (piece) => {
-            writeSse(res, { type: "delta", text: piece });
-          },
-        });
-      } finally {
-        releaseDeepSeekSlot();
-      }
+      logTiming("provider_started");
+      const llmResult = await callOpenAiCompletionStream({
+        userPrompt: cleanedPrompt,
+        temperature,
+        max_tokens,
+        logTag: "story-chat-stream",
+        onFirstToken: () => logTiming("first_token"),
+        onDelta: (piece) => {
+          writeSse(res, { type: "delta", text: piece });
+        },
+      });
 
       if (!llmResult.ok) {
         writeSse(res, {
           type: "error",
-          error: llmResult.errorText || "deepseek failed",
+          error: llmResult.errorText || "openai failed",
         });
         res.end();
         return;
@@ -2429,6 +2243,11 @@ app.post("/api/story-chat", async (req, res) => {
 
       const reply = llmResult.text;
       logTiming("completed");
+
+      console.log(
+        `[story-chat stream] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
+          `scene=${sceneData.scene} preload=${JSON.stringify(sceneData.preload)}`,
+      );
 
       writeSse(res, {
         type: "done",
@@ -2442,27 +2261,20 @@ app.post("/api/story-chat", async (req, res) => {
       return;
     }
 
-    await acquireDeepSeekSlot();
-    let llmResult;
-    let sceneData;
-    try {
-      llmResult = await callDeepSeekCompletion({
-        userPrompt: cleanedPrompt,
-        temperature,
-        max_tokens,
-        logTag: "story-chat",
-      });
-    } finally {
-      releaseDeepSeekSlot();
-    }
+    const llmResult = await callOpenAiCompletion({
+      userPrompt: cleanedPrompt,
+      temperature,
+      max_tokens,
+      logTag: "story-chat",
+    });
     logTiming("provider_completed");
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
-      const errMsg = llmResult.errorText || "deepseek failed";
+      const errMsg = llmResult.errorText || "openai failed";
       console.error(
         "[story-chat llm error]",
-        `provider=deepseek model=${DEEPSEEK_MODEL}`,
+        `provider=openai model=${OPENAI_MODEL}`,
         statusOut,
         errMsg,
       );
@@ -2474,7 +2286,7 @@ app.post("/api/story-chat", async (req, res) => {
       return res.status(502).json({ ok: false, error: "empty reply" });
     }
 
-    sceneData = {
+    let sceneData = {
       scene: "default",
       preload: [],
       source: skipScenePrediction ? "beat_scene_only" : "default_fallback",
@@ -2505,7 +2317,7 @@ app.post("/api/story-chat", async (req, res) => {
       `[story-chat] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
         `currentBeat.scene=${beatScene || "(none)"} appliedScenePreset=${sceneData.scene} ` +
         `preload=${JSON.stringify(sceneData.preload)} source=${sceneData.source} ` +
-        `provider=deepseek model=${DEEPSEEK_MODEL}`,
+        `provider=openai model=${OPENAI_MODEL}`,
     );
 
     return res.json({
@@ -2518,6 +2330,9 @@ app.post("/api/story-chat", async (req, res) => {
     });
   } catch (e) {
     console.error("[story-chat server error]", e);
+    if (req.body && req.body.stream === true && !res.headersSent) {
+      res.status(500);
+    }
     if (req.body && req.body.stream === true && res.headersSent) {
       writeSse(res, { type: "error", error: e.message });
       res.end();
@@ -2610,16 +2425,6 @@ Do not change body type.
 
 Only change pose, expression, scene, lighting and environment according to the story.`;
 
-const STORY_STYLE_REFERENCE_RULES = `IMPORTANT:
-
-Use the provided reference image as a VISUAL STYLE guide only.
-
-Match the rendering quality, color palette, lighting mood, composition style, and art direction from the reference.
-
-Do NOT copy the person's face, identity, hairstyle, age, ethnicity, or exact pose from the reference.
-
-Create a NEW original character based on the prompt while matching the reference aesthetic.`;
-
 const STORY_IMAGE_COMMON_RULES = `Visual rules:
 - vertical 9:16 composition
 - cinematic lighting
@@ -2692,12 +2497,30 @@ function parseStoryReferenceImages(raw) {
 }
 
 const STORY_BANNER_TITLE_RULES = `Visual rules for story banner card:
-- horizontal 16:9 composition (landscape banner card)
+- horizontal 16:9 composition (landscape banner card, exact widescreen crop)
 - cinematic lighting, full background scene
 - render the story title text prominently at the top center, integrated into the artwork like a movie or game poster
 - title must be bold, readable, cinematic typography with dramatic lighting or texture
 - no speech bubbles, no subtitles, no caption text, no watermark, no UI elements
 - emotionally clear storytelling`;
+
+const STORY_BANNER_NO_TITLE_RULES = `Visual rules for story banner card:
+- horizontal 16:9 composition (landscape banner card, exact widescreen crop)
+- cinematic lighting, full background scene
+- absolutely no text, no letters, no words, no title, no typography, no captions in the image
+- no speech bubbles, no subtitles, no watermark, no UI elements
+- leave subtle darker atmospheric space at the top center for app title overlay
+- emotionally clear storytelling`;
+
+const STORY_BANNER_REFERENCE_RULES = `IMPORTANT:
+
+Use the provided reference images as style and composition references for the banner.
+
+Match the visual style, color palette, lighting mood, rendering quality, and compositional feel.
+
+Do NOT copy exact characters, logos, or specific copyrighted elements.
+
+Create an original scene for this story while preserving the reference banner's aesthetic feel.`;
 
 function characterChatVisualStyle(styleType, mood = "") {
   const m = String(mood || "").trim() || "cinematic dramatic";
@@ -2714,6 +2537,22 @@ function characterChatVisualStyle(styleType, mood = "") {
     "expressive illustrated rendering, soft atmospheric background, cinematic lighting, " +
     "no text, no UI, no watermark. Mood: " +
     m
+  );
+}
+
+function bannerVisualFocus(referenceMode = "") {
+  const mode = String(referenceMode || "").trim().toLowerCase();
+  if (mode === "banner" || mode === "style") {
+    return (
+      "Focus: Horizontal 16:9 story banner background. " +
+      "Match composition style, color palette, and visual quality from the reference banner image. " +
+      "Create an original scene for this story opening. No text in the image."
+    );
+  }
+  return (
+    "Focus: Horizontal 16:9 story banner background. " +
+    "Cinematic landscape scene for the story opening. " +
+    "Title is shown in app UI overlay — no text in the image."
   );
 }
 
@@ -2762,6 +2601,8 @@ function buildStoryImagePrompt({
   if (program === "character_chat") {
     style = characterChatVisualStyle(styleType, mood);
     focus = characterChatVisualFocus(styleType, referenceMode);
+  } else if (isCover) {
+    focus = bannerVisualFocus(referenceMode);
   }
   const t = String(title || "").trim().slice(0, 200);
   const op = String(opening || "").trim().slice(0, 600);
@@ -2778,12 +2619,14 @@ function buildStoryImagePrompt({
   const kind = isCover
     ? renderTitleInImage
       ? "Create one high-quality horizontal story banner cover with the title text rendered inside the image."
-      : "Create one high-quality vertical story cover background."
+      : "Create one high-quality horizontal story banner background (16:9 landscape). No text in the image."
     : "Create one high-quality vertical story scene background.";
 
-  const visualRules = isCover && renderTitleInImage
-    ? `${STORY_BANNER_TITLE_RULES}
+  const visualRules = isCover
+    ? renderTitleInImage
+      ? `${STORY_BANNER_TITLE_RULES}
 - only text allowed in the image is the story title shown below`
+      : STORY_BANNER_NO_TITLE_RULES
     : STORY_IMAGE_COMMON_RULES;
 
   const titleBlock =
@@ -2798,11 +2641,9 @@ function buildStoryImagePrompt({
 
   const refMode = String(referenceMode || "").trim().toLowerCase();
   const refRules =
-    refNames.length > 0
-      ? refMode === "style"
-        ? STORY_STYLE_REFERENCE_RULES
-        : STORY_IMAGE_REFERENCE_RULES
-      : "";
+    refMode === "banner" || (isCover && refNames.length > 0)
+      ? STORY_BANNER_REFERENCE_RULES
+      : STORY_IMAGE_REFERENCE_RULES;
 
   return `${refRules}
 ${refBlock}
@@ -2855,91 +2696,93 @@ async function uploadStoryImageToSupabase(sessionKey, subfolder, fileStem, pngBu
   return data?.publicUrl || null;
 }
 
-const CHARACTER_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const USER_ASSET_IMAGE_MAX_BYTES = 6 * 1024 * 1024;
 
-function detectCharacterImageMeta(buffer) {
-  if (!buffer?.length) return { contentType: "image/png", ext: "png" };
-  if (
-    buffer.length >= 4 &&
-    buffer[0] === 0x89 &&
-    buffer[1] === 0x50 &&
-    buffer[2] === 0x4e &&
-    buffer[3] === 0x47
-  ) {
-    return { contentType: "image/png", ext: "png" };
-  }
-  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return { contentType: "image/jpeg", ext: "jpg" };
-  }
-  if (
-    buffer.length >= 12 &&
-    buffer[0] === 0x52 &&
-    buffer[1] === 0x49 &&
-    buffer[2] === 0x46 &&
-    buffer[3] === 0x46
-  ) {
-    return { contentType: "image/webp", ext: "webp" };
-  }
-  return { contentType: "image/png", ext: "png" };
+function isJpegBuffer(buf) {
+  return buf?.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
 }
 
-async function uploadCharacterImageToSupabase(userId, commenterId, kind, imageBuffer) {
-  const supabase = getSupabase();
-  if (!supabase || !userId || !commenterId || !imageBuffer?.length) return null;
-  if (imageBuffer.length > CHARACTER_IMAGE_MAX_BYTES) {
-    console.warn("[character-image] too large", imageBuffer.length);
+function isWebpBuffer(buf) {
+  return (
+    buf?.length >= 12 &&
+    buf[0] === 0x52 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x46 &&
+    buf[8] === 0x57 &&
+    buf[9] === 0x45 &&
+    buf[10] === 0x42 &&
+    buf[11] === 0x50
+  );
+}
+
+function detectUserAssetImage(buf) {
+  if (!buf?.length || buf.length > USER_ASSET_IMAGE_MAX_BYTES) return null;
+  if (isPngBuffer(buf)) return { contentType: "image/png", ext: "png" };
+  if (isJpegBuffer(buf)) return { contentType: "image/jpeg", ext: "jpg" };
+  if (isWebpBuffer(buf)) return { contentType: "image/webp", ext: "webp" };
+  return null;
+}
+
+function decodeUserAssetImageBase64(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  const comma = s.indexOf(",");
+  const payload = s.startsWith("data:") && comma >= 0 ? s.slice(comma + 1) : s;
+  try {
+    const buf = Buffer.from(payload, "base64");
+    return detectUserAssetImage(buf) ? buf : null;
+  } catch (_e) {
     return null;
   }
+}
 
-  const safeUser = sanitizeStoryImagePathSegment(userId, 80);
-  const safePk = sanitizeStoryImagePathSegment(commenterId, 80);
-  const safeKind = sanitizeStoryImagePathSegment(kind || "profile", 24);
-  const meta = detectCharacterImageMeta(imageBuffer);
-  const path = `${safeUser}/${safePk}_${safeKind}.${meta.ext}`;
-
-  const { error } = await supabase.storage.from("character-profiles").upload(path, imageBuffer, {
-    contentType: meta.contentType,
+async function uploadUserAssetImage(bucket, storagePath, buf, contentType) {
+  const supabase = getSupabase();
+  if (!supabase || !buf?.length) return null;
+  const { error } = await supabase.storage.from(bucket).upload(storagePath, buf, {
+    contentType,
     upsert: true,
   });
-
   if (error) {
-    console.error("[character-image upload error]", error.message);
+    console.error("[user-asset-image upload]", storagePath, error.message);
     return null;
   }
-
-  const { data } = supabase.storage.from("character-profiles").getPublicUrl(path);
+  const { data } = supabase.storage.from(bucket).getPublicUrl(storagePath);
   return data?.publicUrl || null;
 }
 
-async function uploadUserStoryAssetToSupabase(userId, storyId, kind, imageBuffer) {
-  const supabase = getSupabase();
-  if (!supabase || !userId || !storyId || !imageBuffer?.length) return null;
-  if (imageBuffer.length > CHARACTER_IMAGE_MAX_BYTES) {
-    console.warn("[user-story-image] too large", imageBuffer.length);
-    return null;
+async function handleCharacterImagePost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const commenter_id = readString(req.body, "commenter_id");
+    const kind = sanitizeStoryImagePathSegment(readString(req.body, "kind") || "profile", 40);
+    const buf = decodeUserAssetImageBase64(req.body && req.body.image_base64);
+
+    if (!user_id || !commenter_id || !buf) {
+      return res.status(400).json({ ok: false, error: "user_id, commenter_id, image_base64 필요" });
+    }
+
+    const detected = detectUserAssetImage(buf);
+    if (!detected) {
+      return res.status(400).json({ ok: false, error: "invalid image" });
+    }
+
+    const safeUser = sanitizeStoryImagePathSegment(user_id, 120);
+    const safeId = sanitizeStoryImagePathSegment(commenter_id, 120);
+    const path = `commenters/${safeUser}/${safeId}/${kind}.${detected.ext}`;
+    const url = await uploadUserAssetImage("story-covers", path, buf, detected.contentType);
+    if (!url) return res.status(500).json({ ok: false, error: "upload failed" });
+    return res.json({ ok: true, image_url: url });
+  } catch (e) {
+    console.error("[character-image]", e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
-
-  const safeUser = sanitizeStoryImagePathSegment(userId, 80);
-  const safeStory = sanitizeStoryImagePathSegment(storyId, 80);
-  const safeKind = sanitizeStoryImagePathSegment(kind || "cover", 40);
-  const meta = detectCharacterImageMeta(imageBuffer);
-  const path = `user-stories/${safeUser}/${safeStory}/${safeKind}.${meta.ext}`;
-
-  const { error } = await supabase.storage.from("story-covers").upload(path, imageBuffer, {
-    contentType: meta.contentType,
-    upsert: true,
-  });
-
-  if (error) {
-    console.error("[user-story-image upload error]", error.message);
-    return null;
-  }
-
-  const { data } = supabase.storage.from("story-covers").getPublicUrl(path);
-  return data?.publicUrl || null;
 }
 
-// 유저 제작 스토리 배너·배경·캐릭터 초상화 — `POST /api/user-story-image`
 async function handleUserStoryImagePost(req, res) {
   try {
     const supabase = getSupabase();
@@ -2947,45 +2790,29 @@ async function handleUserStoryImagePost(req, res) {
 
     const user_id = readString(req.body, "user_id");
     const story_id = readString(req.body, "story_id");
-    const kind = readString(req.body, "kind") || "cover";
-    const image_base64 = readString(req.body, "image_base64");
+    const kind = sanitizeStoryImagePathSegment(readString(req.body, "kind") || "cover", 40);
+    const buf = decodeUserAssetImageBase64(req.body && req.body.image_base64);
 
-    if (!user_id || !story_id || !image_base64) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "user_id, story_id, image_base64 필요" });
+    if (!user_id || !story_id || !buf) {
+      return res.status(400).json({ ok: false, error: "user_id, story_id, image_base64 필요" });
     }
 
-    let buffer;
-    try {
-      buffer = Buffer.from(image_base64, "base64");
-    } catch (_e) {
-      return res.status(400).json({ ok: false, error: "image_base64 파싱 실패" });
+    const detected = detectUserAssetImage(buf);
+    if (!detected) {
+      return res.status(400).json({ ok: false, error: "invalid image" });
     }
 
-    if (!buffer?.length) {
-      return res.status(400).json({ ok: false, error: "이미지 데이터 비어 있음" });
-    }
-
-    const imageUrl = await uploadUserStoryAssetToSupabase(
-      user_id,
-      story_id,
-      kind,
-      buffer,
-    );
-    if (!imageUrl) {
-      return res.status(500).json({ ok: false, error: "storage 업로드 실패" });
-    }
-
-    return res.json({ ok: true, image_url: imageUrl });
+    const safeUser = sanitizeStoryImagePathSegment(user_id, 120);
+    const safeStory = sanitizeStoryImagePathSegment(story_id, 120);
+    const path = `user-stories/${safeUser}/${safeStory}/${kind}.${detected.ext}`;
+    const url = await uploadUserAssetImage("story-covers", path, buf, detected.contentType);
+    if (!url) return res.status(500).json({ ok: false, error: "upload failed" });
+    return res.json({ ok: true, image_url: url });
   } catch (e) {
-    console.error("[user-story-image post]", e);
-    return res.status(500).json({ ok: false, error: e.message || "server error" });
+    console.error("[user-story-image]", e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
 }
-
-app.post("/api/user-story-image", handleUserStoryImagePost);
-app.post("/user-story-image", handleUserStoryImagePost);
 
 const STORY_REF_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
 
@@ -2997,23 +2824,6 @@ function isPngBuffer(buf) {
     buf[2] === 0x4e &&
     buf[3] === 0x47
   );
-}
-
-function detectStoryReferenceImageMime(buf) {
-  if (isPngBuffer(buf)) {
-    return { ext: "png", contentType: "image/png" };
-  }
-  if (buf?.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
-    return { ext: "jpg", contentType: "image/jpeg" };
-  }
-  if (
-    buf?.length >= 12 &&
-    buf.toString("ascii", 0, 4) === "RIFF" &&
-    buf.toString("ascii", 8, 12) === "WEBP"
-  ) {
-    return { ext: "webp", contentType: "image/webp" };
-  }
-  return null;
 }
 
 function filterStoryReferenceImagesForApi(referenceImages) {
@@ -3034,12 +2844,11 @@ function filterStoryReferenceImagesForApi(referenceImages) {
       );
       continue;
     }
-    const mime = detectStoryReferenceImageMime(buf);
-    if (!mime) {
-      console.warn("[story-image] skip ref", ref.name, "unsupported format");
+    if (!isPngBuffer(buf)) {
+      console.warn("[story-image] skip ref", ref.name, "not png");
       continue;
     }
-    out.push({ name: ref.name, buf, ext: mime.ext, contentType: mime.contentType });
+    out.push({ name: ref.name, buf });
   }
   return out;
 }
@@ -3131,17 +2940,15 @@ async function requestOpenAiStoryImageEdits(
   prompt,
   referenceImages,
   imageSize = STORY_IMAGE_SIZE_PORTRAIT,
-  { referenceMode = "" } = {},
 ) {
   const refs = filterStoryReferenceImagesForApi(referenceImages);
   if (!refs.length) return null;
 
   const form = new FormData();
-  const imageField = refs.length > 1 ? "image[]" : "image";
   refs.forEach((ref, index) => {
-    form.append(imageField, ref.buf, {
-      filename: `reference_${index + 1}.${ref.ext}`,
-      contentType: ref.contentType,
+    form.append("image", ref.buf, {
+      filename: `reference_${index + 1}.png`,
+      contentType: "image/png",
     });
   });
   form.append("model", OPENAI_IMAGE_MODEL);
@@ -3149,16 +2956,10 @@ async function requestOpenAiStoryImageEdits(
   form.append("size", imageSize);
   form.append("quality", OPENAI_IMAGE_QUALITY);
   form.append("output_format", "png");
-  const refMode = String(referenceMode || "").trim().toLowerCase();
-  if (refMode === "character" || refMode === "style" || refs.length > 0) {
-    form.append("input_fidelity", "high");
-  }
 
   console.log(
     "[story-image edits request]",
     `refs=${refs.length}`,
-    `field=${imageField}`,
-    `referenceMode=${refMode || "(default)"}`,
     `bytes=${refs.map((r) => r.buf.length).join(",")}`,
   );
 
@@ -3182,17 +2983,13 @@ async function generateStoryImageFromPrompt(
   let generationMode = "generations";
   let referenceApplied = false;
   let fallbackUsed = false;
-  let editsError = "";
   let result;
 
   if (parsedReferenceCount > 0) {
     let editsFailed = false;
-    const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages, imageSize, {
-      referenceMode: refMode,
-    });
+    const editsRes = await requestOpenAiStoryImageEdits(prompt, referenceImages, imageSize);
     if (!editsRes) {
       editsFailed = true;
-      editsError = "reference images could not be prepared for edits";
       console.warn(
         "[imageGen]",
         "edits request could not be built",
@@ -3205,23 +3002,12 @@ async function generateStoryImageFromPrompt(
         "[imageGen]",
         `parsedReferenceCount=${parsedReferenceCount}`,
         `referenceMode=${refMode || "(default)"}`,
-        `refSizes=${referenceImages
-          .map((r) => {
-            if (r.buf?.length) return r.buf.length;
-            try {
-              return Buffer.from(r.data || "", "base64").length;
-            } catch (_e) {
-              return 0;
-            }
-          })
-          .join(",")}`,
         `editsStatus=${result.status}`,
         "generationMode=edits",
       );
       if (!result.ok) {
         editsFailed = true;
-        editsError = result.errorMessage || `edits failed (${result.status})`;
-        console.warn("[imageGen] edits failed:", editsError);
+        console.warn("[imageGen] edits failed:", result.errorMessage);
       } else {
         generationMode = "edits";
         referenceApplied = true;
@@ -3249,13 +3035,6 @@ async function generateStoryImageFromPrompt(
   } else {
     const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
     result = await readOpenAiStoryImageResponse(genRes, "generations");
-    console.log(
-      "[imageGen]",
-      "parsedReferenceCount=0",
-      `generationsStatus=${result.status}`,
-      "generationMode=generations",
-      "fallbackUsed=false",
-    );
   }
 
   const raw = result.raw;
@@ -3294,7 +3073,6 @@ async function generateStoryImageFromPrompt(
     generationMode,
     referenceApplied,
     fallbackUsed,
-    editsError,
   };
 }
 
@@ -3350,7 +3128,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       referenceMode: reference_mode,
     });
 
-    const imageSize = storyImageApiSize({ landscape: !!render_title_in_image });
+    const imageSize = storyImageApiSize({ landscape: true });
     const genResult = await generateStoryImageFromPrompt(
       promptUsed,
       session_key || "cover",
@@ -3369,7 +3147,6 @@ app.post("/api/story-cover-image", async (req, res) => {
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
       fallback_used: genResult.fallbackUsed,
-      edits_error: genResult.editsError || "",
     });
   } catch (e) {
     console.error("[story-cover server error]", e);
@@ -3439,7 +3216,6 @@ app.post("/api/story-scene-image", async (req, res) => {
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
       fallback_used: genResult.fallbackUsed,
-      edits_error: genResult.editsError || "",
     });
   } catch (e) {
     console.error("[story-scene server error]", e);
@@ -3497,18 +3273,15 @@ async function handleUserStoriesPost(req, res) {
         return res.status(500).json({ ok: false, error: fetchErr.message });
       }
       if (!existing) {
-        // 앱이 이미지 업로드용으로 id를 미리 발급한 뒤 첫 저장이 실패한 경우 — insert로 처리.
         row.created_at = now;
         result = await supabase
           .from("user_stories")
           .insert([row])
           .select("id")
           .single();
+      } else if ((existing.user_id || "").trim() !== user_id) {
+        return res.status(403).json({ ok: false, error: "forbidden" });
       } else {
-        if ((existing.user_id || "").trim() !== user_id) {
-          return res.status(403).json({ ok: false, error: "forbidden" });
-        }
-
         result = await supabase
           .from("user_stories")
           .update(row)
@@ -3552,6 +3325,17 @@ async function handleUserStoriesQueryGet(req, res) {
           ? decodeURIComponent(categoryRaw[0]).trim()
           : "";
 
+    const liteRaw = req.query && req.query.lite;
+    const lite =
+      liteRaw === "1" ||
+      liteRaw === "true" ||
+      liteRaw === true ||
+      (typeof liteRaw === "string" && decodeURIComponent(liteRaw).trim() === "1");
+
+    const listSelect = lite
+      ? "id,user_id,title,summary,category,visibility,cover_url,background_url,created_at,updated_at"
+      : "*";
+
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
 
@@ -3566,7 +3350,7 @@ async function handleUserStoriesQueryGet(req, res) {
 
       let query = supabase
         .from("user_stories")
-        .select("*")
+        .select(listSelect)
         .eq("visibility", "public")
         .order("updated_at", { ascending: false });
       if (category) {
@@ -3596,7 +3380,7 @@ async function handleUserStoriesQueryGet(req, res) {
 
     const { data, error } = await supabase
       .from("user_stories")
-      .select("*")
+      .select(listSelect)
       .eq("user_id", userId)
       .order("updated_at", { ascending: false });
 
@@ -3696,42 +3480,10 @@ async function handleUserStoryByIdDelete(req, res) {
   }
 }
 
-async function handleAdminRestoreUserStoryOwnerPost(req, res) {
-  try {
-    if (!isAdminPresenceAuthorized(req)) {
-      return res.status(403).json({ ok: false, error: "forbidden" });
-    }
-
-    const storyId = readString(req.body, "story_id") || readString(req.body, "id");
-    const userId = readString(req.body, "user_id");
-    if (!storyId || !userId) {
-      return res.status(400).json({ ok: false, error: "story_id, user_id required" });
-    }
-
-    const supabase = getSupabase();
-    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
-
-    const { data, error } = await supabase
-      .from("user_stories")
-      .update({ user_id: userId, updated_at: new Date().toISOString() })
-      .eq("id", storyId)
-      .select("id,user_id")
-      .maybeSingle();
-
-    if (error) {
-      logSupabaseErr("[admin/restore-user-story-owner]", error);
-      return res.status(500).json({ ok: false, error: error.message });
-    }
-    if (!data) {
-      return res.status(404).json({ ok: false, error: "not found" });
-    }
-
-    return res.json({ ok: true, story: data });
-  } catch (e) {
-    console.error("[admin/restore-user-story-owner]", e);
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-}
+app.post("/api/character-image", handleCharacterImagePost);
+app.post("/character-image", handleCharacterImagePost);
+app.post("/api/user-story-image", handleUserStoryImagePost);
+app.post("/user-story-image", handleUserStoryImagePost);
 
 app.post("/api/user-stories", handleUserStoriesPost);
 app.post("/user-stories", handleUserStoriesPost);
@@ -3741,14 +3493,337 @@ app.get("/api/user-stories/:id", handleUserStoryByIdGet);
 app.get("/user-stories/:id", handleUserStoryByIdGet);
 app.delete("/api/user-stories/:id", handleUserStoryByIdDelete);
 app.delete("/user-stories/:id", handleUserStoryByIdDelete);
-app.post("/api/admin/restore-user-story-owner", handleAdminRestoreUserStoryOwnerPost);
-app.post("/admin/restore-user-story-owner", handleAdminRestoreUserStoryOwnerPost);
+
+// 스토리 라이브러리 댓글 — 앱 `GET/POST/PATCH/DELETE /api/story-comments`
+async function fetchStoryCommentsWithMeta(supabase, storyId, viewerUserId) {
+  const { data: rows, error } = await supabase
+    .from("story_comments")
+    .select("id, story_id, user_id, author_name, author_image_path, text, parent_id, created_at, updated_at")
+    .eq("story_id", storyId)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+
+  const comments = rows || [];
+  if (!comments.length) return [];
+
+  const ids = comments.map((c) => c.id);
+  const { data: likes, error: likesErr } = await supabase
+    .from("story_comment_likes")
+    .select("comment_id, user_id")
+    .in("comment_id", ids);
+
+  if (likesErr) throw likesErr;
+
+  const likeCountById = new Map();
+  const likedByViewer = new Set();
+  for (const row of likes || []) {
+    const cid = row.comment_id;
+    likeCountById.set(cid, (likeCountById.get(cid) || 0) + 1);
+    if (viewerUserId && row.user_id === viewerUserId) {
+      likedByViewer.add(cid);
+    }
+  }
+
+  return comments.map((c) => ({
+    id: c.id,
+    story_id: c.story_id,
+    user_id: c.user_id,
+    author_name: c.author_name || "",
+    author_image_path: c.author_image_path || "",
+    text: c.text || "",
+    parent_id: c.parent_id || null,
+    created_at: c.created_at,
+    updated_at: c.updated_at,
+    like_count: likeCountById.get(c.id) || 0,
+    liked_by_me: likedByViewer.has(c.id),
+  }));
+}
+
+async function handleStoryCommentsListGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const storyId = decodeURIComponent(req.params.storyId || "").trim();
+    if (!storyId) return res.status(400).json({ ok: false, error: "story_id required" });
+
+    const rawViewer = req.query && req.query.user_id;
+    const viewerUserId =
+      typeof rawViewer === "string"
+        ? decodeURIComponent(rawViewer).trim()
+        : Array.isArray(rawViewer) && typeof rawViewer[0] === "string"
+          ? decodeURIComponent(rawViewer[0]).trim()
+          : "";
+
+    const comments = await fetchStoryCommentsWithMeta(
+      supabase,
+      storyId,
+      viewerUserId || null,
+    );
+    return res.json({ ok: true, comments });
+  } catch (e) {
+    console.log("[story-comments list]", e);
+    return res.status(500).json({ ok: false, error: e.message || "failed" });
+  }
+}
+
+async function handleStoryCommentsPost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const story_id = readString(req.body, "story_id");
+    const author_name = readString(req.body, "author_name") || "게스트";
+    const author_image_path = readString(req.body, "author_image_path");
+    const text = readString(req.body, "text");
+    const parent_id = readString(req.body, "parent_id");
+
+    if (!user_id || !story_id || !text) {
+      return res.status(400).json({ ok: false, error: "user_id, story_id, text 필요" });
+    }
+
+    if (parent_id) {
+      const { data: parent, error: parentErr } = await supabase
+        .from("story_comments")
+        .select("id, story_id")
+        .eq("id", parent_id)
+        .maybeSingle();
+      if (parentErr) {
+        logSupabaseErr("[story-comments post] parent lookup", parentErr);
+        return res.status(500).json({ ok: false, error: parentErr.message });
+      }
+      if (!parent || parent.story_id !== story_id) {
+        return res.status(400).json({ ok: false, error: "invalid parent_id" });
+      }
+    }
+
+    const now = new Date().toISOString();
+    const row = {
+      story_id,
+      user_id,
+      author_name,
+      author_image_path: author_image_path || null,
+      text,
+      parent_id: parent_id || null,
+      created_at: now,
+      updated_at: now,
+    };
+
+    const { data, error } = await supabase
+      .from("story_comments")
+      .insert([row])
+      .select("id, story_id, user_id, author_name, author_image_path, text, parent_id, created_at, updated_at")
+      .single();
+
+    if (error) {
+      logSupabaseErr("[story-comments post]", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      comment: {
+        ...data,
+        like_count: 0,
+        liked_by_me: false,
+      },
+    });
+  } catch (e) {
+    console.log("[story-comments post]", e);
+    return res.status(500).json({ ok: false, error: e.message || "failed" });
+  }
+}
+
+async function handleStoryCommentsPatch(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const commentId = decodeURIComponent(req.params.id || "").trim();
+    const user_id = readString(req.body, "user_id");
+    const text = readString(req.body, "text");
+
+    if (!commentId || !user_id || !text) {
+      return res.status(400).json({ ok: false, error: "id, user_id, text 필요" });
+    }
+
+    const { data: existing, error: findErr } = await supabase
+      .from("story_comments")
+      .select("id, user_id")
+      .eq("id", commentId)
+      .maybeSingle();
+
+    if (findErr) {
+      logSupabaseErr("[story-comments patch] lookup", findErr);
+      return res.status(500).json({ ok: false, error: findErr.message });
+    }
+    if (!existing) return res.status(404).json({ ok: false, error: "not found" });
+    if (existing.user_id !== user_id) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from("story_comments")
+      .update({ text, updated_at: now })
+      .eq("id", commentId)
+      .select("id, story_id, user_id, author_name, author_image_path, text, parent_id, created_at, updated_at")
+      .single();
+
+    if (error) {
+      logSupabaseErr("[story-comments patch]", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    const { count } = await supabase
+      .from("story_comment_likes")
+      .select("*", { count: "exact", head: true })
+      .eq("comment_id", commentId);
+
+    const { data: myLike } = await supabase
+      .from("story_comment_likes")
+      .select("comment_id")
+      .eq("comment_id", commentId)
+      .eq("user_id", user_id)
+      .maybeSingle();
+
+    return res.json({
+      ok: true,
+      comment: {
+        ...data,
+        like_count: count || 0,
+        liked_by_me: !!myLike,
+      },
+    });
+  } catch (e) {
+    console.log("[story-comments patch]", e);
+    return res.status(500).json({ ok: false, error: e.message || "failed" });
+  }
+}
+
+async function handleStoryCommentsDelete(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const commentId = decodeURIComponent(req.params.id || "").trim();
+    const raw = req.query && req.query.user_id;
+    const user_id =
+      typeof raw === "string"
+        ? decodeURIComponent(raw).trim()
+        : Array.isArray(raw) && typeof raw[0] === "string"
+          ? decodeURIComponent(raw[0]).trim()
+          : readString(req.body, "user_id");
+
+    if (!commentId || !user_id) {
+      return res.status(400).json({ ok: false, error: "id, user_id 필요" });
+    }
+
+    const { data: existing, error: findErr } = await supabase
+      .from("story_comments")
+      .select("id, user_id")
+      .eq("id", commentId)
+      .maybeSingle();
+
+    if (findErr) {
+      logSupabaseErr("[story-comments delete] lookup", findErr);
+      return res.status(500).json({ ok: false, error: findErr.message });
+    }
+    if (!existing) return res.status(404).json({ ok: false, error: "not found" });
+    if (existing.user_id !== user_id) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+
+    const { error } = await supabase.from("story_comments").delete().eq("id", commentId);
+    if (error) {
+      logSupabaseErr("[story-comments delete]", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("[story-comments delete]", e);
+    return res.status(500).json({ ok: false, error: e.message || "failed" });
+  }
+}
+
+async function handleStoryCommentLikePost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    const comment_id = readString(req.body, "comment_id");
+
+    if (!user_id || !comment_id) {
+      return res.status(400).json({ ok: false, error: "user_id, comment_id 필요" });
+    }
+
+    const { data: existing, error: findErr } = await supabase
+      .from("story_comment_likes")
+      .select("comment_id")
+      .eq("comment_id", comment_id)
+      .eq("user_id", user_id)
+      .maybeSingle();
+
+    if (findErr) {
+      logSupabaseErr("[story-comment-like] lookup", findErr);
+      return res.status(500).json({ ok: false, error: findErr.message });
+    }
+
+    let liked = false;
+    if (existing) {
+      const { error } = await supabase
+        .from("story_comment_likes")
+        .delete()
+        .eq("comment_id", comment_id)
+        .eq("user_id", user_id);
+      if (error) {
+        logSupabaseErr("[story-comment-like] delete", error);
+        return res.status(500).json({ ok: false, error: error.message });
+      }
+      liked = false;
+    } else {
+      const { error } = await supabase
+        .from("story_comment_likes")
+        .insert([{ comment_id, user_id }]);
+      if (error) {
+        logSupabaseErr("[story-comment-like] insert", error);
+        return res.status(500).json({ ok: false, error: error.message });
+      }
+      liked = true;
+    }
+
+    const { count } = await supabase
+      .from("story_comment_likes")
+      .select("*", { count: "exact", head: true })
+      .eq("comment_id", comment_id);
+
+    return res.json({ ok: true, liked, like_count: count || 0 });
+  } catch (e) {
+    console.log("[story-comment-like]", e);
+    return res.status(500).json({ ok: false, error: e.message || "failed" });
+  }
+}
+
+app.get("/api/story-comments/:storyId", handleStoryCommentsListGet);
+app.get("/story-comments/:storyId", handleStoryCommentsListGet);
+app.post("/api/story-comments", handleStoryCommentsPost);
+app.post("/story-comments", handleStoryCommentsPost);
+app.patch("/api/story-comments/:id", handleStoryCommentsPatch);
+app.patch("/story-comments/:id", handleStoryCommentsPatch);
+app.delete("/api/story-comments/:id", handleStoryCommentsDelete);
+app.delete("/story-comments/:id", handleStoryCommentsDelete);
+app.post("/api/story-comment-like", handleStoryCommentLikePost);
+app.post("/story-comment-like", handleStoryCommentLikePost);
 
 const PORT = Number(process.env.PORT) || 3000;
 
 logSupabaseInit();
 console.log(
-  `[ai-server] storyProvider=deepseek storyModel=${DEEPSEEK_MODEL} deepseekConfigured=${!!DEEPSEEK_API_KEY} openaiConfigured=${!!OPENAI_API_KEY}`,
+  `[ai-server] provider=openai model=${OPENAI_MODEL} openaiConfigured=${!!OPENAI_API_KEY}`,
 );
 
 try {
