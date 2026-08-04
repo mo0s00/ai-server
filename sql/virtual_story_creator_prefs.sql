@@ -9,4 +9,4 @@ create table if not exists public.virtual_story_creator_prefs (
   updated_at timestamptz not null default now()
 );
 
-comment on table public.virtual_story_creator_prefs is '가상 스토리 제작자 프로필 목록 + storyId→creatorId 지정 (앱 관리자 333)';
+comment on table public.virtual_story_creator_prefs is '가상 스토리 제작자 — user_id __global__ 1행(앱 전체 공통). 관리자 POST(333).';
