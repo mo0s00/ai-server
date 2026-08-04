@@ -1254,6 +1254,105 @@ app.post("/comment-save", handleCommentSave);
 app.post("/api/commenter-state", handleCommenterStatePost);
 app.post("/commenter-state", handleCommenterStatePost);
 
+// 가상 스토리 제작자 — 앱 `GET/POST /api/virtual-story-creators`
+async function handleVirtualStoryCreatorsGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const userId = decodeURIComponent(req.params.userId || "").trim();
+    if (!userId) {
+      return res.status(400).json({ ok: false, error: "userId 필요" });
+    }
+
+    const { data, error } = await supabase
+      .from("virtual_story_creator_prefs")
+      .select("profiles, assignments, updated_at_ms")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      logSupabaseErr("[virtual-story-creators] get", error);
+      return res.status(500).json({ ok: false, error: "조회 실패" });
+    }
+
+    if (!data) {
+      return res.json({
+        ok: true,
+        profiles: [],
+        assignments: {},
+        updated_at_ms: 0,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      profiles: Array.isArray(data.profiles) ? data.profiles : [],
+      assignments:
+        data.assignments && typeof data.assignments === "object"
+          ? data.assignments
+          : {},
+      updated_at_ms: Number(data.updated_at_ms) || 0,
+    });
+  } catch (e) {
+    console.log("[virtual-story-creators get]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
+app.get("/api/virtual-story-creators/:userId", handleVirtualStoryCreatorsGet);
+app.get("/virtual-story-creators/:userId", handleVirtualStoryCreatorsGet);
+
+async function handleVirtualStoryCreatorsPost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const user_id = readString(req.body, "user_id");
+    if (!user_id) {
+      return res.status(400).json({ ok: false, error: "user_id 필요" });
+    }
+
+    const profilesRaw = req.body.profiles;
+    const assignmentsRaw = req.body.assignments;
+    if (!Array.isArray(profilesRaw)) {
+      return res.status(400).json({ ok: false, error: "profiles 배열 필요" });
+    }
+    if (
+      assignmentsRaw != null &&
+      (typeof assignmentsRaw !== "object" || Array.isArray(assignmentsRaw))
+    ) {
+      return res.status(400).json({ ok: false, error: "assignments 객체 필요" });
+    }
+
+    const updated_at_ms = readInt(req.body, "updated_at_ms", Date.now());
+    const row = {
+      user_id,
+      profiles: profilesRaw,
+      assignments: assignmentsRaw && typeof assignmentsRaw === "object" ? assignmentsRaw : {},
+      updated_at_ms,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from("virtual_story_creator_prefs")
+      .upsert(row, { onConflict: "user_id" });
+
+    if (error) {
+      logSupabaseErr("[virtual-story-creators] upsert", error);
+      return res.status(500).json({ ok: false, error: "저장 실패" });
+    }
+
+    return res.json({ ok: true, updated_at_ms });
+  } catch (e) {
+    console.log("[virtual-story-creators post]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
+app.post("/api/virtual-story-creators", handleVirtualStoryCreatorsPost);
+app.post("/virtual-story-creators", handleVirtualStoryCreatorsPost);
+
 const ADMIN_PRESENCE_PASSWORD = process.env.ADMIN_PASSWORD || "333";
 
 function isAdminPresenceAuthorized(req) {
