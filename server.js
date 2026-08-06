@@ -3967,6 +3967,258 @@ app.delete("/story-comments/:id", handleStoryCommentsDelete);
 app.post("/api/story-comment-like", handleStoryCommentLikePost);
 app.post("/story-comment-like", handleStoryCommentLikePost);
 
+// ─── 제작자 순위 · 캔디 귀속 · 하트 ─────────────────────────────────────────
+
+const CREATOR_TIER_VALUES = new Set(["sprout", "pick", "partner", "ambassador"]);
+
+function creatorRankingWindowStart(windowRaw) {
+  const w = (windowRaw || "7d").trim().toLowerCase();
+  const now = Date.now();
+  if (w === "all" || w === "lifetime") return null;
+  const days = w === "30d" ? 30 : 7;
+  return new Date(now - days * 86400000).toISOString();
+}
+
+async function handleCreatorCandyEventPost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const spender_user_id = readString(req.body, "user_id");
+    const creator_user_id = readString(req.body, "creator_user_id");
+    const candies = readInt(req.body, "candies", 0);
+    if (!spender_user_id || !creator_user_id) {
+      return res.status(400).json({ ok: false, error: "user_id, creator_user_id 필요" });
+    }
+    if (creator_user_id === spender_user_id) {
+      return res.status(200).json({ ok: true, skipped: "self_spend" });
+    }
+    if (!Number.isFinite(candies) || candies <= 0) {
+      return res.status(400).json({ ok: false, error: "candies 필요(양수)" });
+    }
+
+    const content_type = readString(req.body, "content_type") || "";
+    const content_id = readString(req.body, "content_id") || "";
+    const reason = readString(req.body, "reason") || "spend";
+    const display_name = readString(req.body, "creator_display_name") || "";
+
+    const { error: insErr } = await supabase.from("creator_candy_events").insert([
+      {
+        creator_user_id,
+        spender_user_id,
+        content_type,
+        content_id,
+        candies,
+        reason,
+      },
+    ]);
+    if (insErr) {
+      logSupabaseErr("[creator-candy-event] insert", insErr);
+      return res.status(500).json({ ok: false, error: insErr.message });
+    }
+
+    const tierRow = {
+      creator_user_id,
+      updated_at: new Date().toISOString(),
+    };
+    if (display_name) tierRow.display_name = display_name;
+
+    const { data: prevTier } = await supabase
+      .from("creator_tiers")
+      .select("points_lifetime, display_name, tier")
+      .eq("creator_user_id", creator_user_id)
+      .maybeSingle();
+
+    const prevPts = Number(prevTier?.points_lifetime) || 0;
+    tierRow.points_lifetime = prevPts + candies;
+    if (!display_name && prevTier?.display_name) {
+      tierRow.display_name = prevTier.display_name;
+    }
+    if (!tierRow.display_name) tierRow.display_name = "";
+    tierRow.tier = (prevTier?.tier || "sprout").trim().toLowerCase();
+    if (!CREATOR_TIER_VALUES.has(tierRow.tier)) tierRow.tier = "sprout";
+
+    const { error: tierErr } = await supabase
+      .from("creator_tiers")
+      .upsert([tierRow], { onConflict: "creator_user_id" });
+    if (tierErr) logSupabaseErr("[creator-candy-event] tier upsert", tierErr);
+
+    return res.status(201).json({ ok: true });
+  } catch (e) {
+    console.log("[creator-candy-event]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+async function handleCreatorHeartPost(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const giver_user_id = readString(req.body, "user_id");
+    const creator_user_id = readString(req.body, "creator_user_id");
+    const liked = readBool(req.body, "liked");
+    if (!giver_user_id || !creator_user_id) {
+      return res.status(400).json({ ok: false, error: "user_id, creator_user_id 필요" });
+    }
+    if (giver_user_id === creator_user_id) {
+      return res.status(200).json({ ok: true, skipped: "self" });
+    }
+
+    const display_name = readString(req.body, "creator_display_name") || "";
+
+    if (liked) {
+      const { error } = await supabase.from("creator_hearts").upsert(
+        [{ creator_user_id, giver_user_id }],
+        { onConflict: "creator_user_id,giver_user_id" },
+      );
+      if (error) {
+        logSupabaseErr("[creator-heart] upsert", error);
+        return res.status(500).json({ ok: false, error: error.message });
+      }
+    } else {
+      const { error } = await supabase
+        .from("creator_hearts")
+        .delete()
+        .eq("creator_user_id", creator_user_id)
+        .eq("giver_user_id", giver_user_id);
+      if (error) {
+        logSupabaseErr("[creator-heart] delete", error);
+        return res.status(500).json({ ok: false, error: error.message });
+      }
+    }
+
+    if (display_name) {
+      const { data: existing } = await supabase
+        .from("creator_tiers")
+        .select("creator_user_id")
+        .eq("creator_user_id", creator_user_id)
+        .maybeSingle();
+      if (existing) {
+        await supabase
+          .from("creator_tiers")
+          .update({ display_name, updated_at: new Date().toISOString() })
+          .eq("creator_user_id", creator_user_id);
+      } else {
+        await supabase.from("creator_tiers").insert([
+          {
+            creator_user_id,
+            display_name,
+            tier: "sprout",
+            points_lifetime: 0,
+          },
+        ]);
+      }
+    }
+
+    const { count } = await supabase
+      .from("creator_hearts")
+      .select("*", { count: "exact", head: true })
+      .eq("creator_user_id", creator_user_id);
+
+    return res.json({ ok: true, heartCount: count ?? 0 });
+  } catch (e) {
+    console.log("[creator-heart]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+async function handleCreatorRankingGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ error: "supabase 없음" });
+
+    const windowStart = creatorRankingWindowStart(req.query?.window);
+    const limitRaw = parseInt(String(req.query?.limit || "80"), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 80;
+
+    let candyQuery = supabase
+      .from("creator_candy_events")
+      .select("creator_user_id, candies");
+    if (windowStart) {
+      candyQuery = candyQuery.gte("created_at", windowStart);
+    }
+    const { data: candyRows, error: candyErr } = await candyQuery;
+    if (candyErr) {
+      logSupabaseErr("[creator-ranking] candy", candyErr);
+      return res.status(500).json({ error: candyErr.message });
+    }
+
+    const candyByCreator = new Map();
+    for (const r of candyRows || []) {
+      const id = (r.creator_user_id || "").trim();
+      if (!id) continue;
+      const n = Number(r.candies) || 0;
+      candyByCreator.set(id, (candyByCreator.get(id) || 0) + n);
+    }
+
+    const { data: heartRows, error: heartErr } = await supabase
+      .from("creator_hearts")
+      .select("creator_user_id");
+    if (heartErr) {
+      logSupabaseErr("[creator-ranking] hearts", heartErr);
+      return res.status(500).json({ error: heartErr.message });
+    }
+
+    const heartsByCreator = new Map();
+    for (const r of heartRows || []) {
+      const id = (r.creator_user_id || "").trim();
+      if (!id) continue;
+      heartsByCreator.set(id, (heartsByCreator.get(id) || 0) + 1);
+    }
+
+    const creatorIds = new Set([...candyByCreator.keys(), ...heartsByCreator.keys()]);
+
+    const { data: tierRows } = await supabase.from("creator_tiers").select("*");
+    const tierById = new Map();
+    for (const t of tierRows || []) {
+      const id = (t.creator_user_id || "").trim();
+      if (id) tierById.set(id, t);
+    }
+
+    for (const id of tierById.keys()) creatorIds.add(id);
+
+    const scored = [];
+    for (const creatorUserId of creatorIds) {
+      const windowCandy = candyByCreator.get(creatorUserId) || 0;
+      const hearts = heartsByCreator.get(creatorUserId) || 0;
+      const tierRec = tierById.get(creatorUserId);
+      const lifetimePoints = Number(tierRec?.points_lifetime) || 0;
+      const tierRaw = (tierRec?.tier || "sprout").trim().toLowerCase();
+      const tier = CREATOR_TIER_VALUES.has(tierRaw) ? tierRaw : "sprout";
+      const displayName = (tierRec?.display_name || "").trim();
+      const score = windowCandy + hearts * 5;
+      scored.push({
+        creatorUserId,
+        displayName,
+        tier,
+        heartsTotal: hearts,
+        candyWindow: windowCandy,
+        pointsLifetime: lifetimePoints,
+        score,
+      });
+    }
+
+    scored.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.pointsLifetime !== a.pointsLifetime) return b.pointsLifetime - a.pointsLifetime;
+      return a.creatorUserId.localeCompare(b.creatorUserId);
+    });
+
+    res.json({ ok: true, window: windowStart ? (req.query?.window || "7d") : "all", rows: scored.slice(0, limit) });
+  } catch (e) {
+    console.log("[creator-ranking]", e);
+    res.status(500).json({ error: "server error" });
+  }
+}
+
+app.post("/api/creator-candy-event", handleCreatorCandyEventPost);
+app.post("/creator-candy-event", handleCreatorCandyEventPost);
+app.post("/api/creator-heart", handleCreatorHeartPost);
+app.post("/creator-heart", handleCreatorHeartPost);
+app.get("/api/creator-ranking", handleCreatorRankingGet);
+app.get("/creator-ranking", handleCreatorRankingGet);
+
 const PORT = Number(process.env.PORT) || 3000;
 
 logSupabaseInit();
