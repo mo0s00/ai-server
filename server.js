@@ -3979,6 +3979,70 @@ function creatorRankingWindowStart(windowRaw) {
   return new Date(now - days * 86400000).toISOString();
 }
 
+function rankingRowFromVirtualCreatorProfile(p, windowStart) {
+  const id = (p.id || "").trim();
+  if (!id) return null;
+  const creatorUserId = `virtual_${id}`;
+  const displayName = (p.displayName || "").trim() || "제작자";
+  const followers = Math.max(0, Number(p.followers) || 0);
+  const hearts = Math.max(0, Number(p.hearts ?? p.heartsTotal) || followers);
+  const favorites = Math.max(0, Number(p.favorites) || 0);
+  const pointsLifetime = Math.max(
+    0,
+    Number(p.rankingPoints ?? p.pointsLifetime) || followers,
+  );
+  const seededCandy = Math.max(0, Number(p.rankingCandyWindow) || 0);
+  const tierRaw = (p.tier || "sprout").trim().toLowerCase();
+  const tier = CREATOR_TIER_VALUES.has(tierRaw) ? tierRaw : "sprout";
+  const profileImagePath = (p.profileImagePath || "").trim();
+  const candyWindow = windowStart ? seededCandy : pointsLifetime;
+  const score = candyWindow + hearts * 5 + favorites * 3;
+  return {
+    creatorUserId,
+    displayName,
+    tier,
+    heartsTotal: hearts,
+    candyWindow,
+    pointsLifetime,
+    score,
+    isVirtual: true,
+    profileImagePath,
+    favoritesTotal: favorites,
+  };
+}
+
+async function mergeVirtualCreatorsIntoRanking(supabase, scored, windowStart) {
+  const { data, error } = await readVirtualStoryCreatorRow(
+    supabase,
+    VIRTUAL_STORY_CREATOR_GLOBAL_USER_ID,
+  );
+  if (error) {
+    logSupabaseErr("[creator-ranking] virtual profiles", error);
+    return;
+  }
+  const profiles = Array.isArray(data?.profiles) ? data.profiles : [];
+  const byId = new Map(scored.map((r) => [r.creatorUserId, r]));
+  for (const p of profiles) {
+    const row = rankingRowFromVirtualCreatorProfile(p, windowStart);
+    if (!row) continue;
+    const existing = byId.get(row.creatorUserId);
+    if (existing) {
+      existing.heartsTotal = Math.max(existing.heartsTotal, row.heartsTotal);
+      existing.pointsLifetime = Math.max(existing.pointsLifetime, row.pointsLifetime);
+      existing.candyWindow = Math.max(existing.candyWindow, row.candyWindow);
+      if (!existing.displayName && row.displayName) {
+        existing.displayName = row.displayName;
+      }
+      existing.score = existing.candyWindow + existing.heartsTotal * 5;
+      existing.isVirtual = true;
+      if (row.profileImagePath) existing.profileImagePath = row.profileImagePath;
+    } else {
+      scored.push(row);
+      byId.set(row.creatorUserId, row);
+    }
+  }
+}
+
 async function handleCreatorCandyEventPost(req, res) {
   try {
     const supabase = getSupabase();
@@ -4198,6 +4262,8 @@ async function handleCreatorRankingGet(req, res) {
         score,
       });
     }
+
+    await mergeVirtualCreatorsIntoRanking(supabase, scored, windowStart);
 
     scored.sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
