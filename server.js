@@ -32,7 +32,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "openai-max-completion-v1";
+const SERVER_REV = "home-announcements-v1";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -1497,6 +1497,134 @@ app.post("/api/user-presence", handleUserPresencePost);
 app.post("/user-presence", handleUserPresencePost);
 app.get("/api/admin/presence-stats", handleAdminPresenceStatsGet);
 app.get("/admin/presence-stats", handleAdminPresenceStatsGet);
+
+const HOME_ANNOUNCEMENT_TITLE_MAX = 120;
+const HOME_ANNOUNCEMENT_BODY_MAX = 8000;
+
+function jsonHomeAnnouncementRow(row) {
+  return {
+    id: String(row.id || ""),
+    title: String(row.title || "").trim(),
+    body: String(row.body || ""),
+    created_at_ms: Number(row.created_at_ms) || 0,
+  };
+}
+
+async function handleHomeAnnouncementsPublicGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const { data, error } = await supabase
+      .from("home_announcements")
+      .select("id, title, body, created_at_ms")
+      .order("created_at_ms", { ascending: false })
+      .limit(32);
+
+    if (error) {
+      logSupabaseErr("[home-announcements public]", error);
+      return res.status(500).json({
+        ok: false,
+        error: error.message || "조회 실패",
+      });
+    }
+
+    const items = (Array.isArray(data) ? data : [])
+      .map(jsonHomeAnnouncementRow)
+      .filter((row) => row.id && row.title);
+    return res.json({ ok: true, items });
+  } catch (e) {
+    console.log("[home-announcements public]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
+async function handleHomeAnnouncementsPost(req, res) {
+  try {
+    if (!isAdminPresenceAuthorized(req)) {
+      return res.status(403).json({ ok: false, error: "관리자 권한 필요" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const title = readString(req.body, "title").trim();
+    const body = readString(req.body, "body");
+    if (!title) {
+      return res.status(400).json({ ok: false, error: "title 필요" });
+    }
+    if (title.length > HOME_ANNOUNCEMENT_TITLE_MAX) {
+      return res.status(400).json({ ok: false, error: "title 너무 김" });
+    }
+    if (body.length > HOME_ANNOUNCEMENT_BODY_MAX) {
+      return res.status(400).json({ ok: false, error: "body 너무 김" });
+    }
+
+    const created_at_ms = Date.now();
+    const row = {
+      title,
+      body,
+      created_at_ms,
+      created_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase
+      .from("home_announcements")
+      .insert(row)
+      .select("id, title, body, created_at_ms")
+      .single();
+
+    if (error) {
+      logSupabaseErr("[home-announcements] insert", error);
+      return res.status(500).json({
+        ok: false,
+        error: error.message || "저장 실패",
+      });
+    }
+
+    console.log("✅ [home-announcements] insert", data?.id);
+    return res.json({ ok: true, item: jsonHomeAnnouncementRow(data) });
+  } catch (e) {
+    console.log("[home-announcements post]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
+async function handleHomeAnnouncementsDelete(req, res) {
+  try {
+    if (!isAdminPresenceAuthorized(req)) {
+      return res.status(403).json({ ok: false, error: "관리자 권한 필요" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const id = decodeURIComponent(req.params.id || "").trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: "id 필요" });
+    }
+
+    const { error } = await supabase.from("home_announcements").delete().eq("id", id);
+
+    if (error) {
+      logSupabaseErr("[home-announcements] delete", error);
+      return res.status(500).json({ ok: false, error: "삭제 실패" });
+    }
+
+    console.log("✅ [home-announcements] delete", id);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("[home-announcements delete]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
+app.get("/api/home-announcements/public", handleHomeAnnouncementsPublicGet);
+app.get("/home-announcements/public", handleHomeAnnouncementsPublicGet);
+app.post("/api/home-announcements", handleHomeAnnouncementsPost);
+app.post("/home-announcements", handleHomeAnnouncementsPost);
+app.delete("/api/home-announcements/:id", handleHomeAnnouncementsDelete);
+app.delete("/home-announcements/:id", handleHomeAnnouncementsDelete);
 
 // 커스텀 댓글러 프롬프트 — 앱 `POST /api/custom-prompt` · 배포별칭 `POST /api/custom-prompts`
 async function handleCustomPromptPost(req, res) {
