@@ -32,7 +32,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "home-announcements-v1";
+const SERVER_REV = "home-announcements-v2";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -1590,6 +1590,59 @@ async function handleHomeAnnouncementsPost(req, res) {
   }
 }
 
+async function handleHomeAnnouncementsPatch(req, res) {
+  try {
+    if (!isAdminPresenceAuthorized(req)) {
+      return res.status(403).json({ ok: false, error: "관리자 권한 필요" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const id = decodeURIComponent(req.params.id || "").trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: "id 필요" });
+    }
+
+    const title = readString(req.body, "title").trim();
+    const body = readString(req.body, "body");
+    if (!title) {
+      return res.status(400).json({ ok: false, error: "title 필요" });
+    }
+    if (title.length > HOME_ANNOUNCEMENT_TITLE_MAX) {
+      return res.status(400).json({ ok: false, error: "title 너무 김" });
+    }
+    if (body.length > HOME_ANNOUNCEMENT_BODY_MAX) {
+      return res.status(400).json({ ok: false, error: "body 너무 김" });
+    }
+
+    const { data, error } = await supabase
+      .from("home_announcements")
+      .update({ title, body })
+      .eq("id", id)
+      .select("id, title, body, created_at_ms")
+      .single();
+
+    if (error) {
+      logSupabaseErr("[home-announcements] update", error);
+      return res.status(500).json({
+        ok: false,
+        error: error.message || "수정 실패",
+      });
+    }
+
+    if (!data) {
+      return res.status(404).json({ ok: false, error: "공지 없음" });
+    }
+
+    console.log("✅ [home-announcements] update", id);
+    return res.json({ ok: true, item: jsonHomeAnnouncementRow(data) });
+  } catch (e) {
+    console.log("[home-announcements patch]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
 async function handleHomeAnnouncementsDelete(req, res) {
   try {
     if (!isAdminPresenceAuthorized(req)) {
@@ -1623,6 +1676,8 @@ app.get("/api/home-announcements/public", handleHomeAnnouncementsPublicGet);
 app.get("/home-announcements/public", handleHomeAnnouncementsPublicGet);
 app.post("/api/home-announcements", handleHomeAnnouncementsPost);
 app.post("/home-announcements", handleHomeAnnouncementsPost);
+app.patch("/api/home-announcements/:id", handleHomeAnnouncementsPatch);
+app.patch("/home-announcements/:id", handleHomeAnnouncementsPatch);
 app.delete("/api/home-announcements/:id", handleHomeAnnouncementsDelete);
 app.delete("/home-announcements/:id", handleHomeAnnouncementsDelete);
 
