@@ -410,10 +410,11 @@ function assistantTextFromReasoning(reasoningRaw) {
 }
 
 /** DeepSeek/호환 API assistant 메시지 */
-function assistantTextFromMessage(msgObj) {
+function assistantTextFromMessage(msgObj, { allowReasoning = true } = {}) {
   if (!msgObj || typeof msgObj !== "object") return "";
   let out = assistantTextFromContent(msgObj.content);
   if (out) return out;
+  if (!allowReasoning) return "";
   if (typeof msgObj.reasoning_content === "string") {
     out = assistantTextFromReasoning(msgObj.reasoning_content);
     if (out) return out;
@@ -428,6 +429,8 @@ async function callOpenAiCompletion({
   max_tokens,
   logTag,
   systemPrompt,
+  jsonMode = false,
+  allowReasoning = true,
 }) {
   const llm = resolveDeepSeekConfig();
   if (!llm) {
@@ -454,6 +457,7 @@ async function callOpenAiCompletion({
       temperature,
       ...chatCompletionTokenLimit(max_tokens, llm.model),
       messages,
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     });
   } catch (stringifyErr) {
     console.error(`[${logTag}] JSON.stringify(chat payload) failed:`, stringifyErr);
@@ -530,7 +534,7 @@ async function callOpenAiCompletion({
   const choices = Array.isArray(json?.choices) ? json.choices : [];
   const first = choices[0];
   const msgObj = first && first.message;
-  let text = assistantTextFromMessage(msgObj);
+  let text = assistantTextFromMessage(msgObj, { allowReasoning });
   if (!text && first && typeof first.text === "string") {
     text = first.text.trim();
   }
@@ -569,6 +573,8 @@ async function callOpenAiCompletionStream({
   systemPrompt,
   onDelta,
   onFirstToken,
+  jsonMode = false,
+  allowReasoning = true,
 }) {
   const llm = resolveDeepSeekConfig();
   if (!llm) {
@@ -594,6 +600,7 @@ async function callOpenAiCompletionStream({
       ...chatCompletionTokenLimit(max_tokens, llm.model),
       stream: true,
       messages,
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     });
   } catch (stringifyErr) {
     console.error(`[${logTag}] stream payload failed:`, stringifyErr);
@@ -676,7 +683,11 @@ async function callOpenAiCompletionStream({
       let piece = "";
       if (delta && typeof delta.content === "string") {
         piece = delta.content;
-      } else if (delta && typeof delta.reasoning_content === "string") {
+      } else if (
+        allowReasoning &&
+        delta &&
+        typeof delta.reasoning_content === "string"
+      ) {
         piece = delta.reasoning_content;
       } else if (choices[0]?.text) {
         piece = String(choices[0].text);
@@ -1069,6 +1080,8 @@ async function handleAiCommentPost(req, res) {
       temperature,
       max_tokens,
       logTag: "comment",
+      jsonMode: true,
+      allowReasoning: false,
     });
 
     if (!llmResult.ok) {
@@ -1203,6 +1216,8 @@ async function handleStorySuggestionsPost(req, res) {
       temperature,
       max_tokens,
       logTag: "story-suggestions",
+      jsonMode: true,
+      allowReasoning: false,
     });
 
     if (!llmResult.ok) {
@@ -2593,7 +2608,7 @@ Format:
     return {
       scene: "default",
       preload: [],
-      source: "fallback_openai_error",
+      source: "fallback_deepseek_error",
     };
   }
 
@@ -2606,7 +2621,7 @@ Format:
     return {
       scene,
       preload: normalizeStoryScenePreload(parsed?.preload, scene),
-      source: "openai",
+      source: "deepseek",
     };
   } catch (e) {
     console.error("[story-chat scene parse error]", e?.message || e);
@@ -2720,6 +2735,8 @@ app.post("/api/story-chat", async (req, res) => {
         temperature,
         max_tokens,
         logTag: "story-chat-stream",
+        jsonMode: true,
+        allowReasoning: false,
         onFirstToken: () => logTiming("first_token"),
         onDelta: (piece) => {
           writeSse(res, { type: "delta", text: piece });
@@ -2760,6 +2777,8 @@ app.post("/api/story-chat", async (req, res) => {
       temperature,
       max_tokens,
       logTag: "story-chat",
+      jsonMode: true,
+      allowReasoning: false,
     });
     logTiming("provider_completed");
 
