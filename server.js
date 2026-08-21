@@ -10,6 +10,49 @@ const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-5.4-nano").trim();
 
+/** 스토리 대사·추천·댓글 LLM — DeepSeek (TTS·이미지 생성은 OpenAI 유지). */
+const DEEPSEEK_CHAT_URL = (
+  process.env.DEEPSEEK_CHAT_URL || "https://api.deepseek.com/v1/chat/completions"
+).trim();
+const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || "").trim();
+const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
+
+/** @returns {{ provider: string, url: string, apiKey: string, model: string } | null} */
+function resolveDeepSeekConfig() {
+  if (!DEEPSEEK_API_KEY) return null;
+  return {
+    provider: "deepseek",
+    url: DEEPSEEK_CHAT_URL,
+    apiKey: DEEPSEEK_API_KEY,
+    model: DEEPSEEK_MODEL,
+  };
+}
+
+function isDeepSeekConfigured() {
+  return !!DEEPSEEK_API_KEY;
+}
+
+function logDeepSeekNotConfigured(logTag) {
+  console.error("[chatLlm] ERROR DeepSeek is not configured");
+  if (logTag) {
+    console.error(`[${logTag}] DeepSeek is not configured (set DEEPSEEK_API_KEY)`);
+  }
+}
+
+/** Chat completion token limit — DeepSeek·대부분 모델은 max_tokens. */
+function chatCompletionTokenLimit(maxTokens, modelStr) {
+  const n =
+    typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+      ? Math.floor(maxTokens)
+      : null;
+  if (n == null) return {};
+  const model = (modelStr || DEEPSEEK_MODEL).toLowerCase();
+  if (/gpt-5|^o[0-9]/.test(model)) {
+    return { max_completion_tokens: n };
+  }
+  return { max_tokens: n };
+}
+
 /** gpt-5·o 시리즈는 `max_tokens` 대신 `max_completion_tokens`만 허용한다. */
 function openAiCompletionTokenLimit(maxTokens) {
   const n =
@@ -116,11 +159,15 @@ function buildHealthPayload() {
     process.env.SUPABASE_ANON_KEY ||
     ""
   ).trim();
+  const chatLlm = resolveDeepSeekConfig();
   return {
     ok: true,
     openaiConfigured: !!OPENAI_API_KEY,
-    provider: "openai",
-    model: OPENAI_MODEL,
+    deepseekConfigured: isDeepSeekConfigured(),
+    chatLlmProvider: chatLlm?.provider || "none",
+    chatLlmModel: chatLlm?.model || "",
+    provider: chatLlm?.provider || "none",
+    model: chatLlm?.model || "",
     rev: SERVER_REV,
     storyImageGeneration: storyImageGenerationEnabled(),
     supabaseConfigured: !!(url && key),
@@ -374,7 +421,7 @@ function assistantTextFromMessage(msgObj) {
   return "";
 }
 
-/** OpenAI Chat Completions — story-chat, story-suggestions, comment 등 공통. */
+/** Chat Completions — story-chat, story-suggestions, comment (DeepSeek only). */
 async function callOpenAiCompletion({
   userPrompt,
   temperature,
@@ -382,12 +429,14 @@ async function callOpenAiCompletion({
   logTag,
   systemPrompt,
 }) {
-  if (!OPENAI_API_KEY) {
+  const llm = resolveDeepSeekConfig();
+  if (!llm) {
+    logDeepSeekNotConfigured(logTag);
     return {
       ok: false,
-      provider: "openai",
+      provider: "deepseek",
       status: 503,
-      errorText: "서버 설정 오류입니다.",
+      errorText: "DeepSeek is not configured",
       skipped: true,
     };
   }
@@ -401,16 +450,16 @@ async function callOpenAiCompletion({
   let payload;
   try {
     payload = JSON.stringify({
-      model: OPENAI_MODEL,
+      model: llm.model,
       temperature,
-      ...openAiCompletionTokenLimit(max_tokens),
+      ...chatCompletionTokenLimit(max_tokens, llm.model),
       messages,
     });
   } catch (stringifyErr) {
-    console.error(`[${logTag}] JSON.stringify(openai payload) failed:`, stringifyErr);
+    console.error(`[${logTag}] JSON.stringify(chat payload) failed:`, stringifyErr);
     return {
       ok: false,
-      provider: "openai",
+      provider: llm.provider,
       status: 400,
       errorText: "프롬프트 인코딩에 실패했습니다.",
     };
@@ -421,10 +470,10 @@ async function callOpenAiCompletion({
 
   let oaiRes;
   try {
-    oaiRes = await fetch(OPENAI_CHAT_URL, {
+    oaiRes = await fetch(llm.url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${llm.apiKey}`,
         "Content-Type": "application/json; charset=utf-8",
       },
       body: payload,
@@ -433,10 +482,10 @@ async function callOpenAiCompletion({
   } catch (fetchErr) {
     clearTimeout(timer);
     const msg = fetchErr?.message || String(fetchErr);
-    console.error(`[${logTag}] OpenAI fetch error:`, msg);
+    console.error(`[${logTag}] ${llm.provider} fetch error:`, msg);
     return {
       ok: false,
-      provider: "openai",
+      provider: llm.provider,
       status: fetchErr?.name === "AbortError" ? 504 : 502,
       errorText:
         fetchErr?.name === "AbortError"
@@ -454,10 +503,10 @@ async function callOpenAiCompletion({
     try {
       json = JSON.parse(safeRaw);
     } catch (parseErr) {
-      console.log(`[${logTag}] OpenAI JSON parse`, parseErr.message);
+      console.log(`[${logTag}] ${llm.provider} JSON parse`, parseErr.message);
       return {
         ok: false,
-        provider: "openai",
+        provider: llm.provider,
         status: 502,
         errorText: "응답을 해석할 수 없습니다.",
       };
@@ -465,14 +514,14 @@ async function callOpenAiCompletion({
   }
 
   if (!oaiRes.ok) {
-    const apiMsg = openAiErrorMessage(json) || "OpenAI 요청에 실패했습니다.";
+    const apiMsg = openAiErrorMessage(json) || "LLM 요청에 실패했습니다.";
     const statusOut = oaiRes.status >= 500 ? 502 : oaiRes.status;
     console.log(
-      `[${logTag}] OpenAI HTTP ${oaiRes.status} provider=openai model=${OPENAI_MODEL}`,
+      `[${logTag}] ${llm.provider} HTTP ${oaiRes.status} model=${llm.model}`,
     );
     return {
       ok: false,
-      provider: "openai",
+      provider: llm.provider,
       status: statusOut,
       errorText: apiMsg,
     };
@@ -488,28 +537,28 @@ async function callOpenAiCompletion({
 
   if (!text) {
     console.log(
-      `[${logTag}] No assistant content in OpenAI response provider=openai model=${OPENAI_MODEL}`,
+      `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model}`,
     );
     return {
       ok: false,
-      provider: "openai",
+      provider: llm.provider,
       status: 502,
       errorText: "추천문 생성 실패",
     };
   }
 
-  console.log(`[${logTag}] provider=openai model=${OPENAI_MODEL}`);
+  console.log(`[${logTag}] provider=${llm.provider} model=${llm.model}`);
   return {
     ok: true,
-    provider: "openai",
-    model: OPENAI_MODEL,
+    provider: llm.provider,
+    model: llm.model,
     text,
     raw: json,
   };
 }
 
 /**
- * OpenAI Chat Completions streaming — delta 콜백으로 전달.
+ * Chat Completions streaming — DeepSeek only.
  * @returns {{ ok: boolean, text?: string, raw?: object, errorText?: string, status?: number }}
  */
 async function callOpenAiCompletionStream({
@@ -521,11 +570,13 @@ async function callOpenAiCompletionStream({
   onDelta,
   onFirstToken,
 }) {
-  if (!OPENAI_API_KEY) {
+  const llm = resolveDeepSeekConfig();
+  if (!llm) {
+    logDeepSeekNotConfigured(logTag);
     return {
       ok: false,
       status: 503,
-      errorText: "서버 설정 오류입니다.",
+      errorText: "DeepSeek is not configured",
     };
   }
 
@@ -538,9 +589,9 @@ async function callOpenAiCompletionStream({
   let payload;
   try {
     payload = JSON.stringify({
-      model: OPENAI_MODEL,
+      model: llm.model,
       temperature,
-      ...openAiCompletionTokenLimit(max_tokens),
+      ...chatCompletionTokenLimit(max_tokens, llm.model),
       stream: true,
       messages,
     });
@@ -554,10 +605,10 @@ async function callOpenAiCompletionStream({
 
   let oaiRes;
   try {
-    oaiRes = await fetch(OPENAI_CHAT_URL, {
+    oaiRes = await fetch(llm.url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${llm.apiKey}`,
         "Content-Type": "application/json; charset=utf-8",
       },
       body: payload,
@@ -566,7 +617,7 @@ async function callOpenAiCompletionStream({
   } catch (fetchErr) {
     clearTimeout(timer);
     const msg = fetchErr?.message || String(fetchErr);
-    console.error(`[${logTag}] OpenAI stream fetch error:`, msg);
+    console.error(`[${logTag}] ${llm.provider} stream fetch error:`, msg);
     return {
       ok: false,
       status: fetchErr?.name === "AbortError" ? 504 : 502,
@@ -585,7 +636,7 @@ async function callOpenAiCompletionStream({
     try {
       json = rawText ? JSON.parse(rawText) : {};
     } catch (_) {}
-    const apiMsg = openAiErrorMessage(json) || "OpenAI 요청에 실패했습니다.";
+    const apiMsg = openAiErrorMessage(json) || "LLM 요청에 실패했습니다.";
     return {
       ok: false,
       status: oaiRes.status >= 500 ? 502 : oaiRes.status,
@@ -625,6 +676,8 @@ async function callOpenAiCompletionStream({
       let piece = "";
       if (delta && typeof delta.content === "string") {
         piece = delta.content;
+      } else if (delta && typeof delta.reasoning_content === "string") {
+        piece = delta.reasoning_content;
       } else if (choices[0]?.text) {
         piece = String(choices[0].text);
       }
@@ -643,13 +696,13 @@ async function callOpenAiCompletionStream({
     return { ok: false, status: 502, errorText: "empty reply" };
   }
 
-  console.log(`[${logTag}] stream complete provider=openai model=${OPENAI_MODEL}`);
+  console.log(`[${logTag}] stream complete provider=${llm.provider} model=${llm.model}`);
   return {
     ok: true,
-    provider: "openai",
-    model: OPENAI_MODEL,
+    provider: llm.provider,
+    model: llm.model,
     text: fullText,
-    raw: { stream: true, model: OPENAI_MODEL },
+    raw: { stream: true, model: llm.model },
   };
 }
 
@@ -659,8 +712,11 @@ function writeSse(res, obj) {
 
 /** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
 function isGarbageModelLine(s, modelStr) {
+  const chatLlm = resolveDeepSeekConfig();
   const model =
-    typeof modelStr === "string" && modelStr.trim() ? modelStr.trim() : OPENAI_MODEL;
+    typeof modelStr === "string" && modelStr.trim()
+      ? modelStr.trim()
+      : chatLlm?.model || DEEPSEEK_MODEL;
   if (!s || typeof s !== "string") return false;
   let t = s
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
@@ -991,10 +1047,11 @@ async function handleAiCommentPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    if (!OPENAI_API_KEY) {
-      console.log("[comment] OPENAI_API_KEY missing");
-      return res.status(503).json({ text: "서버 설정 오류입니다." });
+    if (!isDeepSeekConfigured()) {
+      logDeepSeekNotConfigured("comment");
+      return res.status(503).json({ text: "DeepSeek is not configured" });
     }
+    console.log(`[comment] provider=deepseek model=${DEEPSEEK_MODEL}`);
 
     const requestedTemperature = Number(req.body && req.body.temperature);
     const requestedMaxTokens = Number(req.body && req.body.maxTokens);
@@ -1017,13 +1074,13 @@ async function handleAiCommentPost(req, res) {
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
       return res.status(statusOut).json({
-        text: llmResult.errorText || "OpenAI 요청에 실패했습니다.",
+        text: llmResult.errorText || "DeepSeek request failed",
       });
     }
 
     const text = llmResult.text;
 
-    if (isGarbageModelLine(text, OPENAI_MODEL)) {
+    if (isGarbageModelLine(text, llmResult.model || DEEPSEEK_MODEL)) {
       console.log("[comment] rejected garbage model-line reply");
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
@@ -1094,7 +1151,7 @@ function resolveStorySuggestionMaxTokens(requested) {
   return Math.min(2048, Math.max(220, Math.floor(n)));
 }
 
-/** 스토리 beat 추천 재작성 — OpenAI only. */
+/** 스토리 beat 추천 재작성 — DeepSeek only. */
 async function handleStorySuggestionsPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
@@ -1119,10 +1176,11 @@ async function handleStorySuggestionsPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    if (!OPENAI_API_KEY) {
-      console.log("[story-suggestions] OPENAI_API_KEY missing");
-      return res.status(503).json({ text: "서버 설정 오류입니다." });
+    if (!isDeepSeekConfigured()) {
+      logDeepSeekNotConfigured("story-suggestions");
+      return res.status(503).json({ text: "DeepSeek is not configured" });
     }
+    console.log(`[story-suggestions] provider=deepseek model=${DEEPSEEK_MODEL}`);
 
     const storyId = readString(req.body, "story_id");
     const programId = readString(req.body, "program_id");
@@ -1137,8 +1195,7 @@ async function handleStorySuggestionsPost(req, res) {
 
     console.log(
       `[story-suggestions] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
-        `slotCount=${slotCount} promptLen=${cleanedPrompt.length} maxTokens=${max_tokens} ` +
-        `provider=openai model=${OPENAI_MODEL}`,
+        `slotCount=${slotCount} promptLen=${cleanedPrompt.length} maxTokens=${max_tokens}`,
     );
 
     const llmResult = await callOpenAiCompletion({
@@ -1150,12 +1207,12 @@ async function handleStorySuggestionsPost(req, res) {
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
-      const errorText = llmResult.errorText || "OpenAI 요청에 실패했습니다.";
+      const errorText = llmResult.errorText || "DeepSeek request failed";
       return res.status(statusOut).json({ text: errorText });
     }
 
     const text = llmResult.text;
-    if (isGarbageModelLine(text, OPENAI_MODEL)) {
+    if (isGarbageModelLine(text, llmResult.model || DEEPSEEK_MODEL)) {
       console.log("[story-suggestions] rejected garbage model-line reply");
       return res.status(502).json({ text: "추천문 생성 실패" });
     }
@@ -1394,6 +1451,94 @@ async function handleVirtualStoryCreatorsPost(req, res) {
 
 app.post("/api/virtual-story-creators", handleVirtualStoryCreatorsPost);
 app.post("/virtual-story-creators", handleVirtualStoryCreatorsPost);
+
+// 스토리 좋아요·즐겨찾기 — 전역 표시 · 관리자 POST(333)
+const STORY_SOCIAL_STATS_GLOBAL_USER_ID = "__global__";
+
+async function readStorySocialStatsRow(supabase, userId) {
+  return supabase
+    .from("story_social_stats_prefs")
+    .select("stats, updated_at_ms")
+    .eq("user_id", userId)
+    .maybeSingle();
+}
+
+function jsonStorySocialStatsPrefs(data) {
+  const statsRaw = data?.stats;
+  const stats =
+    statsRaw && typeof statsRaw === "object" && !Array.isArray(statsRaw)
+      ? statsRaw
+      : {};
+  return {
+    ok: true,
+    stats,
+    updated_at_ms: Number(data?.updated_at_ms) || 0,
+  };
+}
+
+async function handleStorySocialStatsPublicGet(req, res) {
+  try {
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const { data, error } = await readStorySocialStatsRow(
+      supabase,
+      STORY_SOCIAL_STATS_GLOBAL_USER_ID,
+    );
+    if (error) {
+      logSupabaseErr("[story-social-stats public]", error);
+      return res.status(500).json({ ok: false, error: "조회 실패" });
+    }
+    return res.json(jsonStorySocialStatsPrefs(data));
+  } catch (e) {
+    console.log("[story-social-stats public]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
+app.get("/api/story-social-stats/public", handleStorySocialStatsPublicGet);
+app.get("/story-social-stats/public", handleStorySocialStatsPublicGet);
+
+async function handleStorySocialStatsPost(req, res) {
+  try {
+    if (!isAdminPresenceAuthorized(req)) {
+      return res.status(403).json({ ok: false, error: "관리자 권한 필요" });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const statsRaw = req.body.stats;
+    if (statsRaw != null && (typeof statsRaw !== "object" || Array.isArray(statsRaw))) {
+      return res.status(400).json({ ok: false, error: "stats 객체 필요" });
+    }
+
+    const updated_at_ms = readInt(req.body, "updated_at_ms", Date.now());
+    const row = {
+      user_id: STORY_SOCIAL_STATS_GLOBAL_USER_ID,
+      stats: statsRaw && typeof statsRaw === "object" ? statsRaw : {},
+      updated_at_ms,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from("story_social_stats_prefs")
+      .upsert(row, { onConflict: "user_id" });
+
+    if (error) {
+      logSupabaseErr("[story-social-stats] upsert", error);
+      return res.status(500).json({ ok: false, error: "저장 실패" });
+    }
+
+    return res.json({ ok: true, updated_at_ms });
+  } catch (e) {
+    console.log("[story-social-stats post]", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+}
+
+app.post("/api/story-social-stats", handleStorySocialStatsPost);
+app.post("/story-social-stats", handleStorySocialStatsPost);
 
 function kstStartOfTodayIso() {
   const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -2293,7 +2438,7 @@ app.post("/chat-message", (req, res) =>
 );
 
 // =========================
-// STORY CHAT (OpenAI reply + OpenAI scene prediction)
+// STORY CHAT (DeepSeek reply + DeepSeek scene prediction)
 // =========================
 
 const STORY_SCENE_KEYS = [
@@ -2384,11 +2529,13 @@ function storyChatSkipsScenePrediction(storyId, programId) {
 }
 
 async function predictStoryScene(contextText) {
-  if (!OPENAI_API_KEY) {
+  const llm = resolveDeepSeekConfig();
+  if (!llm) {
+    logDeepSeekNotConfigured("story-chat-scene");
     return {
       scene: "default",
       preload: [],
-      source: "fallback_no_openai_key",
+      source: "fallback_deepseek_not_configured",
     };
   }
 
@@ -2401,16 +2548,16 @@ async function predictStoryScene(contextText) {
     };
   }
 
-  const sceneRes = await fetch(OPENAI_CHAT_URL, {
+  const sceneRes = await fetch(llm.url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${llm.apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: OPENAI_MODEL,
+      model: llm.model,
       temperature: 0.25,
-      ...openAiCompletionTokenLimit(220),
+      ...chatCompletionTokenLimit(220, llm.model),
       messages: [
         {
           role: "system",
@@ -2499,9 +2646,11 @@ app.post("/api/story-chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "no prompt" });
     }
 
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
+    if (!isDeepSeekConfigured()) {
+      logDeepSeekNotConfigured("story-chat");
+      return res.status(503).json({ ok: false, error: "DeepSeek is not configured" });
     }
+    console.log(`[story-chat] provider=deepseek model=${DEEPSEEK_MODEL}`);
 
     const cleanedPrompt = sanitizePromptForApi(promptRaw);
     if (!cleanedPrompt) {
@@ -2513,6 +2662,20 @@ app.post("/api/story-chat", async (req, res) => {
     const storyId = readString(req.body, "story_id");
     const programId = readString(req.body, "program_id");
     const beatScene = readString(req.body, "beat_scene");
+
+    if (process.env.STORY_PROMPT_DUMP === "1") {
+      console.log("[storyPromptDump] === SERVER START ===");
+      console.log(`[storyPromptDump] provider=deepseek model=${DEEPSEEK_MODEL}`);
+      console.log(`[storyPromptDump] storyId=${storyId || "(none)"} programId=${programId || "(none)"}`);
+      console.log(`[storyPromptDump] --- combinedPrompt (${cleanedPrompt.length} chars) ---`);
+      console.log(cleanedPrompt);
+      if (storyContext && storyContext !== cleanedPrompt) {
+        console.log(`[storyPromptDump] --- story_context (${storyContext.length} chars) ---`);
+        console.log(storyContext);
+      }
+      console.log("[storyPromptDump] === SERVER END ===");
+    }
+
     const skipScenePrediction =
       (req.body && req.body.skip_scene_prediction === true) ||
       storyChatSkipsScenePrediction(storyId, programId);
@@ -2566,7 +2729,7 @@ app.post("/api/story-chat", async (req, res) => {
       if (!llmResult.ok) {
         writeSse(res, {
           type: "error",
-          error: llmResult.errorText || "openai failed",
+          error: llmResult.errorText || "DeepSeek request failed",
         });
         res.end();
         return;
@@ -2602,10 +2765,10 @@ app.post("/api/story-chat", async (req, res) => {
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
-      const errMsg = llmResult.errorText || "openai failed";
+      const errMsg = llmResult.errorText || "DeepSeek request failed";
       console.error(
         "[story-chat llm error]",
-        `provider=openai model=${OPENAI_MODEL}`,
+        `provider=deepseek model=${DEEPSEEK_MODEL}`,
         statusOut,
         errMsg,
       );
@@ -2648,7 +2811,7 @@ app.post("/api/story-chat", async (req, res) => {
       `[story-chat] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
         `currentBeat.scene=${beatScene || "(none)"} appliedScenePreset=${sceneData.scene} ` +
         `preload=${JSON.stringify(sceneData.preload)} source=${sceneData.source} ` +
-        `provider=openai model=${OPENAI_MODEL}`,
+        `provider=deepseek model=${DEEPSEEK_MODEL}`,
     );
 
     return res.json({
@@ -4153,6 +4316,40 @@ app.post("/story-comment-like", handleStoryCommentLikePost);
 // ─── 제작자 순위 · 캔디 귀속 · 하트 ─────────────────────────────────────────
 
 const CREATOR_TIER_VALUES = new Set(["sprout", "pick", "partner", "ambassador"]);
+const CREATOR_RANKING_ADMIN_PASSWORD = "333";
+
+function readOptionalNonNegativeInt(obj, key) {
+  if (obj == null || typeof obj !== "object") return null;
+  const v = obj[key];
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
+}
+
+function effectiveRankingHearts(tierRec, countedHearts) {
+  const o = tierRec?.ranking_hearts_override;
+  if (o !== null && o !== undefined && Number.isFinite(Number(o))) {
+    return Math.max(0, Number(o));
+  }
+  return countedHearts;
+}
+
+function effectiveRankingCandyWindow(tierRec, countedCandy) {
+  const o = tierRec?.ranking_candy_override;
+  if (o !== null && o !== undefined && Number.isFinite(Number(o))) {
+    return Math.max(0, Number(o));
+  }
+  return countedCandy;
+}
+
+function effectiveRankingFavorites(tierRec, countedFavorites) {
+  const o = tierRec?.ranking_favorites_override;
+  if (o !== null && o !== undefined && Number.isFinite(Number(o))) {
+    return Math.max(0, Number(o));
+  }
+  return countedFavorites;
+}
 
 function creatorRankingWindowStart(windowRaw) {
   const w = (windowRaw || "7d").trim().toLowerCase();
@@ -4178,6 +4375,13 @@ function rankingRowFromVirtualCreatorProfile(p, windowStart) {
   const tierRaw = (p.tier || "sprout").trim().toLowerCase();
   const tier = CREATOR_TIER_VALUES.has(tierRaw) ? tierRaw : "sprout";
   const profileImagePath = (p.profileImagePath || "").trim();
+  const featuredStoryTitle = (
+    p.featuredStoryTitle ||
+    p.representativeStoryTitle ||
+    p.headlineStory ||
+    ""
+  ).trim();
+  const worksCount = Math.max(0, Number(p.worksCount) || 0);
   const candyWindow = windowStart ? seededCandy : pointsLifetime;
   const score = candyWindow + hearts * 5 + favorites * 3;
   return {
@@ -4191,6 +4395,9 @@ function rankingRowFromVirtualCreatorProfile(p, windowStart) {
     isVirtual: true,
     profileImagePath,
     favoritesTotal: favorites,
+    followersCount: followers,
+    worksCount,
+    featuredStoryTitle: featuredStoryTitle || undefined,
   };
 }
 
@@ -4213,12 +4420,32 @@ async function mergeVirtualCreatorsIntoRanking(supabase, scored, windowStart) {
       existing.heartsTotal = Math.max(existing.heartsTotal, row.heartsTotal);
       existing.pointsLifetime = Math.max(existing.pointsLifetime, row.pointsLifetime);
       existing.candyWindow = Math.max(existing.candyWindow, row.candyWindow);
+      if (row.tier && row.tier !== "sprout") existing.tier = row.tier;
       if (!existing.displayName && row.displayName) {
         existing.displayName = row.displayName;
       }
-      existing.score = existing.candyWindow + existing.heartsTotal * 5;
+      existing.favoritesTotal = Math.max(
+        existing.favoritesTotal || 0,
+        row.favoritesTotal || 0,
+      );
+      existing.score =
+        existing.candyWindow +
+        existing.heartsTotal * 5 +
+        (existing.favoritesTotal || 0) * 3;
       existing.isVirtual = true;
       if (row.profileImagePath) existing.profileImagePath = row.profileImagePath;
+      if (row.featuredStoryTitle) {
+        existing.featuredStoryTitle = row.featuredStoryTitle;
+      }
+      if (row.followersCount) {
+        existing.followersCount = Math.max(
+          existing.followersCount || 0,
+          row.followersCount,
+        );
+      }
+      if (row.worksCount) {
+        existing.worksCount = Math.max(existing.worksCount || 0, row.worksCount);
+      }
     } else {
       scored.push(row);
       byId.set(row.creatorUserId, row);
@@ -4427,22 +4654,28 @@ async function handleCreatorRankingGet(req, res) {
 
     const scored = [];
     for (const creatorUserId of creatorIds) {
-      const windowCandy = candyByCreator.get(creatorUserId) || 0;
-      const hearts = heartsByCreator.get(creatorUserId) || 0;
       const tierRec = tierById.get(creatorUserId);
+      const countedCandy = candyByCreator.get(creatorUserId) || 0;
+      const countedHearts = heartsByCreator.get(creatorUserId) || 0;
+      const windowCandy = effectiveRankingCandyWindow(tierRec, countedCandy);
+      const hearts = effectiveRankingHearts(tierRec, countedHearts);
       const lifetimePoints = Number(tierRec?.points_lifetime) || 0;
       const tierRaw = (tierRec?.tier || "sprout").trim().toLowerCase();
       const tier = CREATOR_TIER_VALUES.has(tierRaw) ? tierRaw : "sprout";
       const displayName = (tierRec?.display_name || "").trim();
-      const score = windowCandy + hearts * 5;
+      const favorites = effectiveRankingFavorites(tierRec, 0);
+      const score = windowCandy + hearts * 5 + favorites * 3;
       scored.push({
         creatorUserId,
         displayName,
         tier,
         heartsTotal: hearts,
+        favoritesTotal: favorites,
         candyWindow: windowCandy,
         pointsLifetime: lifetimePoints,
         score,
+        followersCount: 0,
+        worksCount: 0,
       });
     }
 
@@ -4468,11 +4701,143 @@ app.post("/creator-heart", handleCreatorHeartPost);
 app.get("/api/creator-ranking", handleCreatorRankingGet);
 app.get("/creator-ranking", handleCreatorRankingGet);
 
+async function handleCreatorTierGet(req, res) {
+  try {
+    const creator_user_id = (req.params?.creatorUserId || "").trim();
+    if (!creator_user_id) {
+      return res.status(400).json({ ok: false, error: "creatorUserId 필요" });
+    }
+    if (creator_user_id.startsWith("virtual_")) {
+      const supabase = getSupabase();
+      if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+      const { data, error } = await readVirtualStoryCreatorRow(
+        supabase,
+        VIRTUAL_STORY_CREATOR_GLOBAL_USER_ID,
+      );
+      if (error) {
+        logSupabaseErr("[creator-tier] virtual", error);
+        return res.status(500).json({ ok: false, error: error.message });
+      }
+      const profiles = Array.isArray(data?.profiles) ? data.profiles : [];
+      const vid = creator_user_id.substring("virtual_".length);
+      const p = profiles.find((x) => (x.id || "").trim() === vid);
+      const tierRaw = (p?.tier || "sprout").trim().toLowerCase();
+      const tier = CREATOR_TIER_VALUES.has(tierRaw) ? tierRaw : "sprout";
+      const pointsLifetime = Math.max(
+        0,
+        Number(p?.rankingPoints ?? p?.pointsLifetime) ||
+          Number(p?.followers) ||
+          0,
+      );
+      return res.json({ ok: true, tier, pointsLifetime });
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+    const { data, error } = await supabase
+      .from("creator_tiers")
+      .select("tier, points_lifetime")
+      .eq("creator_user_id", creator_user_id)
+      .maybeSingle();
+    if (error) {
+      logSupabaseErr("[creator-tier] get", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    const tierRaw = (data?.tier || "sprout").trim().toLowerCase();
+    const tier = CREATOR_TIER_VALUES.has(tierRaw) ? tierRaw : "sprout";
+    return res.json({
+      ok: true,
+      tier,
+      pointsLifetime: Number(data?.points_lifetime) || 0,
+    });
+  } catch (e) {
+    console.log("[creator-tier]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+async function handleCreatorRankingAdminPost(req, res) {
+  try {
+    const admin_password = readString(req.body, "admin_password");
+    if (admin_password !== CREATOR_RANKING_ADMIN_PASSWORD) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
+    }
+    const creator_user_id = readString(req.body, "creator_user_id");
+    if (!creator_user_id || creator_user_id.startsWith("virtual_")) {
+      return res.status(400).json({ ok: false, error: "creator_user_id 필요" });
+    }
+    const supabase = getSupabase();
+    if (!supabase) return res.status(500).json({ ok: false, error: "supabase 없음" });
+
+    const tierRaw = readString(req.body, "tier").trim().toLowerCase() || "sprout";
+    const tier = CREATOR_TIER_VALUES.has(tierRaw) ? tierRaw : "sprout";
+    const display_name =
+      readString(req.body, "creator_display_name") ||
+      readString(req.body, "display_name") ||
+      "";
+    const points_lifetime = readInt(req.body, "points_lifetime", 0);
+    const ranking_hearts_override = readOptionalNonNegativeInt(
+      req.body,
+      "ranking_hearts_override",
+    );
+    const ranking_candy_override = readOptionalNonNegativeInt(
+      req.body,
+      "ranking_candy_override",
+    );
+    const ranking_favorites_override = readOptionalNonNegativeInt(
+      req.body,
+      "ranking_favorites_override",
+    );
+
+    const row = {
+      creator_user_id,
+      tier,
+      points_lifetime: Math.max(0, points_lifetime),
+      updated_at: new Date().toISOString(),
+    };
+    if (display_name) row.display_name = display_name;
+    if (ranking_hearts_override !== null) {
+      row.ranking_hearts_override = ranking_hearts_override;
+    }
+    if (ranking_candy_override !== null) {
+      row.ranking_candy_override = ranking_candy_override;
+    }
+    if (ranking_favorites_override !== null) {
+      row.ranking_favorites_override = ranking_favorites_override;
+    }
+
+    const { error } = await supabase
+      .from("creator_tiers")
+      .upsert([row], { onConflict: "creator_user_id" });
+    if (error) {
+      logSupabaseErr("[creator-ranking-admin] upsert", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+    return res.status(201).json({ ok: true });
+  } catch (e) {
+    console.log("[creator-ranking-admin]", e);
+    return res.status(500).json({ ok: false });
+  }
+}
+
+app.get("/api/creator-tier/:creatorUserId", handleCreatorTierGet);
+app.get("/creator-tier/:creatorUserId", handleCreatorTierGet);
+app.post("/api/creator-ranking-admin", handleCreatorRankingAdminPost);
+app.post("/creator-ranking-admin", handleCreatorRankingAdminPost);
+
 const PORT = Number(process.env.PORT) || 3000;
 
 logSupabaseInit();
+if (!isDeepSeekConfigured()) {
+  console.error("[chatLlm] ERROR DeepSeek is not configured");
+} else {
+  console.log(
+    `[chatLlm] story text APIs use provider=deepseek model=${DEEPSEEK_MODEL} ` +
+      `(story-chat, story-suggestions, comment)`,
+  );
+}
 console.log(
-  `[ai-server] provider=openai model=${OPENAI_MODEL} openaiConfigured=${!!OPENAI_API_KEY}`,
+  `[ai-server] openaiConfigured=${!!OPENAI_API_KEY} (TTS/image only)`,
 );
 
 try {
