@@ -1075,13 +1075,17 @@ async function handleAiCommentPost(req, res) {
         ? Math.min(2048, Math.floor(requestedMaxTokens))
         : 200;
 
+    // DeepSeek json_object — prompt에 "json"이 있을 때만(일반 댓글·DM은 제외).
+    const jsonMode = /\bjson\b/i.test(cleanedPrompt);
+    const effectiveMaxTokens = jsonMode ? Math.max(max_tokens, 960) : max_tokens;
+
     const llmResult = await callOpenAiCompletion({
       userPrompt: cleanedPrompt,
       temperature,
-      max_tokens,
+      max_tokens: effectiveMaxTokens,
       logTag: "comment",
-      jsonMode: true,
-      allowReasoning: false,
+      jsonMode,
+      allowReasoning: !jsonMode,
     });
 
     if (!llmResult.ok) {
