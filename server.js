@@ -602,6 +602,7 @@ async function callOpenAiCompletionStream({
   onFirstToken,
   jsonMode = false,
   allowReasoning = true,
+  _attempt = 0,
 }) {
   const llm = resolveDeepSeekConfig();
   if (!llm) {
@@ -731,6 +732,23 @@ async function callOpenAiCompletionStream({
 
   fullText = fullText.trim();
   if (!fullText) {
+    if (_attempt === 0) {
+      console.log(
+        `[${logTag}] stream empty — retry once jsonMode=${jsonMode} max_tokens=${Math.max(max_tokens, 1200)}`,
+      );
+      return callOpenAiCompletionStream({
+        userPrompt,
+        temperature,
+        max_tokens: Math.max(max_tokens, 1200),
+        logTag,
+        systemPrompt,
+        onDelta,
+        onFirstToken,
+        jsonMode: false,
+        allowReasoning: false,
+        _attempt: 1,
+      });
+    }
     return { ok: false, status: 502, errorText: "empty reply" };
   }
 
@@ -2766,7 +2784,8 @@ app.post("/api/story-chat", async (req, res) => {
         temperature,
         max_tokens,
         logTag: "story-chat-stream",
-        jsonMode: true,
+        // DeepSeek: json_object + stream → content delta 없음(empty reply).
+        jsonMode: false,
         allowReasoning: false,
         onFirstToken: () => logTiming("first_token"),
         onDelta: (piece) => {
