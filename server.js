@@ -431,6 +431,7 @@ async function callOpenAiCompletion({
   systemPrompt,
   jsonMode = false,
   allowReasoning = true,
+  _attempt = 0,
 }) {
   const llm = resolveDeepSeekConfig();
   if (!llm) {
@@ -541,8 +542,34 @@ async function callOpenAiCompletion({
 
   if (!text) {
     console.log(
-      `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model}`,
+      `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model} attempt=${_attempt}`,
     );
+    if (_attempt === 0) {
+      if (jsonMode) {
+        console.log(`[${logTag}] retry without json_mode max_tokens=${Math.max(max_tokens, 1200)}`);
+        return callOpenAiCompletion({
+          userPrompt,
+          temperature,
+          max_tokens: Math.max(max_tokens, 1200),
+          logTag,
+          systemPrompt,
+          jsonMode: false,
+          allowReasoning: false,
+          _attempt: 1,
+        });
+      }
+      console.log(`[${logTag}] retry same mode max_tokens=${Math.max(max_tokens, 1200)}`);
+      return callOpenAiCompletion({
+        userPrompt,
+        temperature,
+        max_tokens: Math.max(max_tokens, 1200),
+        logTag,
+        systemPrompt,
+        jsonMode,
+        allowReasoning,
+        _attempt: 1,
+      });
+    }
     return {
       ok: false,
       provider: llm.provider,
