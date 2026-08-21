@@ -1077,7 +1077,7 @@ async function handleAiCommentPost(req, res) {
 
     // DeepSeek json_object — prompt에 "json"이 있을 때만(일반 댓글·DM은 제외).
     const jsonMode = /\bjson\b/i.test(cleanedPrompt);
-    const effectiveMaxTokens = jsonMode ? Math.max(max_tokens, 960) : max_tokens;
+    const effectiveMaxTokens = jsonMode ? Math.max(max_tokens, 1200) : max_tokens;
 
     const llmResult = await callOpenAiCompletion({
       userPrompt: cleanedPrompt,
