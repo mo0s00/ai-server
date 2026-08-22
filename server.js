@@ -545,12 +545,17 @@ async function callOpenAiCompletion({
       `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model} attempt=${_attempt}`,
     );
     if (_attempt === 0) {
+      // 일부 reasoning 모델은 JSON 모드에서 추론 토큰만 먼저 소진해
+      // content를 비워 반환한다. 일반 출력 + 넉넉한 토큰으로 한 번 재시도한다.
+      const retryMaxTokens = Math.max(max_tokens, 2048);
       if (jsonMode) {
-        console.log(`[${logTag}] retry without json_mode max_tokens=${Math.max(max_tokens, 1200)}`);
+        console.log(
+          `[${logTag}] retry without json_mode max_tokens=${retryMaxTokens}`,
+        );
         return callOpenAiCompletion({
           userPrompt,
           temperature,
-          max_tokens: Math.max(max_tokens, 1200),
+          max_tokens: retryMaxTokens,
           logTag,
           systemPrompt,
           jsonMode: false,
@@ -558,11 +563,13 @@ async function callOpenAiCompletion({
           _attempt: 1,
         });
       }
-      console.log(`[${logTag}] retry same mode max_tokens=${Math.max(max_tokens, 1200)}`);
+      console.log(
+        `[${logTag}] retry same mode max_tokens=${retryMaxTokens}`,
+      );
       return callOpenAiCompletion({
         userPrompt,
         temperature,
-        max_tokens: Math.max(max_tokens, 1200),
+        max_tokens: retryMaxTokens,
         logTag,
         systemPrompt,
         jsonMode,
