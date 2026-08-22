@@ -595,6 +595,74 @@ async function callOpenAiCompletion({
   };
 }
 
+/** 실시간 댓글은 대사·추천용 DeepSeek와 분리해 OpenAI의 빠른 소형 모델로 처리한다. */
+async function callOpenAiLiveCommentCompletion({
+  userPrompt,
+  temperature,
+  max_tokens,
+  logTag,
+}) {
+  if (!OPENAI_API_KEY) {
+    return {
+      ok: false,
+      status: 503,
+      errorText: "OpenAI is not configured",
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 9000);
+  try {
+    const response = await fetch(OPENAI_CHAT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature,
+        ...openAiCompletionTokenLimit(max_tokens),
+        response_format: { type: "json_object" },
+        messages: [{ role: "user", content: userPrompt }],
+      }),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    let json = {};
+    try {
+      json = raw ? JSON.parse(raw) : {};
+    } catch (_) {
+      return { ok: false, status: 502, errorText: "OpenAI 응답 해석 실패" };
+    }
+    if (!response.ok) {
+      console.log(`[${logTag}] OpenAI HTTP ${response.status} model=${OPENAI_MODEL}`);
+      return {
+        ok: false,
+        status: response.status >= 500 ? 502 : response.status,
+        errorText: openAiErrorMessage(json) || "OpenAI 요청 실패",
+      };
+    }
+    const first = Array.isArray(json.choices) ? json.choices[0] : null;
+    const text = assistantTextFromContent(first?.message?.content);
+    if (!text) {
+      return { ok: false, status: 502, errorText: "OpenAI 빈 응답" };
+    }
+    console.log(`[${logTag}] provider=openai model=${OPENAI_MODEL}`);
+    return { ok: true, model: OPENAI_MODEL, text };
+  } catch (error) {
+    const timeout = error?.name === "AbortError";
+    console.error(`[${logTag}] OpenAI error:`, error?.message || error);
+    return {
+      ok: false,
+      status: timeout ? 504 : 502,
+      errorText: timeout ? "OpenAI 요청 시간 초과" : "OpenAI 연결 실패",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Chat Completions streaming — DeepSeek only.
  * @returns {{ ok: boolean, text?: string, raw?: object, errorText?: string, status?: number }}
@@ -1214,6 +1282,27 @@ async function handleAiCommentPost(req, res) {
   }
 }
 
+/** 스토리·채팅의 관중 댓글 전용 — 메인 대사/추천과 다른 OpenAI 큐를 쓴다. */
+async function handleLiveCommentsPost(req, res) {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+  const prompt = readString(req.body, "prompt");
+  if (!prompt) {
+    return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+  }
+  const result = await callOpenAiLiveCommentCompletion({
+    userPrompt: prompt.slice(0, MAX_PROMPT_CHARS),
+    temperature: 1,
+    max_tokens: 240,
+    logTag: "live-comments",
+  });
+  if (!result.ok) {
+    return res
+      .status(result.status || 502)
+      .json({ text: result.errorText || "댓글 생성 실패" });
+  }
+  return res.json({ text: result.text });
+}
+
 function resolveStorySuggestionMaxTokens(requested) {
   const n = Number(requested);
   if (!Number.isFinite(n) || n <= 0) return 350;
@@ -1372,6 +1461,8 @@ async function handleCommenterStatePost(req, res) {
 // POST 별칭: 동일 핸들러를 `/api/*` 와 루트 경로에 각각 한 번만 등록
 app.post("/api/comment", handleAiCommentPost);
 app.post("/comment", handleAiCommentPost);
+app.post("/api/live-comments", handleLiveCommentsPost);
+app.post("/live-comments", handleLiveCommentsPost);
 
 app.post("/api/story-suggestions", handleStorySuggestionsPost);
 app.post("/story-suggestions", handleStorySuggestionsPost);
