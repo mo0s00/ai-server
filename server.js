@@ -21,9 +21,7 @@ const STORY_CHAT_ANTHROPIC_MODEL = (
 ).trim();
 /** 플레이어 추천문 2~3개 — Claude Haiku 4.5 */
 const STORY_SUGGESTION_ANTHROPIC_MODEL = (
-  process.env.STORY_SUGGESTION_ANTHROPIC_MODEL ||
-  process.env.ANTHROPIC_MODEL ||
-  "claude-haiku-4-5-20251001"
+  process.env.STORY_SUGGESTION_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
 const LIVE_COMMENT_ANTHROPIC_MODEL = (
   process.env.LIVE_COMMENT_ANTHROPIC_MODEL || "claude-opus-4-6"
