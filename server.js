@@ -15,6 +15,9 @@ const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 const ANTHROPIC_MODEL = (
   process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
+const LIVE_COMMENT_ANTHROPIC_MODEL = (
+  process.env.LIVE_COMMENT_ANTHROPIC_MODEL || "claude-opus-4-6"
+).trim();
 const ANTHROPIC_VERSION = "2023-06-01";
 
 /** 스토리 대사·추천·댓글 LLM — DeepSeek (TTS·이미지 생성은 OpenAI 유지). */
@@ -87,7 +90,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "live-comments-claude-v1";
+const SERVER_REV = "live-comments-opus-4-6";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -179,7 +182,9 @@ function buildHealthPayload() {
     openaiConfigured: !!OPENAI_API_KEY,
     anthropicConfigured: isAnthropicConfigured(),
     liveCommentProvider: isAnthropicConfigured() ? "anthropic" : "openai",
-    liveCommentModel: isAnthropicConfigured() ? ANTHROPIC_MODEL : OPENAI_MODEL,
+    liveCommentModel: isAnthropicConfigured()
+      ? LIVE_COMMENT_ANTHROPIC_MODEL
+      : OPENAI_MODEL,
     deepseekConfigured: isDeepSeekConfigured(),
     chatLlmProvider: chatLlm?.provider || "none",
     chatLlmModel: chatLlm?.model || "",
@@ -728,7 +733,7 @@ async function callAnthropicLiveCommentCompletion({
         "Content-Type": "application/json; charset=utf-8",
       },
       body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
+        model: LIVE_COMMENT_ANTHROPIC_MODEL,
         max_tokens,
         temperature,
         system: "Reply with ONE valid JSON object only. No markdown fences or extra text.",
@@ -745,7 +750,7 @@ async function callAnthropicLiveCommentCompletion({
     }
     if (!response.ok) {
       console.log(
-        `[${logTag}] Anthropic HTTP ${response.status} model=${ANTHROPIC_MODEL}`,
+        `[${logTag}] Anthropic HTTP ${response.status} model=${LIVE_COMMENT_ANTHROPIC_MODEL}`,
       );
       return {
         ok: false,
@@ -757,8 +762,10 @@ async function callAnthropicLiveCommentCompletion({
     if (!text) {
       return { ok: false, status: 502, errorText: "Anthropic 빈 응답" };
     }
-    console.log(`[${logTag}] provider=anthropic model=${ANTHROPIC_MODEL}`);
-    return { ok: true, model: ANTHROPIC_MODEL, text };
+    console.log(
+      `[${logTag}] provider=anthropic model=${LIVE_COMMENT_ANTHROPIC_MODEL}`,
+    );
+    return { ok: true, model: LIVE_COMMENT_ANTHROPIC_MODEL, text };
   } catch (error) {
     const timeout = error?.name === "AbortError";
     console.error(`[${logTag}] Anthropic error:`, error?.message || error);
@@ -5189,7 +5196,7 @@ console.log(
 );
 if (isAnthropicConfigured()) {
   console.log(
-    `[live-comments] provider=anthropic model=${ANTHROPIC_MODEL}`,
+    `[live-comments] provider=anthropic model=${LIVE_COMMENT_ANTHROPIC_MODEL}`,
   );
 } else {
   console.log(
