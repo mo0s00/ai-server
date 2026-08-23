@@ -15,10 +15,13 @@ const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 const ANTHROPIC_MODEL = (
   process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
-/** 스토리 본문 대사·나레이션 — Claude Sonnet 5 */
+/** 스토리 본문 대사·나레이션 — 기본 Haiku(속도). Sonnet은 env로 지정. */
 const STORY_CHAT_ANTHROPIC_MODEL = (
-  process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-sonnet-5"
+  process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
+/** DeepSeek 키가 있으면 story-chat에 DeepSeek 우선(~2초). "0"이면 Anthropic 유지. */
+const STORY_CHAT_PREFER_DEEPSEEK =
+  (process.env.STORY_CHAT_PREFER_DEEPSEEK ?? "1").trim() !== "0";
 /** 플레이어 추천문 2~3개 — Claude Haiku 4.5 */
 const STORY_SUGGESTION_ANTHROPIC_MODEL = (
   process.env.STORY_SUGGESTION_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
@@ -98,7 +101,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-sonnet5-max-tokens-cap";
+const SERVER_REV = "story-chat-fast-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -816,6 +819,7 @@ function buildAnthropicMessagesBody({
   temperature,
   max_tokens,
   stream = false,
+  disableThinking = false,
 }) {
   const body = {
     model: (model || ANTHROPIC_MODEL).trim(),
@@ -831,6 +835,9 @@ function buildAnthropicMessagesBody({
     anthropicSupportsTemperature(body.model)
   ) {
     body.temperature = temperature;
+  }
+  if (disableThinking && isAnthropicThinkingHeavyModel(body.model)) {
+    body.thinking = { type: "disabled" };
   }
   if (stream) body.stream = true;
   return body;
@@ -854,6 +861,7 @@ async function callAnthropicCompletion({
   logTag,
   fetchTimeoutMs = STORY_LLM_TIMEOUT_MS,
   _attempt = 0,
+  disableThinking = false,
 }) {
   const modelId = (model || ANTHROPIC_MODEL).trim();
   if (!ANTHROPIC_API_KEY) {
@@ -874,6 +882,7 @@ async function callAnthropicCompletion({
     systemPrompt,
     temperature,
     max_tokens,
+    disableThinking,
   });
 
   try {
@@ -918,6 +927,7 @@ async function callAnthropicCompletion({
           logTag,
           fetchTimeoutMs,
           _attempt: 1,
+          disableThinking,
         });
       }
       return {
@@ -954,6 +964,7 @@ async function callAnthropicCompletion({
           logTag,
           fetchTimeoutMs,
           _attempt: 1,
+          disableThinking,
         });
       }
       return {
@@ -3284,10 +3295,13 @@ function normalizeStoryScenePreload(value, scene) {
   return out;
 }
 
-function storyChatSkipsScenePrediction(storyId, programId) {
+function storyChatSkipsScenePrediction(storyId, programId, beatScene) {
   const sid = String(storyId || "").trim();
   const pid = String(programId || "").trim();
-  return sid === "movie_alien_x" || sid.startsWith("movie_") || pid === "movie_story";
+  const beat = String(beatScene || "").trim();
+  if (pid === "movie_story") return true;
+  if (beat.length > 0) return true;
+  return sid === "movie_alien_x" || sid.startsWith("movie_");
 }
 
 async function predictStoryScene(contextText) {
@@ -3399,30 +3413,35 @@ app.post("/api/story-chat", async (req, res) => {
       Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
         ? requestedTemperature
         : 0.82;
-    const max_tokens = resolveStoryLlmMaxTokens(
-      requestedMaxTokens,
-      isAnthropicConfigured() ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL,
-    );
 
     if (typeof promptRaw !== "string" || !promptRaw.trim()) {
       return res.status(400).json({ ok: false, error: "no prompt" });
     }
 
-    const useAnthropic = isAnthropicConfigured();
+    const useDeepSeek =
+      isDeepSeekConfigured() &&
+      (STORY_CHAT_PREFER_DEEPSEEK || !isAnthropicConfigured());
+    const useAnthropic = isAnthropicConfigured() && !useDeepSeek;
+
+    if (!useDeepSeek && !useAnthropic) {
+      logDeepSeekNotConfigured("story-chat");
+      return res.status(503).json({ ok: false, error: "No LLM configured for story-chat" });
+    }
+    const max_tokens = resolveStoryLlmMaxTokens(
+      requestedMaxTokens,
+      useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL,
+    );
     if (Number.isFinite(requestedMaxTokens) || useAnthropic) {
       console.log(
         `[story-chat] maxTokens requested=${Number.isFinite(requestedMaxTokens) ? requestedMaxTokens : "(default)"} ` +
           `effective=${max_tokens} model=${useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL}`,
       );
     }
-    if (!useAnthropic && !isDeepSeekConfigured()) {
-      logDeepSeekNotConfigured("story-chat");
-      return res.status(503).json({ ok: false, error: "Anthropic is not configured" });
-    }
     console.log(
       useAnthropic
         ? `[story-chat] provider=anthropic model=${STORY_CHAT_ANTHROPIC_MODEL}`
-        : `[story-chat] provider=deepseek model=${DEEPSEEK_MODEL}`,
+        : `[story-chat] provider=deepseek model=${DEEPSEEK_MODEL}` +
+            (STORY_CHAT_PREFER_DEEPSEEK ? " (preferred)" : ""),
     );
 
     const cleanedPrompt = sanitizePromptForApi(promptRaw);
@@ -3454,7 +3473,7 @@ app.post("/api/story-chat", async (req, res) => {
 
     const skipScenePrediction =
       (req.body && req.body.skip_scene_prediction === true) ||
-      storyChatSkipsScenePrediction(storyId, programId);
+      storyChatSkipsScenePrediction(storyId, programId, beatScene);
 
     const scenePromise = skipScenePrediction
       ? Promise.resolve({
@@ -3559,6 +3578,7 @@ app.post("/api/story-chat", async (req, res) => {
           max_tokens,
           logTag: "story-chat",
           fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+          disableThinking: true,
         })
       : await callOpenAiCompletion({
           userPrompt: cleanedPrompt,
@@ -3593,6 +3613,7 @@ app.post("/api/story-chat", async (req, res) => {
         logTag: "story-chat",
         fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
         _attempt: 1,
+        disableThinking: true,
       });
       logTiming("provider_json_retry_completed");
     }
@@ -5701,10 +5722,20 @@ app.post("/creator-ranking-admin", handleCreatorRankingAdminPost);
 const PORT = Number(process.env.PORT) || 3000;
 
 logSupabaseInit();
-if (isAnthropicConfigured()) {
+if (isDeepSeekConfigured() && STORY_CHAT_PREFER_DEEPSEEK) {
+  console.log(
+    `[story-chat] provider=deepseek model=${DEEPSEEK_MODEL} (preferred)`,
+  );
+} else if (isAnthropicConfigured()) {
   console.log(
     `[story-chat] provider=anthropic model=${STORY_CHAT_ANTHROPIC_MODEL}`,
   );
+} else if (isDeepSeekConfigured()) {
+  console.log(`[story-chat] provider=deepseek model=${DEEPSEEK_MODEL}`);
+} else {
+  console.error("[story-chat] ERROR No LLM configured for story-chat");
+}
+if (isAnthropicConfigured()) {
   console.log(
     `[story-suggestions] provider=anthropic model=${STORY_SUGGESTION_ANTHROPIC_MODEL}`,
   );
