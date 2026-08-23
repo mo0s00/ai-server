@@ -98,7 +98,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-sonnet5-empty-retry";
+const SERVER_REV = "story-sonnet5-max-tokens-cap";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -447,11 +447,51 @@ function isAnthropicThinkingHeavyModel(modelStr) {
 function resolveStoryLlmMaxTokens(requested, modelStr) {
   const n = Number(requested);
   const base = Number.isFinite(n) && n > 0 ? Math.floor(n) : 620;
-  let floor = 1200;
-  if (isReasoningHeavyDeepSeekModel(modelStr)) floor = 4096;
-  else if (isAnthropicThinkingHeavyModel(modelStr)) floor = 4096;
-  const cap = isAnthropicThinkingHeavyModel(modelStr) ? 8192 : 4096;
-  return Math.min(cap, Math.max(base, floor));
+  if (isReasoningHeavyDeepSeekModel(modelStr)) {
+    return Math.min(4096, Math.max(base, 1200));
+  }
+  if (isAnthropicThinkingHeavyModel(modelStr)) {
+    // Sonnet/Opus 5 — 앱 요청(800~1100)을 존중. 4096 floor는 생성 지연·비용만 키움.
+    const cap = 1200;
+    const floor = 600;
+    return Math.min(cap, Math.max(base, floor));
+  }
+  return Math.min(4096, Math.max(base, 620));
+}
+
+/** Anthropic story-chat JSON이 파싱 가능한지 — 잘림 시에만 상한 재시도. */
+function storyChatJsonLooksComplete(text) {
+  if (typeof text !== "string") return false;
+  const t = text.trim();
+  if (!t) return false;
+  if (!t.startsWith("{")) return t.length >= 80;
+  try {
+    JSON.parse(t);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function anthropicRetryMaxTokens(currentMax, { empty = false, truncated = false } = {}) {
+  const cur = Number.isFinite(currentMax) && currentMax > 0 ? Math.floor(currentMax) : 800;
+  if (truncated || empty) {
+    return Math.min(8192, Math.max(cur * 2, 2048));
+  }
+  return cur;
+}
+
+function logAnthropicUsage({ logTag, modelId, max_tokens, text, raw, attempt = 0 }) {
+  const usage = raw?.usage || {};
+  const thinkingTokens = usage?.output_tokens_details?.thinking_tokens;
+  console.log(
+    `[${logTag}] anthropic usage model=${modelId} attempt=${attempt} ` +
+      `max_tokens=${max_tokens} ` +
+      `input_tokens=${usage.input_tokens ?? "?"} ` +
+      `output_tokens=${usage.output_tokens ?? "?"} ` +
+      `thinking_tokens=${thinkingTokens ?? "?"} ` +
+      `replyLen=${(text || "").length}`,
+  );
 }
 
 /** reasoning·마크다운 본문에서 첫 JSON 객체를 추출한다. */
@@ -874,7 +914,7 @@ async function callAnthropicCompletion({
           userPrompt,
           systemPrompt,
           temperature,
-          max_tokens: Math.max(max_tokens, 4096),
+          max_tokens,
           logTag,
           fetchTimeoutMs,
           _attempt: 1,
@@ -900,14 +940,17 @@ async function callAnthropicCompletion({
           `stop_reason=${stopReason} max_tokens=${max_tokens} ` +
           `output_tokens=${usage?.output_tokens ?? "?"} thinking_tokens=${thinkingTokens ?? "?"}`,
       );
-      const retryMax = Math.max(max_tokens, 4096);
+      const retryMax = anthropicRetryMaxTokens(max_tokens, {
+        empty: true,
+        truncated: stopReason === "max_tokens",
+      });
       if (_attempt === 0 && (stopReason === "max_tokens" || retryMax > max_tokens)) {
         return callAnthropicCompletion({
           model,
           userPrompt,
           systemPrompt,
           temperature,
-          max_tokens: stopReason === "max_tokens" ? Math.max(retryMax, 8192) : retryMax,
+          max_tokens: retryMax,
           logTag,
           fetchTimeoutMs,
           _attempt: 1,
@@ -926,6 +969,14 @@ async function callAnthropicCompletion({
       };
     }
     console.log(`[${logTag}] provider=anthropic model=${modelId}`);
+    logAnthropicUsage({
+      logTag,
+      modelId,
+      max_tokens,
+      text,
+      raw: json,
+      attempt: _attempt,
+    });
     return {
       ok: true,
       provider: "anthropic",
@@ -1068,7 +1119,7 @@ async function callAnthropicCompletionStream({
   }
   if (!fullText) {
     if (_attempt === 0) {
-      const retryMax = Math.max(max_tokens, 4096);
+      const retryMax = anthropicRetryMaxTokens(max_tokens, { empty: true });
       console.log(
         `[${logTag}] anthropic stream empty — retry once max_tokens=${retryMax}`,
       );
@@ -3358,6 +3409,12 @@ app.post("/api/story-chat", async (req, res) => {
     }
 
     const useAnthropic = isAnthropicConfigured();
+    if (Number.isFinite(requestedMaxTokens) || useAnthropic) {
+      console.log(
+        `[story-chat] maxTokens requested=${Number.isFinite(requestedMaxTokens) ? requestedMaxTokens : "(default)"} ` +
+          `effective=${max_tokens} model=${useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL}`,
+      );
+    }
     if (!useAnthropic && !isDeepSeekConfigured()) {
       logDeepSeekNotConfigured("story-chat");
       return res.status(503).json({ ok: false, error: "Anthropic is not configured" });
@@ -3518,6 +3575,28 @@ app.post("/api/story-chat", async (req, res) => {
 
     let finalLlm = llmResult;
     if (
+      useAnthropic &&
+      finalLlm.ok &&
+      finalLlm.text &&
+      !storyChatJsonLooksComplete(finalLlm.text)
+    ) {
+      const retryMax = anthropicRetryMaxTokens(max_tokens, { truncated: true });
+      console.log(
+        `[story-chat] incomplete JSON len=${finalLlm.text.length} — retry max_tokens=${retryMax}`,
+      );
+      finalLlm = await callAnthropicCompletion({
+        model: STORY_CHAT_ANTHROPIC_MODEL,
+        userPrompt: cleanedPrompt,
+        systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+        temperature,
+        max_tokens: retryMax,
+        logTag: "story-chat",
+        fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+        _attempt: 1,
+      });
+      logTiming("provider_json_retry_completed");
+    }
+    if (
       !useAnthropic &&
       finalLlm.ok &&
       storyChatReplyLooksEmpty(finalLlm.text) &&
@@ -3592,13 +3671,20 @@ app.post("/api/story-chat", async (req, res) => {
     logTiming("completed");
 
     const upstreamRaw = finalLlm.raw;
+    const usage = upstreamRaw?.usage || {};
+    const elapsedMs = Date.now() - t0;
 
     console.log(
       `[story-chat] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
         `currentBeat.scene=${beatScene || "(none)"} appliedScenePreset=${sceneData.scene} ` +
         `preload=${JSON.stringify(sceneData.preload)} source=${sceneData.source} ` +
         `provider=${useAnthropic ? "anthropic" : "deepseek"} ` +
-        `model=${useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL}`,
+        `model=${useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL} ` +
+        `requestedMax=${Number.isFinite(requestedMaxTokens) ? requestedMaxTokens : "(default)"} ` +
+        `effectiveMax=${max_tokens} ` +
+        `inputTokens=${usage.input_tokens ?? "?"} ` +
+        `outputTokens=${usage.output_tokens ?? "?"} ` +
+        `replyLen=${reply.length} elapsedMs=${elapsedMs}`,
     );
 
     return res.json({
