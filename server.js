@@ -75,7 +75,7 @@ const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "home-announcements-v2";
+const SERVER_REV = "story-empty-retry-v1";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -581,7 +581,12 @@ async function callOpenAiCompletion({
       ok: false,
       provider: llm.provider,
       status: 502,
-      errorText: "추천문 생성 실패",
+      errorText:
+        logTag === "story-chat"
+          ? "스토리 대화 생성 실패"
+          : logTag === "story-suggestions"
+            ? "추천문 생성 실패"
+            : "AI 응답 생성 실패",
     };
   }
 
@@ -1361,7 +1366,7 @@ async function handleStorySuggestionsPost(req, res) {
       temperature,
       max_tokens,
       logTag: "story-suggestions",
-      jsonMode: true,
+      jsonMode: false,
       allowReasoning: false,
     });
 
@@ -2925,7 +2930,8 @@ app.post("/api/story-chat", async (req, res) => {
       temperature,
       max_tokens,
       logTag: "story-chat",
-      jsonMode: true,
+      // DeepSeek json_object 모드에서 content가 비는 경우가 잦아 일반 JSON 출력으로 받는다.
+      jsonMode: false,
       allowReasoning: false,
     });
     logTiming("provider_completed");
