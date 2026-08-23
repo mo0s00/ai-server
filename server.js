@@ -98,7 +98,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-sonnet5-no-temperature";
+const SERVER_REV = "story-sonnet5-empty-retry";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -438,11 +438,20 @@ function isReasoningHeavyDeepSeekModel(modelStr) {
   return /v4|reasoner|r1|think/.test(model);
 }
 
+/** Claude 5 — adaptive thinking이 max_tokens 예산을 잡아먹어 text block이 비는 경우 방지. */
+function isAnthropicThinkingHeavyModel(modelStr) {
+  const model = (modelStr || "").trim().toLowerCase();
+  return /claude-(sonnet|opus)-5(?:$|[-_])/.test(model);
+}
+
 function resolveStoryLlmMaxTokens(requested, modelStr) {
   const n = Number(requested);
   const base = Number.isFinite(n) && n > 0 ? Math.floor(n) : 620;
-  const floor = isReasoningHeavyDeepSeekModel(modelStr) ? 4096 : 1200;
-  return Math.min(4096, Math.max(base, floor));
+  let floor = 1200;
+  if (isReasoningHeavyDeepSeekModel(modelStr)) floor = 4096;
+  else if (isAnthropicThinkingHeavyModel(modelStr)) floor = 4096;
+  const cap = isAnthropicThinkingHeavyModel(modelStr) ? 8192 : 4096;
+  return Math.min(cap, Math.max(base, floor));
 }
 
 /** reasoning·마크다운 본문에서 첫 JSON 객체를 추출한다. */
@@ -787,6 +796,14 @@ function buildAnthropicMessagesBody({
   return body;
 }
 
+function normalizeAnthropicStoryReply(text) {
+  if (typeof text !== "string") return "";
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  const extracted = extractJsonObjectFromText(trimmed);
+  return extracted || trimmed;
+}
+
 /** Claude Messages API — story-chat·추천·실시간 댓글 공통. */
 async function callAnthropicCompletion({
   model,
@@ -796,6 +813,7 @@ async function callAnthropicCompletion({
   max_tokens,
   logTag,
   fetchTimeoutMs = STORY_LLM_TIMEOUT_MS,
+  _attempt = 0,
 }) {
   const modelId = (model || ANTHROPIC_MODEL).trim();
   if (!ANTHROPIC_API_KEY) {
@@ -842,18 +860,59 @@ async function callAnthropicCompletion({
       };
     }
     if (!response.ok) {
+      const errMsg = anthropicErrorMessage(json) || "Anthropic 요청 실패";
       console.log(
-        `[${logTag}] Anthropic HTTP ${response.status} model=${modelId}`,
+        `[${logTag}] Anthropic HTTP ${response.status} model=${modelId} attempt=${_attempt} err=${errMsg.slice(0, 200)}`,
       );
+      if (
+        _attempt === 0 &&
+        (response.status === 529 || response.status >= 500)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        return callAnthropicCompletion({
+          model,
+          userPrompt,
+          systemPrompt,
+          temperature,
+          max_tokens: Math.max(max_tokens, 4096),
+          logTag,
+          fetchTimeoutMs,
+          _attempt: 1,
+        });
+      }
       return {
         ok: false,
         provider: "anthropic",
         status: response.status >= 500 ? 502 : response.status,
-        errorText: anthropicErrorMessage(json) || "Anthropic 요청 실패",
+        errorText: errMsg,
       };
     }
-    const text = anthropicTextFromResponse(json);
+    let text = anthropicTextFromResponse(json);
+    if (logTag === "story-chat" || logTag === "story-chat-stream") {
+      text = normalizeAnthropicStoryReply(text);
+    }
     if (!text) {
+      const stopReason = json?.stop_reason || "";
+      const usage = json?.usage || {};
+      const thinkingTokens = usage?.output_tokens_details?.thinking_tokens;
+      console.warn(
+        `[${logTag}] Anthropic empty text model=${modelId} attempt=${_attempt} ` +
+          `stop_reason=${stopReason} max_tokens=${max_tokens} ` +
+          `output_tokens=${usage?.output_tokens ?? "?"} thinking_tokens=${thinkingTokens ?? "?"}`,
+      );
+      const retryMax = Math.max(max_tokens, 4096);
+      if (_attempt === 0 && (stopReason === "max_tokens" || retryMax > max_tokens)) {
+        return callAnthropicCompletion({
+          model,
+          userPrompt,
+          systemPrompt,
+          temperature,
+          max_tokens: stopReason === "max_tokens" ? Math.max(retryMax, 8192) : retryMax,
+          logTag,
+          fetchTimeoutMs,
+          _attempt: 1,
+        });
+      }
       return {
         ok: false,
         provider: "anthropic",
@@ -1004,17 +1063,21 @@ async function callAnthropicCompletionStream({
   }
 
   fullText = fullText.trim();
+  if (logTag === "story-chat" || logTag === "story-chat-stream") {
+    fullText = normalizeAnthropicStoryReply(fullText);
+  }
   if (!fullText) {
     if (_attempt === 0) {
+      const retryMax = Math.max(max_tokens, 4096);
       console.log(
-        `[${logTag}] anthropic stream empty — retry once max_tokens=${Math.max(max_tokens, 1200)}`,
+        `[${logTag}] anthropic stream empty — retry once max_tokens=${retryMax}`,
       );
       return callAnthropicCompletionStream({
         model: modelId,
         userPrompt,
         systemPrompt,
         temperature,
-        max_tokens: Math.max(max_tokens, 1200),
+        max_tokens: retryMax,
         logTag,
         onDelta,
         onFirstToken,
