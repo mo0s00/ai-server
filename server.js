@@ -15,6 +15,16 @@ const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 const ANTHROPIC_MODEL = (
   process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
+/** 스토리 본문 대사·나레이션 — Claude Sonnet 5 */
+const STORY_CHAT_ANTHROPIC_MODEL = (
+  process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-sonnet-5"
+).trim();
+/** 플레이어 추천문 2~3개 — Claude Haiku 4.5 */
+const STORY_SUGGESTION_ANTHROPIC_MODEL = (
+  process.env.STORY_SUGGESTION_ANTHROPIC_MODEL ||
+  process.env.ANTHROPIC_MODEL ||
+  "claude-haiku-4-5-20251001"
+).trim();
 const LIVE_COMMENT_ANTHROPIC_MODEL = (
   process.env.LIVE_COMMENT_ANTHROPIC_MODEL || "claude-opus-4-6"
 ).trim();
@@ -90,7 +100,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "live-comments-opus-4-6";
+const SERVER_REV = "story-sonnet5-suggest-haiku45";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -177,19 +187,31 @@ function buildHealthPayload() {
     ""
   ).trim();
   const chatLlm = resolveDeepSeekConfig();
+  const storyChatProvider = isAnthropicConfigured()
+    ? "anthropic"
+    : chatLlm?.provider || "none";
+  const storyChatModel = isAnthropicConfigured()
+    ? STORY_CHAT_ANTHROPIC_MODEL
+    : chatLlm?.model || "";
   return {
     ok: true,
     openaiConfigured: !!OPENAI_API_KEY,
     anthropicConfigured: isAnthropicConfigured(),
+    storyChatProvider,
+    storyChatModel,
+    storySuggestionProvider: isAnthropicConfigured() ? "anthropic" : chatLlm?.provider || "none",
+    storySuggestionModel: isAnthropicConfigured()
+      ? STORY_SUGGESTION_ANTHROPIC_MODEL
+      : chatLlm?.model || "",
     liveCommentProvider: isAnthropicConfigured() ? "anthropic" : "openai",
     liveCommentModel: isAnthropicConfigured()
       ? LIVE_COMMENT_ANTHROPIC_MODEL
       : OPENAI_MODEL,
     deepseekConfigured: isDeepSeekConfigured(),
-    chatLlmProvider: chatLlm?.provider || "none",
-    chatLlmModel: chatLlm?.model || "",
-    provider: chatLlm?.provider || "none",
-    model: chatLlm?.model || "",
+    chatLlmProvider: storyChatProvider,
+    chatLlmModel: storyChatModel,
+    provider: storyChatProvider,
+    model: storyChatModel,
     rev: SERVER_REV,
     storyImageGeneration: storyImageGenerationEnabled(),
     supabaseConfigured: !!(url && key),
@@ -496,6 +518,32 @@ function assistantTextFromMessage(
   return "";
 }
 
+function storyChatReplyLooksEmpty(text) {
+  if (typeof text !== "string") return true;
+  const t = text.trim();
+  if (!t) return true;
+  if (t.length >= 80 && !t.startsWith("{")) return false;
+  try {
+    const o = JSON.parse(t);
+    if (!o || typeof o !== "object") return t.length < 80;
+    const nar = (o.narrator || o.narration || "").toString().trim();
+    if (nar) return false;
+    const lines = Array.isArray(o.lines) ? o.lines : [];
+    for (const line of lines) {
+      if (!line || typeof line !== "object") continue;
+      const body = (line.text || line.line || "").toString().trim();
+      const speaker = (line.speaker || line.name || "").toString().trim();
+      if (body || speaker) return false;
+    }
+    for (const key of ["summon", "summons", "exit", "exits"]) {
+      if (Array.isArray(o[key]) && o[key].length > 0) return false;
+    }
+    return true;
+  } catch (_) {
+    return t.length < 80;
+  }
+}
+
 /** Chat Completions — story-chat, story-suggestions, comment (DeepSeek only). */
 async function callOpenAiCompletion({
   userPrompt,
@@ -707,23 +755,39 @@ function anthropicErrorMessage(json) {
   return "";
 }
 
-/** 실시간 댓글 — Claude(Haiku 등). DeepSeek·스토리 대사 큐와 분리. */
-async function callAnthropicLiveCommentCompletion({
+/** Claude Messages API — story-chat·추천·실시간 댓글 공통. */
+async function callAnthropicCompletion({
+  model,
   userPrompt,
+  systemPrompt,
   temperature,
   max_tokens,
   logTag,
+  fetchTimeoutMs = STORY_LLM_TIMEOUT_MS,
 }) {
+  const modelId = (model || ANTHROPIC_MODEL).trim();
   if (!ANTHROPIC_API_KEY) {
     return {
       ok: false,
+      provider: "anthropic",
       status: 503,
       errorText: "Anthropic is not configured",
+      skipped: true,
     };
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+  const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
+  const body = {
+    model: modelId,
+    max_tokens,
+    temperature,
+    messages: [{ role: "user", content: userPrompt }],
+  };
+  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
+    body.system = systemPrompt.trim();
+  }
+
   try {
     const response = await fetch(ANTHROPIC_MESSAGES_URL, {
       method: "POST",
@@ -732,13 +796,7 @@ async function callAnthropicLiveCommentCompletion({
         "anthropic-version": ANTHROPIC_VERSION,
         "Content-Type": "application/json; charset=utf-8",
       },
-      body: JSON.stringify({
-        model: LIVE_COMMENT_ANTHROPIC_MODEL,
-        max_tokens,
-        temperature,
-        system: "Reply with ONE valid JSON object only. No markdown fences or extra text.",
-        messages: [{ role: "user", content: userPrompt }],
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     const raw = await response.text();
@@ -746,29 +804,111 @@ async function callAnthropicLiveCommentCompletion({
     try {
       json = raw ? JSON.parse(raw) : {};
     } catch (_) {
-      return { ok: false, status: 502, errorText: "Anthropic 응답 해석 실패" };
+      return {
+        ok: false,
+        provider: "anthropic",
+        status: 502,
+        errorText: "Anthropic 응답 해석 실패",
+      };
     }
     if (!response.ok) {
       console.log(
-        `[${logTag}] Anthropic HTTP ${response.status} model=${LIVE_COMMENT_ANTHROPIC_MODEL}`,
+        `[${logTag}] Anthropic HTTP ${response.status} model=${modelId}`,
       );
       return {
         ok: false,
+        provider: "anthropic",
         status: response.status >= 500 ? 502 : response.status,
         errorText: anthropicErrorMessage(json) || "Anthropic 요청 실패",
       };
     }
     const text = anthropicTextFromResponse(json);
     if (!text) {
-      return { ok: false, status: 502, errorText: "Anthropic 빈 응답" };
+      return {
+        ok: false,
+        provider: "anthropic",
+        status: 502,
+        errorText:
+          logTag === "story-chat"
+            ? "스토리 대화 생성 실패"
+            : logTag === "story-suggestions"
+              ? "추천문 생성 실패"
+              : "Anthropic 빈 응답",
+      };
     }
-    console.log(
-      `[${logTag}] provider=anthropic model=${LIVE_COMMENT_ANTHROPIC_MODEL}`,
-    );
-    return { ok: true, model: LIVE_COMMENT_ANTHROPIC_MODEL, text };
+    console.log(`[${logTag}] provider=anthropic model=${modelId}`);
+    return {
+      ok: true,
+      provider: "anthropic",
+      model: modelId,
+      text,
+      raw: json,
+    };
   } catch (error) {
     const timeout = error?.name === "AbortError";
     console.error(`[${logTag}] Anthropic error:`, error?.message || error);
+    return {
+      ok: false,
+      provider: "anthropic",
+      status: timeout ? 504 : 502,
+      errorText: timeout ? "Anthropic 요청 시간 초과" : "Anthropic 연결 실패",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Claude Messages API streaming — story-chat 전용. */
+async function callAnthropicCompletionStream({
+  model,
+  userPrompt,
+  systemPrompt,
+  temperature,
+  max_tokens,
+  logTag,
+  onDelta,
+  onFirstToken,
+  fetchTimeoutMs = STORY_LLM_TIMEOUT_MS,
+  _attempt = 0,
+}) {
+  const modelId = (model || STORY_CHAT_ANTHROPIC_MODEL).trim();
+  if (!ANTHROPIC_API_KEY) {
+    return {
+      ok: false,
+      status: 503,
+      errorText: "Anthropic is not configured",
+    };
+  }
+
+  const body = {
+    model: modelId,
+    max_tokens,
+    temperature,
+    stream: true,
+    messages: [{ role: "user", content: userPrompt }],
+  };
+  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
+    body.system = systemPrompt.trim();
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
+
+  let response;
+  try {
+    response = await fetch(ANTHROPIC_MESSAGES_URL, {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timer);
+    const timeout = error?.name === "AbortError";
     return {
       ok: false,
       status: timeout ? 504 : 502,
@@ -777,6 +917,113 @@ async function callAnthropicLiveCommentCompletion({
   } finally {
     clearTimeout(timer);
   }
+
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let json = {};
+    try {
+      json = raw ? JSON.parse(raw) : {};
+    } catch (_) {}
+    return {
+      ok: false,
+      status: response.status >= 500 ? 502 : response.status,
+      errorText: anthropicErrorMessage(json) || "Anthropic 요청 실패",
+    };
+  }
+
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    return { ok: false, status: 502, errorText: "스트림을 열 수 없습니다." };
+  }
+
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let fullText = "";
+  let firstTokenSent = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const data = trimmed.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch (_) {
+        continue;
+      }
+      const piece =
+        chunk?.delta?.text ||
+        chunk?.delta?.partial_json ||
+        (chunk?.type === "content_block_delta" &&
+        chunk?.delta?.type === "text_delta"
+          ? chunk.delta.text
+          : "");
+      if (!piece || typeof piece !== "string") continue;
+      fullText += piece;
+      if (!firstTokenSent) {
+        firstTokenSent = true;
+        if (typeof onFirstToken === "function") onFirstToken();
+      }
+      if (typeof onDelta === "function") onDelta(piece);
+    }
+  }
+
+  fullText = fullText.trim();
+  if (!fullText) {
+    if (_attempt === 0) {
+      console.log(
+        `[${logTag}] anthropic stream empty — retry once max_tokens=${Math.max(max_tokens, 1200)}`,
+      );
+      return callAnthropicCompletionStream({
+        model: modelId,
+        userPrompt,
+        systemPrompt,
+        temperature,
+        max_tokens: Math.max(max_tokens, 1200),
+        logTag,
+        onDelta,
+        onFirstToken,
+        fetchTimeoutMs,
+        _attempt: 1,
+      });
+    }
+    return { ok: false, status: 502, errorText: "empty reply" };
+  }
+
+  console.log(`[${logTag}] stream complete provider=anthropic model=${modelId}`);
+  return {
+    ok: true,
+    provider: "anthropic",
+    model: modelId,
+    text: fullText,
+    raw: { stream: true, model: modelId },
+  };
+}
+
+/** 실시간 댓글 — Claude(Haiku 등). DeepSeek·스토리 대사 큐와 분리. */
+async function callAnthropicLiveCommentCompletion({
+  userPrompt,
+  temperature,
+  max_tokens,
+  logTag,
+}) {
+  return callAnthropicCompletion({
+    model: LIVE_COMMENT_ANTHROPIC_MODEL,
+    userPrompt,
+    systemPrompt:
+      "Reply with ONE valid JSON object only. No markdown fences or extra text.",
+    temperature,
+    max_tokens,
+    logTag,
+    fetchTimeoutMs: 12000,
+  });
 }
 
 /** Anthropic 미설정 시 로컬/Render dev용 OpenAI fallback. */
@@ -1491,10 +1738,13 @@ async function handleLiveCommentsPost(req, res) {
 }
 
 function resolveStorySuggestionMaxTokens(requested) {
-  return resolveStoryLlmMaxTokens(requested, DEEPSEEK_MODEL);
+  const model = isAnthropicConfigured()
+    ? STORY_SUGGESTION_ANTHROPIC_MODEL
+    : DEEPSEEK_MODEL;
+  return resolveStoryLlmMaxTokens(requested, model);
 }
 
-/** 스토리 beat 추천 재작성 — DeepSeek only. */
+/** 스토리 beat 추천 재작성 — Claude Haiku 4.5 (Anthropic 미설정 시 DeepSeek fallback). */
 async function handleStorySuggestionsPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
@@ -1519,11 +1769,16 @@ async function handleStorySuggestionsPost(req, res) {
         cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
     }
 
-    if (!isDeepSeekConfigured()) {
+    const useAnthropic = isAnthropicConfigured();
+    if (!useAnthropic && !isDeepSeekConfigured()) {
       logDeepSeekNotConfigured("story-suggestions");
-      return res.status(503).json({ text: "DeepSeek is not configured" });
+      return res.status(503).json({ text: "Anthropic is not configured" });
     }
-    console.log(`[story-suggestions] provider=deepseek model=${DEEPSEEK_MODEL}`);
+    console.log(
+      useAnthropic
+        ? `[story-suggestions] provider=anthropic model=${STORY_SUGGESTION_ANTHROPIC_MODEL}`
+        : `[story-suggestions] provider=deepseek model=${DEEPSEEK_MODEL}`,
+    );
 
     const storyId = readString(req.body, "story_id");
     const programId = readString(req.body, "program_id");
@@ -1541,26 +1796,41 @@ async function handleStorySuggestionsPost(req, res) {
         `slotCount=${slotCount} promptLen=${cleanedPrompt.length} maxTokens=${max_tokens}`,
     );
 
-    const llmResult = await callOpenAiCompletion({
-      userPrompt: cleanedPrompt,
-      temperature,
-      max_tokens,
-      logTag: "story-suggestions",
-      systemPrompt: STORY_JSON_SYSTEM_PROMPT,
-      jsonMode: false,
-      allowReasoning: true,
-      preferJson: true,
-      fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
-    });
+    const llmResult = useAnthropic
+      ? await callAnthropicCompletion({
+          model: STORY_SUGGESTION_ANTHROPIC_MODEL,
+          userPrompt: cleanedPrompt,
+          systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+          temperature,
+          max_tokens,
+          logTag: "story-suggestions",
+          fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+        })
+      : await callOpenAiCompletion({
+          userPrompt: cleanedPrompt,
+          temperature,
+          max_tokens,
+          logTag: "story-suggestions",
+          systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+          jsonMode: false,
+          allowReasoning: true,
+          preferJson: true,
+          fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+        });
 
     if (!llmResult.ok) {
       const statusOut = llmResult.status || 502;
-      const errorText = llmResult.errorText || "DeepSeek request failed";
+      const errorText =
+        llmResult.errorText ||
+        (useAnthropic ? "Anthropic request failed" : "DeepSeek request failed");
       return res.status(statusOut).json({ text: errorText });
     }
 
     const text = llmResult.text;
-    if (isGarbageModelLine(text, llmResult.model || DEEPSEEK_MODEL)) {
+    const modelForGarbageCheck =
+      llmResult.model ||
+      (useAnthropic ? STORY_SUGGESTION_ANTHROPIC_MODEL : DEEPSEEK_MODEL);
+    if (isGarbageModelLine(text, modelForGarbageCheck)) {
       console.log("[story-suggestions] rejected garbage model-line reply");
       return res.status(502).json({ text: "추천문 생성 실패" });
     }
@@ -2987,17 +3257,25 @@ app.post("/api/story-chat", async (req, res) => {
       Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
         ? requestedTemperature
         : 0.82;
-    const max_tokens = resolveStoryLlmMaxTokens(requestedMaxTokens, DEEPSEEK_MODEL);
+    const max_tokens = resolveStoryLlmMaxTokens(
+      requestedMaxTokens,
+      isAnthropicConfigured() ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL,
+    );
 
     if (typeof promptRaw !== "string" || !promptRaw.trim()) {
       return res.status(400).json({ ok: false, error: "no prompt" });
     }
 
-    if (!isDeepSeekConfigured()) {
+    const useAnthropic = isAnthropicConfigured();
+    if (!useAnthropic && !isDeepSeekConfigured()) {
       logDeepSeekNotConfigured("story-chat");
-      return res.status(503).json({ ok: false, error: "DeepSeek is not configured" });
+      return res.status(503).json({ ok: false, error: "Anthropic is not configured" });
     }
-    console.log(`[story-chat] provider=deepseek model=${DEEPSEEK_MODEL}`);
+    console.log(
+      useAnthropic
+        ? `[story-chat] provider=anthropic model=${STORY_CHAT_ANTHROPIC_MODEL}`
+        : `[story-chat] provider=deepseek model=${DEEPSEEK_MODEL}`,
+    );
 
     const cleanedPrompt = sanitizePromptForApi(promptRaw);
     if (!cleanedPrompt) {
@@ -3012,7 +3290,10 @@ app.post("/api/story-chat", async (req, res) => {
 
     if (process.env.STORY_PROMPT_DUMP === "1") {
       console.log("[storyPromptDump] === SERVER START ===");
-      console.log(`[storyPromptDump] provider=deepseek model=${DEEPSEEK_MODEL}`);
+      console.log(
+        `[storyPromptDump] provider=${useAnthropic ? "anthropic" : "deepseek"} ` +
+          `model=${useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL}`,
+      );
       console.log(`[storyPromptDump] storyId=${storyId || "(none)"} programId=${programId || "(none)"}`);
       console.log(`[storyPromptDump] --- combinedPrompt (${cleanedPrompt.length} chars) ---`);
       console.log(cleanedPrompt);
@@ -3062,24 +3343,40 @@ app.post("/api/story-chat", async (req, res) => {
         });
 
       logTiming("provider_started");
-      const llmResult = await callOpenAiCompletionStream({
-        userPrompt: cleanedPrompt,
-        temperature,
-        max_tokens,
-        logTag: "story-chat-stream",
-        systemPrompt: STORY_JSON_SYSTEM_PROMPT,
-        jsonMode: false,
-        allowReasoning: true,
-        onFirstToken: () => logTiming("first_token"),
-        onDelta: (piece) => {
-          writeSse(res, { type: "delta", text: piece });
-        },
-      });
+      const llmResult = useAnthropic
+        ? await callAnthropicCompletionStream({
+            model: STORY_CHAT_ANTHROPIC_MODEL,
+            userPrompt: cleanedPrompt,
+            temperature,
+            max_tokens,
+            logTag: "story-chat-stream",
+            systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+            onFirstToken: () => logTiming("first_token"),
+            onDelta: (piece) => {
+              writeSse(res, { type: "delta", text: piece });
+            },
+            fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+          })
+        : await callOpenAiCompletionStream({
+            userPrompt: cleanedPrompt,
+            temperature,
+            max_tokens,
+            logTag: "story-chat-stream",
+            systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+            jsonMode: false,
+            allowReasoning: true,
+            onFirstToken: () => logTiming("first_token"),
+            onDelta: (piece) => {
+              writeSse(res, { type: "delta", text: piece });
+            },
+          });
 
       if (!llmResult.ok) {
         writeSse(res, {
           type: "error",
-          error: llmResult.errorText || "DeepSeek request failed",
+          error:
+            llmResult.errorText ||
+            (useAnthropic ? "Anthropic request failed" : "DeepSeek request failed"),
         });
         res.end();
         return;
@@ -3105,34 +3402,77 @@ app.post("/api/story-chat", async (req, res) => {
       return;
     }
 
-    const llmResult = await callOpenAiCompletion({
-      userPrompt: cleanedPrompt,
-      temperature,
-      max_tokens,
-      logTag: "story-chat",
-      systemPrompt: STORY_JSON_SYSTEM_PROMPT,
-      jsonMode: false,
-      allowReasoning: true,
-      preferJson: true,
-      fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
-    });
+    const llmResult = useAnthropic
+      ? await callAnthropicCompletion({
+          model: STORY_CHAT_ANTHROPIC_MODEL,
+          userPrompt: cleanedPrompt,
+          systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+          temperature,
+          max_tokens,
+          logTag: "story-chat",
+          fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+        })
+      : await callOpenAiCompletion({
+          userPrompt: cleanedPrompt,
+          temperature,
+          max_tokens,
+          logTag: "story-chat",
+          systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+          jsonMode: false,
+          allowReasoning: true,
+          preferJson: true,
+          fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+        });
     logTiming("provider_completed");
 
-    if (!llmResult.ok) {
-      const statusOut = llmResult.status || 502;
-      const errMsg = llmResult.errorText || "DeepSeek request failed";
+    let finalLlm = llmResult;
+    if (
+      !useAnthropic &&
+      finalLlm.ok &&
+      storyChatReplyLooksEmpty(finalLlm.text) &&
+      isReasoningHeavyDeepSeekModel(DEEPSEEK_MODEL)
+    ) {
+      console.log(
+        `[story-chat] empty turn json len=${(finalLlm.text || "").length} — retry with max_tokens floor`,
+      );
+      finalLlm = await callOpenAiCompletion({
+        userPrompt: cleanedPrompt,
+        temperature,
+        max_tokens: Math.max(max_tokens, 4096),
+        logTag: "story-chat",
+        systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+        jsonMode: false,
+        allowReasoning: true,
+        preferJson: true,
+        fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+        _attempt: 1,
+      });
+      logTiming("provider_retry_completed");
+    }
+
+    if (!finalLlm.ok) {
+      const statusOut = finalLlm.status || 502;
+      const errMsg =
+        finalLlm.errorText ||
+        (useAnthropic ? "Anthropic request failed" : "DeepSeek request failed");
       console.error(
         "[story-chat llm error]",
-        `provider=deepseek model=${DEEPSEEK_MODEL}`,
+        `provider=${useAnthropic ? "anthropic" : "deepseek"} ` +
+          `model=${useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL}`,
         statusOut,
         errMsg,
       );
       return res.status(statusOut).json({ ok: false, error: errMsg });
     }
 
-    const reply = llmResult.text;
+    const reply = finalLlm.text;
     if (!reply) {
       return res.status(502).json({ ok: false, error: "empty reply" });
+    }
+    if (storyChatReplyLooksEmpty(reply)) {
+      console.warn(
+        `[story-chat] still empty after retry len=${reply.length} head=${reply.slice(0, 120)}`,
+      );
     }
 
     let sceneData = {
@@ -3160,13 +3500,14 @@ app.post("/api/story-chat", async (req, res) => {
     }
     logTiming("completed");
 
-    const upstreamRaw = llmResult.raw;
+    const upstreamRaw = finalLlm.raw;
 
     console.log(
       `[story-chat] storyId=${storyId || "(none)"} programId=${programId || "(none)"} ` +
         `currentBeat.scene=${beatScene || "(none)"} appliedScenePreset=${sceneData.scene} ` +
         `preload=${JSON.stringify(sceneData.preload)} source=${sceneData.source} ` +
-        `provider=deepseek model=${DEEPSEEK_MODEL}`,
+        `provider=${useAnthropic ? "anthropic" : "deepseek"} ` +
+        `model=${useAnthropic ? STORY_CHAT_ANTHROPIC_MODEL : DEEPSEEK_MODEL}`,
     );
 
     return res.json({
@@ -5183,22 +5524,35 @@ app.post("/creator-ranking-admin", handleCreatorRankingAdminPost);
 const PORT = Number(process.env.PORT) || 3000;
 
 logSupabaseInit();
-if (!isDeepSeekConfigured()) {
-  console.error("[chatLlm] ERROR DeepSeek is not configured");
-} else {
-  console.log(
-    `[chatLlm] story text APIs use provider=deepseek model=${DEEPSEEK_MODEL} ` +
-      `(story-chat, story-suggestions, comment)`,
-  );
-}
-console.log(
-  `[ai-server] openaiConfigured=${!!OPENAI_API_KEY} (TTS/image only)`,
-);
 if (isAnthropicConfigured()) {
+  console.log(
+    `[story-chat] provider=anthropic model=${STORY_CHAT_ANTHROPIC_MODEL}`,
+  );
+  console.log(
+    `[story-suggestions] provider=anthropic model=${STORY_SUGGESTION_ANTHROPIC_MODEL}`,
+  );
   console.log(
     `[live-comments] provider=anthropic model=${LIVE_COMMENT_ANTHROPIC_MODEL}`,
   );
 } else {
+  console.error("[story-chat] ERROR Anthropic is not configured (set ANTHROPIC_API_KEY)");
+  if (isDeepSeekConfigured()) {
+    console.log(
+      `[chatLlm] story text APIs fallback provider=deepseek model=${DEEPSEEK_MODEL}`,
+    );
+  }
+}
+if (isDeepSeekConfigured()) {
+  console.log(
+    `[chatLlm] comment/DM provider=deepseek model=${DEEPSEEK_MODEL}`,
+  );
+} else if (!isAnthropicConfigured()) {
+  console.error("[chatLlm] ERROR DeepSeek is not configured");
+}
+console.log(
+  `[ai-server] openaiConfigured=${!!OPENAI_API_KEY} (TTS/image only)`,
+);
+if (!isAnthropicConfigured()) {
   console.log(
     `[live-comments] provider=openai model=${OPENAI_MODEL} (set ANTHROPIC_API_KEY to use Claude)`,
   );
