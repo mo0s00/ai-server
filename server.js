@@ -74,8 +74,11 @@ const OPENAI_IMAGE_QUALITY = "high";
 const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
+const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-empty-retry-v1";
+const SERVER_REV = "story-v4-reasoning-v2";
+const STORY_JSON_SYSTEM_PROMPT =
+  "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -391,6 +394,51 @@ function assistantTextFromContent(c) {
  * deepseek-reasoner / thinking 응답에서 `content`가 비고 `reasoning_content`만 채워진 경우.
  * 사용자에게 보일 짧은 본문은 보통 맨 끝 단락에 가깝다.
  */
+function isReasoningHeavyDeepSeekModel(modelStr) {
+  const model = (modelStr || DEEPSEEK_MODEL).toLowerCase();
+  return /v4|reasoner|r1|think/.test(model);
+}
+
+function resolveStoryLlmMaxTokens(requested, modelStr) {
+  const n = Number(requested);
+  const base = Number.isFinite(n) && n > 0 ? Math.floor(n) : 620;
+  const floor = isReasoningHeavyDeepSeekModel(modelStr) ? 4096 : 1200;
+  return Math.min(4096, Math.max(base, floor));
+}
+
+/** reasoning·마크다운 본문에서 첫 JSON 객체를 추출한다. */
+function extractJsonObjectFromText(raw) {
+  if (typeof raw !== "string") return "";
+  const t = raw.trim();
+  if (!t) return "";
+  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const src = fenced ? fenced[1].trim() : t;
+  const start = src.indexOf("{");
+  if (start < 0) return "";
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < src.length; i++) {
+    const ch = src[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return src.slice(start, i + 1).trim();
+    }
+  }
+  return "";
+}
+
 function assistantTextFromReasoning(reasoningRaw) {
   if (typeof reasoningRaw !== "string") return "";
   let t = reasoningRaw.replace(/\r\n/g, "\n").trim();
@@ -410,12 +458,19 @@ function assistantTextFromReasoning(reasoningRaw) {
 }
 
 /** DeepSeek/호환 API assistant 메시지 */
-function assistantTextFromMessage(msgObj, { allowReasoning = true } = {}) {
+function assistantTextFromMessage(
+  msgObj,
+  { allowReasoning = true, preferJson = false } = {},
+) {
   if (!msgObj || typeof msgObj !== "object") return "";
   let out = assistantTextFromContent(msgObj.content);
   if (out) return out;
   if (!allowReasoning) return "";
   if (typeof msgObj.reasoning_content === "string") {
+    if (preferJson) {
+      out = extractJsonObjectFromText(msgObj.reasoning_content);
+      if (out) return out;
+    }
     out = assistantTextFromReasoning(msgObj.reasoning_content);
     if (out) return out;
   }
@@ -431,6 +486,8 @@ async function callOpenAiCompletion({
   systemPrompt,
   jsonMode = false,
   allowReasoning = true,
+  preferJson = false,
+  fetchTimeoutMs = FETCH_TIMEOUT_MS,
   _attempt = 0,
 }) {
   const llm = resolveDeepSeekConfig();
@@ -471,7 +528,7 @@ async function callOpenAiCompletion({
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
 
   let oaiRes;
   try {
@@ -535,22 +592,28 @@ async function callOpenAiCompletion({
   const choices = Array.isArray(json?.choices) ? json.choices : [];
   const first = choices[0];
   const msgObj = first && first.message;
-  let text = assistantTextFromMessage(msgObj, { allowReasoning });
+  let text = assistantTextFromMessage(msgObj, { allowReasoning, preferJson });
   if (!text && first && typeof first.text === "string") {
     text = first.text.trim();
   }
 
   if (!text) {
+    const finishReason = first?.finish_reason || "unknown";
+    const reasoningLength =
+      typeof msgObj?.reasoning_content === "string"
+        ? msgObj.reasoning_content.length
+        : 0;
     console.log(
-      `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model} attempt=${_attempt}`,
+      `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model} ` +
+        `attempt=${_attempt} finish_reason=${finishReason} reasoningLen=${reasoningLength}`,
     );
     if (_attempt === 0) {
-      // 일부 reasoning 모델은 JSON 모드에서 추론 토큰만 먼저 소진해
-      // content를 비워 반환한다. 일반 출력 + 넉넉한 토큰으로 한 번 재시도한다.
-      const retryMaxTokens = Math.max(max_tokens, 2048);
+      // v4/reasoning 모델은 추론 토큰만 먼저 소진해 content가 비는 경우가 있다.
+      const retryFloor = isReasoningHeavyDeepSeekModel(llm.model) ? 4096 : 2048;
+      const retryMaxTokens = Math.max(max_tokens, retryFloor);
       if (jsonMode) {
         console.log(
-          `[${logTag}] retry without json_mode max_tokens=${retryMaxTokens}`,
+          `[${logTag}] retry without json_mode max_tokens=${retryMaxTokens} allowReasoning=true`,
         );
         return callOpenAiCompletion({
           userPrompt,
@@ -559,12 +622,14 @@ async function callOpenAiCompletion({
           logTag,
           systemPrompt,
           jsonMode: false,
-          allowReasoning: false,
+          allowReasoning: true,
+          preferJson,
+          fetchTimeoutMs,
           _attempt: 1,
         });
       }
       console.log(
-        `[${logTag}] retry same mode max_tokens=${retryMaxTokens}`,
+        `[${logTag}] retry same mode max_tokens=${retryMaxTokens} allowReasoning=true`,
       );
       return callOpenAiCompletion({
         userPrompt,
@@ -573,7 +638,9 @@ async function callOpenAiCompletion({
         logTag,
         systemPrompt,
         jsonMode,
-        allowReasoning,
+        allowReasoning: true,
+        preferJson,
+        fetchTimeoutMs,
         _attempt: 1,
       });
     }
@@ -1309,9 +1376,7 @@ async function handleLiveCommentsPost(req, res) {
 }
 
 function resolveStorySuggestionMaxTokens(requested) {
-  const n = Number(requested);
-  if (!Number.isFinite(n) || n <= 0) return 350;
-  return Math.min(2048, Math.max(220, Math.floor(n)));
+  return resolveStoryLlmMaxTokens(requested, DEEPSEEK_MODEL);
 }
 
 /** 스토리 beat 추천 재작성 — DeepSeek only. */
@@ -1366,8 +1431,11 @@ async function handleStorySuggestionsPost(req, res) {
       temperature,
       max_tokens,
       logTag: "story-suggestions",
+      systemPrompt: STORY_JSON_SYSTEM_PROMPT,
       jsonMode: false,
-      allowReasoning: false,
+      allowReasoning: true,
+      preferJson: true,
+      fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
     });
 
     if (!llmResult.ok) {
@@ -2804,10 +2872,7 @@ app.post("/api/story-chat", async (req, res) => {
       Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
         ? requestedTemperature
         : 0.82;
-    const max_tokens =
-      Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
-        ? Math.min(2048, Math.floor(requestedMaxTokens))
-        : 620;
+    const max_tokens = resolveStoryLlmMaxTokens(requestedMaxTokens, DEEPSEEK_MODEL);
 
     if (typeof promptRaw !== "string" || !promptRaw.trim()) {
       return res.status(400).json({ ok: false, error: "no prompt" });
@@ -2887,9 +2952,9 @@ app.post("/api/story-chat", async (req, res) => {
         temperature,
         max_tokens,
         logTag: "story-chat-stream",
-        // DeepSeek: json_object + stream → content delta 없음(empty reply).
+        systemPrompt: STORY_JSON_SYSTEM_PROMPT,
         jsonMode: false,
-        allowReasoning: false,
+        allowReasoning: true,
         onFirstToken: () => logTiming("first_token"),
         onDelta: (piece) => {
           writeSse(res, { type: "delta", text: piece });
@@ -2930,9 +2995,11 @@ app.post("/api/story-chat", async (req, res) => {
       temperature,
       max_tokens,
       logTag: "story-chat",
-      // DeepSeek json_object 모드에서 content가 비는 경우가 잦아 일반 JSON 출력으로 받는다.
+      systemPrompt: STORY_JSON_SYSTEM_PROMPT,
       jsonMode: false,
-      allowReasoning: false,
+      allowReasoning: true,
+      preferJson: true,
+      fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
     });
     logTiming("provider_completed");
 
