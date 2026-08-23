@@ -98,7 +98,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-sonnet5-suggest-haiku45";
+const SERVER_REV = "story-sonnet5-no-temperature";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -753,6 +753,40 @@ function anthropicErrorMessage(json) {
   return "";
 }
 
+function anthropicSupportsTemperature(modelStr) {
+  const model = (modelStr || "").trim().toLowerCase();
+  // Claude 5 세대(adaptive thinking) — temperature 파라미터 deprecated.
+  if (/claude-(sonnet|opus)-5(?:$|[-_])/.test(model)) return false;
+  return true;
+}
+
+function buildAnthropicMessagesBody({
+  model,
+  userPrompt,
+  systemPrompt,
+  temperature,
+  max_tokens,
+  stream = false,
+}) {
+  const body = {
+    model: (model || ANTHROPIC_MODEL).trim(),
+    max_tokens,
+    messages: [{ role: "user", content: userPrompt }],
+  };
+  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
+    body.system = systemPrompt.trim();
+  }
+  if (
+    typeof temperature === "number" &&
+    Number.isFinite(temperature) &&
+    anthropicSupportsTemperature(body.model)
+  ) {
+    body.temperature = temperature;
+  }
+  if (stream) body.stream = true;
+  return body;
+}
+
 /** Claude Messages API — story-chat·추천·실시간 댓글 공통. */
 async function callAnthropicCompletion({
   model,
@@ -776,15 +810,13 @@ async function callAnthropicCompletion({
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
-  const body = {
+  const body = buildAnthropicMessagesBody({
     model: modelId,
-    max_tokens,
+    userPrompt,
+    systemPrompt,
     temperature,
-    messages: [{ role: "user", content: userPrompt }],
-  };
-  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
-    body.system = systemPrompt.trim();
-  }
+    max_tokens,
+  });
 
   try {
     const response = await fetch(ANTHROPIC_MESSAGES_URL, {
@@ -878,16 +910,14 @@ async function callAnthropicCompletionStream({
     };
   }
 
-  const body = {
+  const body = buildAnthropicMessagesBody({
     model: modelId,
-    max_tokens,
+    userPrompt,
+    systemPrompt,
     temperature,
+    max_tokens,
     stream: true,
-    messages: [{ role: "user", content: userPrompt }],
-  };
-  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
-    body.system = systemPrompt.trim();
-  }
+  });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
