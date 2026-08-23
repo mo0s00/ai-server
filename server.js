@@ -10,6 +10,13 @@ const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-5.4-nano").trim();
 
+const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
+const ANTHROPIC_MODEL = (
+  process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
+).trim();
+const ANTHROPIC_VERSION = "2023-06-01";
+
 /** 스토리 대사·추천·댓글 LLM — DeepSeek (TTS·이미지 생성은 OpenAI 유지). */
 const DEEPSEEK_CHAT_URL = (
   process.env.DEEPSEEK_CHAT_URL || "https://api.deepseek.com/v1/chat/completions"
@@ -30,6 +37,10 @@ function resolveDeepSeekConfig() {
 
 function isDeepSeekConfigured() {
   return !!DEEPSEEK_API_KEY;
+}
+
+function isAnthropicConfigured() {
+  return !!ANTHROPIC_API_KEY;
 }
 
 function logDeepSeekNotConfigured(logTag) {
@@ -76,7 +87,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-v4-reasoning-v2";
+const SERVER_REV = "live-comments-claude-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -166,6 +177,9 @@ function buildHealthPayload() {
   return {
     ok: true,
     openaiConfigured: !!OPENAI_API_KEY,
+    anthropicConfigured: isAnthropicConfigured(),
+    liveCommentProvider: isAnthropicConfigured() ? "anthropic" : "openai",
+    liveCommentModel: isAnthropicConfigured() ? ANTHROPIC_MODEL : OPENAI_MODEL,
     deepseekConfigured: isDeepSeekConfigured(),
     chatLlmProvider: chatLlm?.provider || "none",
     chatLlmModel: chatLlm?.model || "",
@@ -667,7 +681,98 @@ async function callOpenAiCompletion({
   };
 }
 
-/** 실시간 댓글은 대사·추천용 DeepSeek와 분리해 OpenAI의 빠른 소형 모델로 처리한다. */
+function anthropicTextFromResponse(json) {
+  const blocks = Array.isArray(json?.content) ? json.content : [];
+  for (const block of blocks) {
+    if (block?.type === "text" && typeof block.text === "string") {
+      const t = block.text.trim();
+      if (t) return t;
+    }
+  }
+  return "";
+}
+
+function anthropicErrorMessage(json) {
+  if (!json || typeof json !== "object") return "";
+  const err = json.error;
+  if (typeof err === "string" && err.trim()) return err.trim();
+  if (err && typeof err.message === "string" && err.message.trim()) {
+    return err.message.trim();
+  }
+  return "";
+}
+
+/** 실시간 댓글 — Claude(Haiku 등). DeepSeek·스토리 대사 큐와 분리. */
+async function callAnthropicLiveCommentCompletion({
+  userPrompt,
+  temperature,
+  max_tokens,
+  logTag,
+}) {
+  if (!ANTHROPIC_API_KEY) {
+    return {
+      ok: false,
+      status: 503,
+      errorText: "Anthropic is not configured",
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(ANTHROPIC_MESSAGES_URL, {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens,
+        temperature,
+        system: "Reply with ONE valid JSON object only. No markdown fences or extra text.",
+        messages: [{ role: "user", content: userPrompt }],
+      }),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    let json = {};
+    try {
+      json = raw ? JSON.parse(raw) : {};
+    } catch (_) {
+      return { ok: false, status: 502, errorText: "Anthropic 응답 해석 실패" };
+    }
+    if (!response.ok) {
+      console.log(
+        `[${logTag}] Anthropic HTTP ${response.status} model=${ANTHROPIC_MODEL}`,
+      );
+      return {
+        ok: false,
+        status: response.status >= 500 ? 502 : response.status,
+        errorText: anthropicErrorMessage(json) || "Anthropic 요청 실패",
+      };
+    }
+    const text = anthropicTextFromResponse(json);
+    if (!text) {
+      return { ok: false, status: 502, errorText: "Anthropic 빈 응답" };
+    }
+    console.log(`[${logTag}] provider=anthropic model=${ANTHROPIC_MODEL}`);
+    return { ok: true, model: ANTHROPIC_MODEL, text };
+  } catch (error) {
+    const timeout = error?.name === "AbortError";
+    console.error(`[${logTag}] Anthropic error:`, error?.message || error);
+    return {
+      ok: false,
+      status: timeout ? 504 : 502,
+      errorText: timeout ? "Anthropic 요청 시간 초과" : "Anthropic 연결 실패",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Anthropic 미설정 시 로컬/Render dev용 OpenAI fallback. */
 async function callOpenAiLiveCommentCompletion({
   userPrompt,
   temperature,
@@ -1354,19 +1459,22 @@ async function handleAiCommentPost(req, res) {
   }
 }
 
-/** 스토리·채팅의 관중 댓글 전용 — 메인 대사/추천과 다른 OpenAI 큐를 쓴다. */
+/** 스토리·채팅의 관중 댓글 전용 — Claude(우선) 또는 OpenAI fallback. */
 async function handleLiveCommentsPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
   const prompt = readString(req.body, "prompt");
   if (!prompt) {
     return res.status(400).json({ text: "prompt 필드가 필요합니다." });
   }
-  const result = await callOpenAiLiveCommentCompletion({
+  const liveCommentArgs = {
     userPrompt: prompt.slice(0, MAX_PROMPT_CHARS),
     temperature: 1,
     max_tokens: 240,
     logTag: "live-comments",
-  });
+  };
+  const result = isAnthropicConfigured()
+    ? await callAnthropicLiveCommentCompletion(liveCommentArgs)
+    : await callOpenAiLiveCommentCompletion(liveCommentArgs);
   if (!result.ok) {
     return res
       .status(result.status || 502)
@@ -5079,6 +5187,15 @@ if (!isDeepSeekConfigured()) {
 console.log(
   `[ai-server] openaiConfigured=${!!OPENAI_API_KEY} (TTS/image only)`,
 );
+if (isAnthropicConfigured()) {
+  console.log(
+    `[live-comments] provider=anthropic model=${ANTHROPIC_MODEL}`,
+  );
+} else {
+  console.log(
+    `[live-comments] provider=openai model=${OPENAI_MODEL} (set ANTHROPIC_API_KEY to use Claude)`,
+  );
+}
 
 try {
   const server = app.listen(PORT, "0.0.0.0", () => {
