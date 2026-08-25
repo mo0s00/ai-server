@@ -11,6 +11,7 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-5.4-nano").trim();
 
 const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_COUNT_TOKENS_URL = "https://api.anthropic.com/v1/messages/count_tokens";
 const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 const ANTHROPIC_MODEL = (
   process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
@@ -107,7 +108,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "llm-routing-v4";
+const SERVER_REV = "prompt-token-audit-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -847,6 +848,124 @@ function buildAnthropicMessagesBody({
   }
   if (stream) body.stream = true;
   return body;
+}
+
+/** story-chat Prompt Caching 사전 실측 — Anthropic count_tokens (cache_control 없음). */
+const _promptAuditPrevByNode = new Map();
+
+async function countAnthropicInputTokens({ model, system, userContent }) {
+  if (!ANTHROPIC_API_KEY) return null;
+  const body = {
+    model: (model || STORY_CHAT_ANTHROPIC_MODEL).trim(),
+    messages: [{ role: "user", content: typeof userContent === "string" ? userContent : "" }],
+  };
+  if (typeof system === "string" && system.trim()) {
+    body.system = system.trim();
+  }
+  try {
+    const response = await fetch(ANTHROPIC_COUNT_TOKENS_URL, {
+      method: "POST",
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify(body),
+    });
+    const raw = await response.text();
+    let json = {};
+    try {
+      json = raw ? JSON.parse(raw) : {};
+    } catch (_) {
+      console.error("[promptTokenAudit] count_tokens parse failed");
+      return null;
+    }
+    if (!response.ok) {
+      console.error(
+        "[promptTokenAudit] count_tokens http",
+        response.status,
+        json?.error?.message || raw.slice(0, 200),
+      );
+      return null;
+    }
+    return typeof json.input_tokens === "number" ? json.input_tokens : null;
+  } catch (e) {
+    console.error("[promptTokenAudit] count_tokens error", e?.message || e);
+    return null;
+  }
+}
+
+function buildStoryChatCacheablePrefix(staticEngine, nodeStatic) {
+  const a = (staticEngine || "").trim();
+  const b = (nodeStatic || "").trim();
+  if (!a) return b;
+  if (!b) return a;
+  return `${a}\n\n${b}`;
+}
+
+function buildStoryChatDynamicContextBlock(dynamicContext) {
+  const d = (dynamicContext || "").trim();
+  if (!d) return "";
+  return `[엔진 story_context]\n${d}`;
+}
+
+async function auditStoryChatPromptTokens({
+  model,
+  anthropicSystem,
+  staticEngine,
+  nodeStatic,
+  dynamicContext,
+  fullUserPrompt,
+  nodeId,
+  storyId,
+}) {
+  const cacheablePrefix = buildStoryChatCacheablePrefix(staticEngine, nodeStatic);
+  const dynamicBlock = buildStoryChatDynamicContextBlock(dynamicContext);
+
+  const [
+    anthropicSystemTokens,
+    staticEngineTokens,
+    nodeStaticTokens,
+    dynamicContextTokens,
+    fullInputTokens,
+    cacheablePrefixTokens,
+  ] = await Promise.all([
+    countAnthropicInputTokens({
+      model,
+      system: anthropicSystem,
+      userContent: "",
+    }),
+    countAnthropicInputTokens({ model, userContent: (staticEngine || "").trim() }),
+    countAnthropicInputTokens({ model, userContent: (nodeStatic || "").trim() }),
+    countAnthropicInputTokens({ model, userContent: dynamicBlock }),
+    countAnthropicInputTokens({
+      model,
+      system: anthropicSystem,
+      userContent: (fullUserPrompt || "").trim(),
+    }),
+    countAnthropicInputTokens({ model, userContent: cacheablePrefix }),
+  ]);
+
+  const auditKey = `${storyId || "(none)"}|${nodeId || "(none)"}`;
+  const prev = _promptAuditPrevByNode.get(auditKey);
+  const cacheablePrefixSame =
+    prev != null && prev.cacheablePrefix === cacheablePrefix;
+  _promptAuditPrevByNode.set(auditKey, {
+    cacheablePrefix,
+    at: Date.now(),
+  });
+
+  console.log("[promptTokenAudit]");
+  console.log(`anthropicSystemTokens=${anthropicSystemTokens ?? "?"}`);
+  console.log(`staticEngineTokens=${staticEngineTokens ?? "?"}`);
+  console.log(`nodeStaticTokens=${nodeStaticTokens ?? "?"}`);
+  console.log(`dynamicContextTokens=${dynamicContextTokens ?? "?"}`);
+  console.log(`fullInputTokens=${fullInputTokens ?? "?"}`);
+  console.log(`cacheablePrefixTokens=${cacheablePrefixTokens ?? "?"}`);
+  console.log(`cacheablePrefixSame=${cacheablePrefixSame}`);
+  if (nodeId) {
+    console.log(`nodeId=${nodeId}`);
+  }
 }
 
 function normalizeAnthropicStoryReply(text) {
@@ -3430,8 +3549,30 @@ app.post("/api/story-chat", async (req, res) => {
     }
     logTiming("prompt_ready");
 
-    const sceneContext = storyContext || cleanedPrompt;
+    const auditRaw = req.body && req.body.prompt_token_audit;
     const storyId = readString(req.body, "story_id");
+    if (auditRaw && typeof auditRaw === "object") {
+      const auditStaticEngine = readString(auditRaw, "static_engine");
+      const auditNodeStatic = readString(auditRaw, "node_static");
+      const auditDynamicContext = readString(auditRaw, "dynamic_context");
+      const auditNodeId = readString(auditRaw, "node_id");
+      if (auditStaticEngine || auditNodeStatic || auditDynamicContext) {
+        logTiming("token_audit_start");
+        await auditStoryChatPromptTokens({
+          model: STORY_CHAT_ANTHROPIC_MODEL,
+          anthropicSystem: STORY_JSON_SYSTEM_PROMPT,
+          staticEngine: auditStaticEngine,
+          nodeStatic: auditNodeStatic,
+          dynamicContext: auditDynamicContext,
+          fullUserPrompt: cleanedPrompt,
+          nodeId: auditNodeId,
+          storyId,
+        });
+        logTiming("token_audit_done");
+      }
+    }
+
+    const sceneContext = storyContext || cleanedPrompt;
     const programId = readString(req.body, "program_id");
     const beatScene = readString(req.body, "beat_scene");
 
