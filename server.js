@@ -955,6 +955,17 @@ async function auditStoryChatPromptTokens({
     at: Date.now(),
   });
 
+  const result = {
+    anthropicSystemTokens,
+    staticEngineTokens,
+    nodeStaticTokens,
+    dynamicContextTokens,
+    fullInputTokens,
+    cacheablePrefixTokens,
+    cacheablePrefixSame,
+    nodeId: nodeId || "",
+  };
+
   console.log("[promptTokenAudit]");
   console.log(`anthropicSystemTokens=${anthropicSystemTokens ?? "?"}`);
   console.log(`staticEngineTokens=${staticEngineTokens ?? "?"}`);
@@ -966,6 +977,7 @@ async function auditStoryChatPromptTokens({
   if (nodeId) {
     console.log(`nodeId=${nodeId}`);
   }
+  return result;
 }
 
 function normalizeAnthropicStoryReply(text) {
@@ -3551,6 +3563,7 @@ app.post("/api/story-chat", async (req, res) => {
 
     const auditRaw = req.body && req.body.prompt_token_audit;
     const storyId = readString(req.body, "story_id");
+    let promptTokenAuditResult = null;
     if (auditRaw && typeof auditRaw === "object") {
       const auditStaticEngine = readString(auditRaw, "static_engine");
       const auditNodeStatic = readString(auditRaw, "node_static");
@@ -3558,7 +3571,7 @@ app.post("/api/story-chat", async (req, res) => {
       const auditNodeId = readString(auditRaw, "node_id");
       if (auditStaticEngine || auditNodeStatic || auditDynamicContext) {
         logTiming("token_audit_start");
-        await auditStoryChatPromptTokens({
+        promptTokenAuditResult = await auditStoryChatPromptTokens({
           model: STORY_CHAT_ANTHROPIC_MODEL,
           anthropicSystem: STORY_JSON_SYSTEM_PROMPT,
           staticEngine: auditStaticEngine,
@@ -3669,6 +3682,7 @@ app.post("/api/story-chat", async (req, res) => {
         preload: sceneData.preload,
         scene_source: sceneData.source,
         raw: llmResult.raw,
+        ...(promptTokenAuditResult ? { prompt_token_audit: promptTokenAuditResult } : {}),
       });
       res.end();
       return;
@@ -3781,6 +3795,7 @@ app.post("/api/story-chat", async (req, res) => {
       preload: sceneData.preload,
       scene_source: sceneData.source,
       raw: upstreamRaw,
+      ...(promptTokenAuditResult ? { prompt_token_audit: promptTokenAuditResult } : {}),
     });
   } catch (e) {
     console.error("[story-chat server error]", e);
