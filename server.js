@@ -107,7 +107,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "llm-routing-v3";
+const SERVER_REV = "llm-routing-v4";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -812,7 +812,8 @@ function anthropicErrorMessage(json) {
 
 function anthropicSupportsTemperature(modelStr) {
   const model = (modelStr || "").trim().toLowerCase();
-  // Claude 5 세대(adaptive thinking) — temperature 파라미터 deprecated.
+  // Opus 4.7+, Sonnet/Opus 5 — Messages API에서 temperature deprecated.
+  if (/claude-opus-4-7(?:$|[-_])/.test(model)) return false;
   if (/claude-(sonnet|opus)-5(?:$|[-_])/.test(model)) return false;
   return true;
 }
