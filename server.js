@@ -108,7 +108,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "prompt-token-audit-v1";
+const SERVER_REV = "prompt-cache-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -493,12 +493,16 @@ function anthropicRetryMaxTokens(currentMax, { empty = false, truncated = false 
 function logAnthropicUsage({ logTag, modelId, max_tokens, text, raw, attempt = 0 }) {
   const usage = raw?.usage || {};
   const thinkingTokens = usage?.output_tokens_details?.thinking_tokens;
+  const cacheRead = usage.cache_read_input_tokens ?? 0;
+  const cacheCreate = usage.cache_creation_input_tokens ?? 0;
   console.log(
     `[${logTag}] anthropic usage model=${modelId} attempt=${attempt} ` +
       `max_tokens=${max_tokens} ` +
       `input_tokens=${usage.input_tokens ?? "?"} ` +
       `output_tokens=${usage.output_tokens ?? "?"} ` +
       `thinking_tokens=${thinkingTokens ?? "?"} ` +
+      `cache_read_input_tokens=${cacheRead} ` +
+      `cache_creation_input_tokens=${cacheCreate} ` +
       `replyLen=${(text || "").length}`,
   );
 }
@@ -819,6 +823,41 @@ function anthropicSupportsTemperature(modelStr) {
   return true;
 }
 
+/** story-chat Prompt Caching — Anthropic ephemeral prefix (2048+ tok). */
+const STORY_CHAT_PROMPT_CACHE_ENABLED = process.env.STORY_CHAT_PROMPT_CACHE !== "false";
+
+function readStoryChatPromptSegments(body) {
+  const raw =
+    (body && body.prompt_segments) || (body && body.prompt_token_audit);
+  if (!raw || typeof raw !== "object") return null;
+  const staticEngine = readString(raw, "static_engine");
+  const nodeStatic = readString(raw, "node_static");
+  const dynamicContext = readString(raw, "dynamic_context");
+  const nodeId = readString(raw, "node_id");
+  if (!staticEngine && !nodeStatic && !dynamicContext) return null;
+  return { staticEngine, nodeStatic, dynamicContext, nodeId };
+}
+
+function buildStoryChatAnthropicUserContent({
+  staticEngine,
+  nodeStatic,
+  dynamicContext,
+  fullUserPrompt,
+}) {
+  const prefix = buildStoryChatCacheablePrefix(staticEngine, nodeStatic);
+  if (!STORY_CHAT_PROMPT_CACHE_ENABLED || !prefix.trim()) {
+    return { content: fullUserPrompt, cached: false };
+  }
+  const dynamicBlock = buildStoryChatDynamicContextBlock(dynamicContext);
+  const blocks = [
+    { type: "text", text: prefix, cache_control: { type: "ephemeral" } },
+  ];
+  if (dynamicBlock.trim()) {
+    blocks.push({ type: "text", text: `\n\n${dynamicBlock}` });
+  }
+  return { content: blocks, cached: true };
+}
+
 function buildAnthropicMessagesBody({
   model,
   userPrompt,
@@ -827,11 +866,25 @@ function buildAnthropicMessagesBody({
   max_tokens,
   stream = false,
   disableThinking = false,
+  promptSegments = null,
 }) {
+  let messageContent = userPrompt;
+  if (promptSegments) {
+    const built = buildStoryChatAnthropicUserContent({
+      staticEngine: promptSegments.staticEngine,
+      nodeStatic: promptSegments.nodeStatic,
+      dynamicContext: promptSegments.dynamicContext,
+      fullUserPrompt: userPrompt,
+    });
+    messageContent = built.content;
+    if (built.cached) {
+      console.log("[story-chat] prompt_cache prefix=ephemeral");
+    }
+  }
   const body = {
     model: (model || ANTHROPIC_MODEL).trim(),
     max_tokens,
-    messages: [{ role: "user", content: userPrompt }],
+    messages: [{ role: "user", content: messageContent }],
   };
   if (typeof systemPrompt === "string" && systemPrompt.trim()) {
     body.system = systemPrompt.trim();
@@ -855,9 +908,13 @@ const _promptAuditPrevByNode = new Map();
 
 async function countAnthropicInputTokens({ model, system, userContent }) {
   if (!ANTHROPIC_API_KEY) return null;
+  const userText =
+    typeof userContent === "string" && userContent.trim()
+      ? userContent.trim()
+      : ".";
   const body = {
     model: (model || STORY_CHAT_ANTHROPIC_MODEL).trim(),
-    messages: [{ role: "user", content: typeof userContent === "string" ? userContent : "" }],
+    messages: [{ role: "user", content: userText }],
   };
   if (typeof system === "string" && system.trim()) {
     body.system = system.trim();
@@ -999,6 +1056,7 @@ async function callAnthropicCompletion({
   fetchTimeoutMs = STORY_LLM_TIMEOUT_MS,
   _attempt = 0,
   disableThinking = false,
+  promptSegments = null,
 }) {
   const modelId = (model || ANTHROPIC_MODEL).trim();
   if (!ANTHROPIC_API_KEY) {
@@ -1020,6 +1078,7 @@ async function callAnthropicCompletion({
     temperature,
     max_tokens,
     disableThinking,
+    promptSegments,
   });
 
   try {
@@ -1065,6 +1124,7 @@ async function callAnthropicCompletion({
           fetchTimeoutMs,
           _attempt: 1,
           disableThinking,
+          promptSegments,
         });
       }
       return {
@@ -1102,6 +1162,7 @@ async function callAnthropicCompletion({
           fetchTimeoutMs,
           _attempt: 1,
           disableThinking,
+          promptSegments,
         });
       }
       return {
@@ -1158,6 +1219,7 @@ async function callAnthropicCompletionStream({
   onFirstToken,
   fetchTimeoutMs = STORY_LLM_TIMEOUT_MS,
   disableThinking = false,
+  promptSegments = null,
   _attempt = 0,
 }) {
   const modelId = (model || STORY_CHAT_ANTHROPIC_MODEL).trim();
@@ -1177,6 +1239,7 @@ async function callAnthropicCompletionStream({
     max_tokens,
     stream: true,
     disableThinking,
+    promptSegments,
   });
 
   const controller = new AbortController();
@@ -1283,6 +1346,8 @@ async function callAnthropicCompletionStream({
         onDelta,
         onFirstToken,
         fetchTimeoutMs,
+        disableThinking,
+        promptSegments,
         _attempt: 1,
       });
     }
@@ -3561,14 +3626,23 @@ app.post("/api/story-chat", async (req, res) => {
     }
     logTiming("prompt_ready");
 
+    const promptSegments = readStoryChatPromptSegments(req.body);
     const auditRaw = req.body && req.body.prompt_token_audit;
     const storyId = readString(req.body, "story_id");
     let promptTokenAuditResult = null;
     if (auditRaw && typeof auditRaw === "object") {
-      const auditStaticEngine = readString(auditRaw, "static_engine");
-      const auditNodeStatic = readString(auditRaw, "node_static");
-      const auditDynamicContext = readString(auditRaw, "dynamic_context");
-      const auditNodeId = readString(auditRaw, "node_id");
+      const auditStaticEngine =
+        readString(auditRaw, "static_engine") ||
+        (promptSegments ? promptSegments.staticEngine : "");
+      const auditNodeStatic =
+        readString(auditRaw, "node_static") ||
+        (promptSegments ? promptSegments.nodeStatic : "");
+      const auditDynamicContext =
+        readString(auditRaw, "dynamic_context") ||
+        (promptSegments ? promptSegments.dynamicContext : "");
+      const auditNodeId =
+        readString(auditRaw, "node_id") ||
+        (promptSegments ? promptSegments.nodeId : "");
       if (auditStaticEngine || auditNodeStatic || auditDynamicContext) {
         logTiming("token_audit_start");
         promptTokenAuditResult = await auditStoryChatPromptTokens({
@@ -3650,6 +3724,7 @@ app.post("/api/story-chat", async (req, res) => {
         max_tokens,
         logTag: "story-chat-stream",
         systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+        promptSegments,
         onFirstToken: () => logTiming("first_token"),
         onDelta: (piece) => {
           writeSse(res, { type: "delta", text: piece });
@@ -3697,6 +3772,7 @@ app.post("/api/story-chat", async (req, res) => {
       logTag: "story-chat",
       fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
       disableThinking: true,
+      promptSegments,
     });
     logTiming("provider_completed");
 
@@ -3720,6 +3796,7 @@ app.post("/api/story-chat", async (req, res) => {
         fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
         _attempt: 1,
         disableThinking: true,
+        promptSegments,
       });
       logTiming("provider_json_retry_completed");
     }
