@@ -16,9 +16,9 @@ const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 const ANTHROPIC_MODEL = (
   process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
-/** 스토리 본문 대사·나레이션 — Claude Opus 4.7 */
+/** 스토리 본문 대사·나레이션 — Claude Haiku 4.5 */
 const STORY_CHAT_ANTHROPIC_MODEL = (
-  process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-opus-4-7"
+  process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
 /** 플레이어 추천문 2~3개 — Claude Opus 4.6 */
 const STORY_SUGGESTION_ANTHROPIC_MODEL = (
