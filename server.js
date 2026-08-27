@@ -112,7 +112,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-story-v4";
+const SERVER_REV = "parallel-story-v5";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -2246,19 +2246,24 @@ function validateParallelStoryResponse(rawText, metadata = null) {
     ? raw.entries
     : Array.isArray(raw.messages)
       ? raw.messages
-      : null;
+      : Array.isArray(raw.lines)
+        ? raw.lines
+        : null;
   if (!rawEntries || rawEntries.length < 1) return null;
 
   const entries = [];
   for (const entry of rawEntries.slice(0, 4)) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    const text = limitedString(entry.text ?? entry.content, 800);
+    const text = limitedString(
+      entry.text ?? entry.content ?? entry.body ?? entry.line ?? entry.dialogue,
+      800,
+    );
     if (!text) continue;
     let speaker = "";
-    if (entry.speaker != null && String(entry.speaker).trim()) {
-      const parsedSpeaker = limitedString(entry.speaker, 120);
-      if (parsedSpeaker === null) continue;
-      speaker = parsedSpeaker;
+    const rawSpeaker = entry.speaker ?? entry.name ?? entry.character ?? entry.role;
+    if (rawSpeaker != null && String(rawSpeaker).trim()) {
+      const parsedSpeaker = limitedString(String(rawSpeaker), 120);
+      speaker = parsedSpeaker || String(rawSpeaker).trim().slice(0, 120);
     }
     entries.push({ speaker, text });
   }
@@ -2282,6 +2287,8 @@ function validateParallelStoryResponse(rawText, metadata = null) {
       if (value) statePatch[key] = value;
     }
     if (!Object.keys(statePatch).length) statePatch = undefined;
+  } else if (raw.statePatch === null) {
+    statePatch = undefined;
   }
   return { show: true, worldTime, place, entries, ...(statePatch ? { statePatch } : {}) };
 }
@@ -2313,7 +2320,7 @@ async function handleParallelStoryPost(req, res) {
     userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
     systemPrompt: "Return only the requested JSON object. Never add markdown.",
     temperature: 0.78,
-    max_tokens: 520,
+    max_tokens: 720,
     model: PARALLEL_STORY_DEEPSEEK_MODEL,
     logTag: "parallel-story",
     jsonMode: true,
@@ -2333,7 +2340,7 @@ async function handleParallelStoryPost(req, res) {
       userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
       systemPrompt: "Return only the requested JSON object. Never add markdown.",
       temperature: 0.78,
-      max_tokens: 520,
+      max_tokens: 720,
       model: PARALLEL_STORY_DEEPSEEK_MODEL,
       logTag: "parallel-story-retry",
       jsonMode: false,
@@ -2345,7 +2352,7 @@ async function handleParallelStoryPost(req, res) {
   }
   if (!validated) {
     console.warn(
-      `[parallel-story] rejected invalid SIDE response rawLen=${(result.text || "").length}`,
+      `[parallel-story] rejected invalid SIDE response rawLen=${(result.text || "").length} preview=${String(result.text || "").slice(0, 240)}`,
     );
     return res.status(502).json({ text: "SIDE 응답 형식이 올바르지 않습니다." });
   }
