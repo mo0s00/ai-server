@@ -112,7 +112,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "prompt-cache-v1";
+const SERVER_REV = "parallel-story-v2";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -2144,18 +2144,19 @@ function parseParallelStoryMetadata(body) {
   const canonicalState = raw.canonicalState;
   if (!nodeId || !impact || typeof impact !== "object" || Array.isArray(impact)) return null;
   if (!canonicalState || typeof canonicalState !== "object" || Array.isArray(canonicalState)) return null;
-  if (Object.keys(impact).some((key) => !["parallelId", "place", "trigger", "eventId", "characters", "delayMinutes"].includes(key))) {
+  if (Object.keys(impact).some((key) => !["parallelId", "place", "trigger", "eventId", "direction", "characters", "delayMinutes"].includes(key))) {
     return null;
   }
   const parallelId = limitedString(impact.parallelId, 120);
   const place = limitedString(impact.place);
   const trigger = limitedString(impact.trigger, 120);
-  if (!parallelId || !place || !trigger || !(trigger === "node_enter" || /^reveal:[\w.-]+$/.test(trigger))) {
+  if (!parallelId || !place || !trigger || !(trigger === "node_enter" || trigger === "confirmed_event" || /^reveal:[\w.-]+$/.test(trigger))) {
     return null;
   }
   const eventId = impact.eventId == null ? "" : limitedString(impact.eventId, 120);
+  const direction = impact.direction == null ? "" : limitedString(impact.direction, 480);
   const characters = impact.characters == null ? [] : limitedStringList(impact.characters, 16, 120);
-  if (eventId === null || characters === null) return null;
+  if (eventId === null || direction === null || characters === null) return null;
   if (Object.keys(canonicalState).some((key) => !["currentPlace", "worldTime", "facts", "unresolvedThreads"].includes(key))) {
     return null;
   }
@@ -2168,7 +2169,7 @@ function parseParallelStoryMetadata(body) {
   }
   return {
     nodeId,
-    impact: { parallelId, place, trigger, eventId, characters },
+    impact: { parallelId, place, trigger, eventId, direction, characters },
     canonicalState: {
       currentPlace: currentPlace || "",
       worldTime: worldTime || "",
