@@ -44,6 +44,10 @@ const DEEPSEEK_CHAT_URL = (
 ).trim();
 const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || "").trim();
 const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
+/** 「한편…」 동시 진행 전용 — 메인 Claude와 비용·역할을 분리한다. */
+const PARALLEL_STORY_DEEPSEEK_MODEL = (
+  process.env.PARALLEL_STORY_DEEPSEEK_MODEL || DEEPSEEK_MODEL
+).trim();
 
 /** @returns {{ provider: string, url: string, apiKey: string, model: string } | null} */
 function resolveDeepSeekConfig() {
@@ -609,6 +613,7 @@ async function callOpenAiCompletion({
   userPrompt,
   temperature,
   max_tokens,
+  model,
   logTag,
   systemPrompt,
   jsonMode = false,
@@ -628,6 +633,8 @@ async function callOpenAiCompletion({
       skipped: true,
     };
   }
+  const effectiveModel =
+    typeof model === "string" && model.trim() ? model.trim() : llm.model;
 
   const messages = [];
   if (typeof systemPrompt === "string" && systemPrompt.trim()) {
@@ -638,9 +645,9 @@ async function callOpenAiCompletion({
   let payload;
   try {
     payload = JSON.stringify({
-      model: llm.model,
+      model: effectiveModel,
       temperature,
-      ...chatCompletionTokenLimit(max_tokens, llm.model),
+      ...chatCompletionTokenLimit(max_tokens, effectiveModel),
       messages,
       ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     });
@@ -706,7 +713,7 @@ async function callOpenAiCompletion({
     const apiMsg = openAiErrorMessage(json) || "LLM 요청에 실패했습니다.";
     const statusOut = oaiRes.status >= 500 ? 502 : oaiRes.status;
     console.log(
-      `[${logTag}] ${llm.provider} HTTP ${oaiRes.status} model=${llm.model}`,
+      `[${logTag}] ${llm.provider} HTTP ${oaiRes.status} model=${effectiveModel}`,
     );
     return {
       ok: false,
@@ -731,12 +738,12 @@ async function callOpenAiCompletion({
         ? msgObj.reasoning_content.length
         : 0;
     console.log(
-      `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model} ` +
+      `[${logTag}] No assistant content provider=${llm.provider} model=${effectiveModel} ` +
         `attempt=${_attempt} finish_reason=${finishReason} reasoningLen=${reasoningLength}`,
     );
     if (_attempt === 0) {
       // v4/reasoning 모델은 추론 토큰만 먼저 소진해 content가 비는 경우가 있다.
-      const retryFloor = isReasoningHeavyDeepSeekModel(llm.model) ? 4096 : 2048;
+      const retryFloor = isReasoningHeavyDeepSeekModel(effectiveModel) ? 4096 : 2048;
       const retryMaxTokens = Math.max(max_tokens, retryFloor);
       if (jsonMode) {
         console.log(
@@ -746,6 +753,7 @@ async function callOpenAiCompletion({
           userPrompt,
           temperature,
           max_tokens: retryMaxTokens,
+          model: effectiveModel,
           logTag,
           systemPrompt,
           jsonMode: false,
@@ -762,6 +770,7 @@ async function callOpenAiCompletion({
         userPrompt,
         temperature,
         max_tokens: retryMaxTokens,
+        model: effectiveModel,
         logTag,
         systemPrompt,
         jsonMode,
@@ -784,7 +793,7 @@ async function callOpenAiCompletion({
     };
   }
 
-  console.log(`[${logTag}] provider=${llm.provider} model=${llm.model}`);
+  console.log(`[${logTag}] provider=${llm.provider} model=${effectiveModel}`);
   return {
     ok: true,
     provider: llm.provider,
@@ -2098,6 +2107,172 @@ async function handleLiveCommentsPost(req, res) {
   return res.json({ text: result.text });
 }
 
+const PARALLEL_PATCH_KEYS = new Set([
+  "currentPlace",
+  "worldTime",
+  "factsAdd",
+  "unresolvedThreadsAdd",
+  "unresolvedThreadsResolve",
+]);
+
+function limitedString(value, max = 240) {
+  return typeof value === "string" && value.trim() && value.trim().length <= max
+    ? value.trim()
+    : null;
+}
+
+function limitedStringList(value, maxItems = 12, maxLength = 240) {
+  if (!Array.isArray(value) || value.length > maxItems) return null;
+  const items = [];
+  for (const item of value) {
+    const text = limitedString(item, maxLength);
+    if (!text) return null;
+    items.push(text);
+  }
+  return items;
+}
+
+/** 클라이언트가 보낸 노드 엔진 메타데이터의 수동 스키마/허용목록 검증. */
+function parseParallelStoryMetadata(body) {
+  const raw = body && body.parallelStory;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (Object.keys(raw).some((key) => !["nodeId", "impact", "canonicalState"].includes(key))) {
+    return null;
+  }
+  const nodeId = limitedString(raw.nodeId, 120);
+  const impact = raw.impact;
+  const canonicalState = raw.canonicalState;
+  if (!nodeId || !impact || typeof impact !== "object" || Array.isArray(impact)) return null;
+  if (!canonicalState || typeof canonicalState !== "object" || Array.isArray(canonicalState)) return null;
+  if (Object.keys(impact).some((key) => !["parallelId", "place", "trigger", "eventId", "characters", "delayMinutes"].includes(key))) {
+    return null;
+  }
+  const parallelId = limitedString(impact.parallelId, 120);
+  const place = limitedString(impact.place);
+  const trigger = limitedString(impact.trigger, 120);
+  if (!parallelId || !place || !trigger || !(trigger === "node_enter" || /^reveal:[\w.-]+$/.test(trigger))) {
+    return null;
+  }
+  const eventId = impact.eventId == null ? "" : limitedString(impact.eventId, 120);
+  const characters = impact.characters == null ? [] : limitedStringList(impact.characters, 16, 120);
+  if (eventId === null || characters === null) return null;
+  if (Object.keys(canonicalState).some((key) => !["currentPlace", "worldTime", "facts", "unresolvedThreads"].includes(key))) {
+    return null;
+  }
+  const currentPlace = limitedString(canonicalState.currentPlace || "", 240);
+  const worldTime = limitedString(canonicalState.worldTime || "", 120);
+  const facts = limitedStringList(canonicalState.facts || [], 64, 240);
+  const unresolvedThreads = limitedStringList(canonicalState.unresolvedThreads || [], 64, 240);
+  if ((canonicalState.currentPlace && !currentPlace) || (canonicalState.worldTime && !worldTime) || !facts || !unresolvedThreads) {
+    return null;
+  }
+  return {
+    nodeId,
+    impact: { parallelId, place, trigger, eventId, characters },
+    canonicalState: {
+      currentPlace: currentPlace || "",
+      worldTime: worldTime || "",
+      facts,
+      unresolvedThreads,
+    },
+  };
+}
+
+/** 모델 응답은 SIDE 상태만 바꿀 수 있도록 응답 스키마를 재검증·정규화한다. */
+function validateParallelStoryResponse(rawText) {
+  const objectText = extractJsonObjectFromText(rawText);
+  if (!objectText) return null;
+  let raw;
+  try {
+    raw = JSON.parse(objectText);
+  } catch (_) {
+    return null;
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (Object.keys(raw).some((key) => !["show", "worldTime", "place", "entries", "statePatch"].includes(key))) {
+    return null;
+  }
+  if (raw.show !== true) return null;
+  const worldTime = limitedString(raw.worldTime, 120);
+  const place = limitedString(raw.place);
+  if (!worldTime || !place || !Array.isArray(raw.entries) || raw.entries.length < 1 || raw.entries.length > 4) {
+    return null;
+  }
+  const entries = [];
+  for (const entry of raw.entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.keys(entry).some((key) => !["speaker", "text"].includes(key))) return null;
+    const text = limitedString(entry.text, 800);
+    const speaker = entry.speaker == null ? "" : limitedString(entry.speaker, 120);
+    if (!text || speaker === null) return null;
+    entries.push({ speaker, text });
+  }
+  let statePatch;
+  if (raw.statePatch !== undefined) {
+    if (!raw.statePatch || typeof raw.statePatch !== "object" || Array.isArray(raw.statePatch) ||
+      Object.keys(raw.statePatch).some((key) => !PARALLEL_PATCH_KEYS.has(key))) return null;
+    statePatch = {};
+    for (const key of ["currentPlace", "worldTime"]) {
+      if (raw.statePatch[key] === undefined) continue;
+      const value = limitedString(raw.statePatch[key], key === "worldTime" ? 120 : 240);
+      if (!value) return null;
+      statePatch[key] = value;
+    }
+    for (const key of ["factsAdd", "unresolvedThreadsAdd", "unresolvedThreadsResolve"]) {
+      if (raw.statePatch[key] === undefined) continue;
+      const value = limitedStringList(raw.statePatch[key], 12, 240);
+      if (!value) return null;
+      statePatch[key] = value;
+    }
+  }
+  return { show: true, worldTime, place, entries, ...(statePatch ? { statePatch } : {}) };
+}
+
+/** 노드 엔진이 확정한 SIDE 영향이 있을 때만 DeepSeek로 별도 장소 시점을 생성한다. */
+async function handleParallelStoryPost(req, res) {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+  const promptRaw = req.body && req.body.prompt;
+  if (typeof promptRaw !== "string" || !promptRaw.trim()) {
+    return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+  }
+  const metadata = parseParallelStoryMetadata(req.body);
+  if (!metadata) {
+    return res.status(400).json({ text: "유효한 노드 엔진 SIDE 메타데이터가 필요합니다." });
+  }
+  if (!isDeepSeekConfigured()) {
+    return res.status(503).json({ text: "DeepSeek is not configured" });
+  }
+
+  const prompt = sanitizePromptForApi(promptRaw).slice(0, MAX_PROMPT_CHARS);
+  if (!prompt) {
+    return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+  }
+
+  console.log(
+    `[parallel-story] provider=deepseek model=${PARALLEL_STORY_DEEPSEEK_MODEL} promptLen=${prompt.length}`,
+  );
+  const result = await callOpenAiCompletion({
+    userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
+    systemPrompt: "Return only the requested JSON object. Never add markdown.",
+    temperature: 0.78,
+    max_tokens: 420,
+    model: PARALLEL_STORY_DEEPSEEK_MODEL,
+    logTag: "parallel-story",
+    jsonMode: true,
+    preferJson: true,
+  });
+  if (!result.ok) {
+    return res
+      .status(result.status || 502)
+      .json({ text: result.errorText || "동시 진행 생성 실패" });
+  }
+  const validated = validateParallelStoryResponse(result.text);
+  if (!validated) {
+    console.warn("[parallel-story] rejected invalid SIDE response");
+    return res.status(502).json({ text: "SIDE 응답 형식이 올바르지 않습니다." });
+  }
+  return res.json({ text: JSON.stringify(validated) });
+}
+
 function resolveStorySuggestionMaxTokens(requested) {
   const model = isAnthropicConfigured()
     ? STORY_SUGGESTION_ANTHROPIC_MODEL
@@ -2265,6 +2440,8 @@ app.post("/api/comment", handleAiCommentPost);
 app.post("/comment", handleAiCommentPost);
 app.post("/api/live-comments", handleLiveCommentsPost);
 app.post("/live-comments", handleLiveCommentsPost);
+app.post("/api/parallel-story", handleParallelStoryPost);
+app.post("/parallel-story", handleParallelStoryPost);
 
 app.post("/api/story-suggestions", handleStorySuggestionsPost);
 app.post("/story-suggestions", handleStorySuggestionsPost);
