@@ -2189,40 +2189,40 @@ function validateParallelStoryResponse(rawText) {
     return null;
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  if (Object.keys(raw).some((key) => !["show", "worldTime", "place", "entries", "statePatch"].includes(key))) {
-    return null;
-  }
-  if (raw.show !== true) return null;
-  const worldTime = limitedString(raw.worldTime, 120);
-  const place = limitedString(raw.place);
-  if (!worldTime || !place || !Array.isArray(raw.entries) || raw.entries.length < 1 || raw.entries.length > 4) {
+  // 모델이 설명용 키를 덧붙여도 표시·SIDE 상태에 쓰는 허용 키만 취한다.
+  const worldTime = limitedString(raw.worldTime ?? raw.world_time, 120);
+  const place = limitedString(raw.place ?? raw.location);
+  const rawEntries = Array.isArray(raw.entries)
+    ? raw.entries
+    : Array.isArray(raw.messages)
+      ? raw.messages
+      : null;
+  if (!worldTime || !place || !rawEntries || rawEntries.length < 1) {
     return null;
   }
   const entries = [];
-  for (const entry of raw.entries) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.keys(entry).some((key) => !["speaker", "text"].includes(key))) return null;
-    const text = limitedString(entry.text, 800);
+  for (const entry of rawEntries.slice(0, 4)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const text = limitedString(entry.text ?? entry.content, 800);
     const speaker = entry.speaker == null ? "" : limitedString(entry.speaker, 120);
-    if (!text || speaker === null) return null;
+    if (!text || speaker === null) continue;
     entries.push({ speaker, text });
   }
+  if (!entries.length) return null;
   let statePatch;
-  if (raw.statePatch !== undefined) {
-    if (!raw.statePatch || typeof raw.statePatch !== "object" || Array.isArray(raw.statePatch) ||
-      Object.keys(raw.statePatch).some((key) => !PARALLEL_PATCH_KEYS.has(key))) return null;
+  if (raw.statePatch && typeof raw.statePatch === "object" && !Array.isArray(raw.statePatch)) {
     statePatch = {};
     for (const key of ["currentPlace", "worldTime"]) {
       if (raw.statePatch[key] === undefined) continue;
       const value = limitedString(raw.statePatch[key], key === "worldTime" ? 120 : 240);
-      if (!value) return null;
-      statePatch[key] = value;
+      if (value) statePatch[key] = value;
     }
     for (const key of ["factsAdd", "unresolvedThreadsAdd", "unresolvedThreadsResolve"]) {
       if (raw.statePatch[key] === undefined) continue;
       const value = limitedStringList(raw.statePatch[key], 12, 240);
-      if (!value) return null;
-      statePatch[key] = value;
+      if (value) statePatch[key] = value;
     }
+    if (!Object.keys(statePatch).length) statePatch = undefined;
   }
   return { show: true, worldTime, place, entries, ...(statePatch ? { statePatch } : {}) };
 }
