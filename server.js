@@ -112,7 +112,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-story-v3";
+const SERVER_REV = "parallel-story-v4";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 
@@ -2133,30 +2133,56 @@ function limitedStringList(value, maxItems = 12, maxLength = 240) {
 }
 
 /** 클라이언트가 보낸 노드 엔진 메타데이터의 수동 스키마/허용목록 검증. */
+function parseParallelStoryPerspective(rawPerspective, rawImpact) {
+  const source =
+    rawPerspective && typeof rawPerspective === "object" && !Array.isArray(rawPerspective)
+      ? rawPerspective
+      : rawImpact && typeof rawImpact === "object" && !Array.isArray(rawImpact)
+        ? rawImpact
+        : null;
+  if (!source) return null;
+  const allowedKeys = new Set([
+    "parallelId",
+    "place",
+    "characters",
+    "direction",
+    "eventHints",
+    "selectionReason",
+    "trigger",
+    "eventId",
+    "delayMinutes",
+  ]);
+  if (Object.keys(source).some((key) => !allowedKeys.has(key))) return null;
+  const parallelId = limitedString(source.parallelId, 120);
+  const place = limitedString(source.place);
+  if (!parallelId || !place) return null;
+  const direction = source.direction == null ? "" : limitedString(source.direction, 480);
+  const characters =
+    source.characters == null ? [] : limitedStringList(source.characters, 16, 120);
+  if (direction === null || characters === null) return null;
+  return { parallelId, place, direction, characters };
+}
+
 function parseParallelStoryMetadata(body) {
   const raw = body && body.parallelStory;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  if (Object.keys(raw).some((key) => !["nodeId", "impact", "canonicalState"].includes(key))) {
-    return null;
-  }
+  const allowedTop = new Set([
+    "nodeId",
+    "perspective",
+    "impact",
+    "canonicalState",
+    "revealedFacts",
+    "withhold",
+    "currentEvent",
+    "mainLocation",
+    "turnIndex",
+  ]);
+  if (Object.keys(raw).some((key) => !allowedTop.has(key))) return null;
   const nodeId = limitedString(raw.nodeId, 120);
-  const impact = raw.impact;
+  const perspective = parseParallelStoryPerspective(raw.perspective, raw.impact);
   const canonicalState = raw.canonicalState;
-  if (!nodeId || !impact || typeof impact !== "object" || Array.isArray(impact)) return null;
+  if (!nodeId || !perspective) return null;
   if (!canonicalState || typeof canonicalState !== "object" || Array.isArray(canonicalState)) return null;
-  if (Object.keys(impact).some((key) => !["parallelId", "place", "trigger", "eventId", "direction", "characters", "delayMinutes"].includes(key))) {
-    return null;
-  }
-  const parallelId = limitedString(impact.parallelId, 120);
-  const place = limitedString(impact.place);
-  const trigger = limitedString(impact.trigger, 120);
-  if (!parallelId || !place || !trigger || !(trigger === "node_enter" || trigger === "confirmed_event" || /^reveal:[\w.-]+$/.test(trigger))) {
-    return null;
-  }
-  const eventId = impact.eventId == null ? "" : limitedString(impact.eventId, 120);
-  const direction = impact.direction == null ? "" : limitedString(impact.direction, 480);
-  const characters = impact.characters == null ? [] : limitedStringList(impact.characters, 16, 120);
-  if (eventId === null || direction === null || characters === null) return null;
   if (Object.keys(canonicalState).some((key) => !["currentPlace", "worldTime", "facts", "unresolvedThreads"].includes(key))) {
     return null;
   }
@@ -2167,15 +2193,31 @@ function parseParallelStoryMetadata(body) {
   if ((canonicalState.currentPlace && !currentPlace) || (canonicalState.worldTime && !worldTime) || !facts || !unresolvedThreads) {
     return null;
   }
+  const revealedFacts =
+    raw.revealedFacts == null ? [] : limitedStringList(raw.revealedFacts, 64, 240);
+  if (revealedFacts === null) return null;
+  const withhold = raw.withhold == null ? "" : limitedString(raw.withhold, 1200) ?? "";
+  const currentEvent = raw.currentEvent == null ? "" : limitedString(raw.currentEvent, 480) ?? "";
+  const mainLocation = raw.mainLocation == null ? "" : limitedString(raw.mainLocation, 240) ?? "";
+  const turnIndex =
+    raw.turnIndex == null || Number.isFinite(Number(raw.turnIndex))
+      ? Math.max(0, Math.min(9999, Number(raw.turnIndex ?? 0)))
+      : null;
+  if (turnIndex === null) return null;
   return {
     nodeId,
-    impact: { parallelId, place, trigger, eventId, direction, characters },
+    perspective,
     canonicalState: {
       currentPlace: currentPlace || "",
       worldTime: worldTime || "",
       facts,
       unresolvedThreads,
     },
+    revealedFacts,
+    withhold,
+    currentEvent,
+    mainLocation,
+    turnIndex,
   };
 }
 
@@ -2192,7 +2234,10 @@ function validateParallelStoryResponse(rawText, metadata = null) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   if (raw.show === false) return null;
 
-  const fallbackPlace = limitedString(metadata?.impact?.place, 240);
+  const fallbackPlace = limitedString(
+    metadata?.perspective?.place ?? metadata?.impact?.place,
+    240,
+  );
   const fallbackTime = limitedString(metadata?.canonicalState?.worldTime, 120);
 
   let worldTime = limitedString(raw.worldTime ?? raw.world_time, 120);
@@ -2241,7 +2286,7 @@ function validateParallelStoryResponse(rawText, metadata = null) {
   return { show: true, worldTime, place, entries, ...(statePatch ? { statePatch } : {}) };
 }
 
-/** 노드 엔진이 확정한 SIDE 영향이 있을 때만 DeepSeek로 별도 장소 시점을 생성한다. */
+/** 노드 기반 movie_story — MAIN 턴마다 DeepSeek로 별도 장소 시점 1턴을 생성한다. */
 async function handleParallelStoryPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
   const promptRaw = req.body && req.body.prompt;
