@@ -1639,6 +1639,63 @@ function writeSse(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
+function streamedSuggestionTexts(raw) {
+  const match = /"suggestions"\s*:\s*\[([\s\S]*)$/m.exec(raw || "");
+  if (!match) return [];
+  const out = [];
+  for (const entry of match[1].matchAll(/"((?:\\.|[^"\\])*)"/g)) {
+    try {
+      out.push(JSON.parse(`"${entry[1]}"`));
+    } catch (_) {}
+  }
+  return out;
+}
+
+async function handleStoryCreationSuggestionsStream(req, res) {
+  const prompt = sanitizePromptForApi(readString(req.body, "prompt"));
+  if (!prompt) return res.status(400).json({ error: "prompt 필드가 필요합니다." });
+  if (!isAnthropicConfigured()) {
+    return res.status(503).json({ error: "Anthropic is not configured" });
+  }
+  const requestedTemperature = Number(req.body?.temperature);
+  const requestedMaxTokens = Number(req.body?.maxTokens);
+  const temperature = Number.isFinite(requestedTemperature) ? requestedTemperature : 0.88;
+  const max_tokens = Number.isFinite(requestedMaxTokens)
+    ? Math.min(4096, Math.floor(requestedMaxTokens))
+    : 3072;
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  let accumulated = "";
+  let sentCount = 0;
+  try {
+    const result = await callAnthropicCompletionStream({
+      model: STORY_CREATION_ANTHROPIC_MODEL,
+      userPrompt: prompt,
+      systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+      temperature,
+      max_tokens,
+      logTag: "story-creation-suggestions-stream",
+      onDelta: (piece) => {
+        accumulated += piece;
+        const suggestions = streamedSuggestionTexts(accumulated);
+        while (sentCount < suggestions.length) {
+          writeSse(res, { type: "suggestion", index: sentCount, text: suggestions[sentCount++] });
+        }
+      },
+      fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+      disableThinking: true,
+    });
+    writeSse(res, result.ok
+      ? { type: "done", text: result.text }
+      : { type: "error", error: result.errorText || "AI 생성 실패" });
+  } catch (e) {
+    writeSse(res, { type: "error", error: e?.message || "AI 생성 실패" });
+  }
+  res.end();
+}
+
 /** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
 function isGarbageModelLine(s, modelStr) {
   const chatLlm = resolveDeepSeekConfig();
@@ -2536,6 +2593,7 @@ async function handleCommenterStatePost(req, res) {
 // POST 별칭: 동일 핸들러를 `/api/*` 와 루트 경로에 각각 한 번만 등록
 app.post("/api/comment", handleAiCommentPost);
 app.post("/comment", handleAiCommentPost);
+app.post("/api/story-creation-suggestions-stream", handleStoryCreationSuggestionsStream);
 app.post("/api/live-comments", handleLiveCommentsPost);
 app.post("/live-comments", handleLiveCommentsPost);
 app.post("/api/parallel-story", handleParallelStoryPost);
