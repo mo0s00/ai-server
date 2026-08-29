@@ -2334,7 +2334,8 @@ async function handleParallelStoryPost(req, res) {
   let validated = validateParallelStoryResponse(result.text, metadata);
   if (!validated) {
     console.warn(
-      `[parallel-story] jsonMode rejected rawLen=${(result.text || "").length} — retry plain`,
+      `[parallel-story] jsonMode rejected rawLen=${(result.text || "").length} ` +
+        `raw=${JSON.stringify(String(result.text || "").slice(0, 2000))} — retry plain`,
     );
     const retry = await callOpenAiCompletion({
       userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
@@ -2348,6 +2349,17 @@ async function handleParallelStoryPost(req, res) {
     });
     if (retry.ok) {
       validated = validateParallelStoryResponse(retry.text, metadata);
+      if (!validated) {
+        console.warn(
+          `[parallel-story] plain retry rejected rawLen=${(retry.text || "").length} ` +
+            `raw=${JSON.stringify(String(retry.text || "").slice(0, 2000))}`,
+        );
+      }
+    } else {
+      console.warn(
+        `[parallel-story] plain retry failed status=${retry.status || 0} ` +
+          `error=${JSON.stringify(retry.errorText || "")}`,
+      );
     }
   }
   if (!validated) {
