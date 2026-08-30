@@ -112,9 +112,14 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-story-v5";
+const SERVER_REV = "parallel-story-v6";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
+const PARALLEL_STORY_SYSTEM_PROMPT =
+  "You write parallel SIDE scenes (separate location from MAIN). " +
+  'Return ONE JSON object: {"show":true,"worldTime":"...","place":"...","entries":[{"speaker":"name or empty","text":"..."}],"statePatch":{optional}}. ' +
+  "entries: 1-4. Empty speaker = narration. Do NOT use narrator/lines/voiceText. No markdown.";
+const PARALLEL_STORY_LLM_TIMEOUT_MS = 12000;
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -2278,24 +2283,72 @@ function parseParallelStoryMetadata(body) {
   };
 }
 
+/** 잘린 SIDE JSON — speaker/text·narrator만 salvage. */
+function salvageParallelStoryFromPartial(rawText, hints = {}) {
+  if (typeof rawText !== "string" || !rawText.trim()) return null;
+  const unescapeJsonString = (s) => {
+    try {
+      return JSON.parse(`"${s}"`);
+    } catch (_) {
+      return s.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
+  };
+  const hintPlace = (hints.place || "").trim();
+  const hintWorldTime = (hints.worldTime || "").trim();
+  const worldTimeM = rawText.match(/"worldTime"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  const worldTimeAltM = rawText.match(/"world_time"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  const placeM = rawText.match(/"place"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  const worldTime = worldTimeM
+    ? unescapeJsonString(worldTimeM[1]).trim()
+    : worldTimeAltM
+      ? unescapeJsonString(worldTimeAltM[1]).trim()
+      : hintWorldTime || "방금";
+  const place = placeM ? unescapeJsonString(placeM[1]).trim() : hintPlace;
+  if (!place) return null;
+
+  const entries = [];
+  const narratorM = rawText.match(/"narrator"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (narratorM) {
+    const narrator = unescapeJsonString(narratorM[1]).trim();
+    if (narrator) entries.push({ speaker: "", text: narrator });
+  }
+  const entryRe =
+    /"speaker"\s*:\s*"((?:\\.|[^"\\])*)"\s*,\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  for (const m of rawText.matchAll(entryRe)) {
+    const text = unescapeJsonString(m[2]).trim();
+    if (!text) continue;
+    entries.push({ speaker: unescapeJsonString(m[1]).trim(), text });
+  }
+  if (!entries.length) return null;
+  return { show: true, worldTime, place, entries: entries.slice(0, 4) };
+}
+
 /** 모델 응답은 SIDE 상태만 바꿀 수 있도록 응답 스키마를 재검증·정규화한다. */
 function validateParallelStoryResponse(rawText, metadata = null) {
-  const objectText = extractJsonObjectFromText(rawText);
-  if (!objectText) return null;
-  let raw;
-  try {
-    raw = JSON.parse(objectText);
-  } catch (_) {
-    return null;
-  }
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  if (raw.show === false) return null;
-
   const fallbackPlace = limitedString(
     metadata?.perspective?.place ?? metadata?.impact?.place,
     240,
   );
   const fallbackTime = limitedString(metadata?.canonicalState?.worldTime, 120);
+  const sideHints = {
+    place: fallbackPlace || "",
+    worldTime: fallbackTime || "방금",
+  };
+
+  const objectText = extractJsonObjectFromText(rawText);
+  if (!objectText) {
+    return salvageParallelStoryFromPartial(rawText, sideHints);
+  }
+  let raw;
+  try {
+    raw = JSON.parse(objectText);
+  } catch (_) {
+    return salvageParallelStoryFromPartial(rawText, sideHints);
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return salvageParallelStoryFromPartial(rawText, sideHints);
+  }
+  if (raw.show === false) return null;
 
   let worldTime = limitedString(raw.worldTime ?? raw.world_time, 120);
   let place = limitedString(raw.place ?? raw.location, 240);
@@ -2306,9 +2359,13 @@ function validateParallelStoryResponse(rawText, metadata = null) {
       : Array.isArray(raw.lines)
         ? raw.lines
         : null;
-  if (!rawEntries || rawEntries.length < 1) return null;
+  if (!rawEntries || rawEntries.length < 1) {
+    return salvageParallelStoryFromPartial(rawText, sideHints);
+  }
 
   const entries = [];
+  const narrator = limitedString(raw.narrator, 800);
+  if (narrator) entries.push({ speaker: "", text: narrator });
   for (const entry of rawEntries.slice(0, 4)) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const text = limitedString(
@@ -2324,7 +2381,9 @@ function validateParallelStoryResponse(rawText, metadata = null) {
     }
     entries.push({ speaker, text });
   }
-  if (!entries.length) return null;
+  if (!entries.length) {
+    return salvageParallelStoryFromPartial(rawText, sideHints);
+  }
 
   if (!place && fallbackPlace) place = fallbackPlace;
   if (!worldTime) worldTime = fallbackTime || "방금";
@@ -2375,13 +2434,14 @@ async function handleParallelStoryPost(req, res) {
   );
   const result = await callOpenAiCompletion({
     userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
-    systemPrompt: "Return only the requested JSON object. Never add markdown.",
+    systemPrompt: PARALLEL_STORY_SYSTEM_PROMPT,
     temperature: 0.78,
     max_tokens: 720,
     model: PARALLEL_STORY_DEEPSEEK_MODEL,
     logTag: "parallel-story",
     jsonMode: true,
     preferJson: true,
+    fetchTimeoutMs: PARALLEL_STORY_LLM_TIMEOUT_MS,
   });
   if (!result.ok) {
     return res
@@ -2396,13 +2456,14 @@ async function handleParallelStoryPost(req, res) {
     );
     const retry = await callOpenAiCompletion({
       userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
-      systemPrompt: "Return only the requested JSON object. Never add markdown.",
+      systemPrompt: PARALLEL_STORY_SYSTEM_PROMPT,
       temperature: 0.78,
       max_tokens: 720,
       model: PARALLEL_STORY_DEEPSEEK_MODEL,
       logTag: "parallel-story-retry",
       jsonMode: false,
       preferJson: true,
+      fetchTimeoutMs: PARALLEL_STORY_LLM_TIMEOUT_MS,
     });
     if (retry.ok) {
       validated = validateParallelStoryResponse(retry.text, metadata);
