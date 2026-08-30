@@ -27,9 +27,13 @@ const STORY_SUGGESTION_ANTHROPIC_MODEL = (
 const LIVE_COMMENT_ANTHROPIC_MODEL = (
   process.env.LIVE_COMMENT_ANTHROPIC_MODEL || "claude-opus-5"
 ).trim();
-/** 스토리 제작·노드 설계·검수·DM `/comment` — Claude Opus 5 */
+/** 스토리 제작·노드 설계·검수 — Claude Opus 5 */
 const STORY_CREATION_ANTHROPIC_MODEL = (
   process.env.STORY_CREATION_ANTHROPIC_MODEL || "claude-opus-5"
+).trim();
+/** 케릭터 DM·상담·피메모·일반 `/comment` — Claude Sonnet 5 */
+const CHAT_LLM_ANTHROPIC_MODEL = (
+  process.env.CHAT_LLM_ANTHROPIC_MODEL || "claude-sonnet-5"
 ).trim();
 /** story-chat 배경 scene 예측(부속) — Haiku */
 const STORY_SCENE_ANTHROPIC_MODEL = (
@@ -111,7 +115,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-suggestion-sonnet-5-v1";
+const SERVER_REV = "chat-llm-sonnet-5-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -228,7 +232,7 @@ function buildHealthPayload() {
       : "",
     deepseekConfigured: isDeepSeekConfigured(),
     chatLlmProvider: isAnthropicConfigured() ? "anthropic" : "none",
-    chatLlmModel: isAnthropicConfigured() ? STORY_CREATION_ANTHROPIC_MODEL : "",
+    chatLlmModel: isAnthropicConfigured() ? CHAT_LLM_ANTHROPIC_MODEL : "",
     provider: storyChatProvider,
     model: storyChatModel,
     rev: SERVER_REV,
@@ -1965,7 +1969,7 @@ async function handleAiCommentPost(req, res) {
       return res.status(503).json({ text: "Anthropic is not configured" });
     }
     console.log(
-      `[comment] provider=anthropic model=${STORY_CREATION_ANTHROPIC_MODEL}`,
+      `[comment] provider=anthropic model=${CHAT_LLM_ANTHROPIC_MODEL}`,
     );
 
     const requestedTemperature = Number(req.body && req.body.temperature);
@@ -1983,7 +1987,7 @@ async function handleAiCommentPost(req, res) {
     const effectiveMaxTokens = jsonMode ? Math.max(max_tokens, 1200) : max_tokens;
 
     const llmResult = await callAnthropicCompletion({
-      model: STORY_CREATION_ANTHROPIC_MODEL,
+      model: CHAT_LLM_ANTHROPIC_MODEL,
       userPrompt: cleanedPrompt,
       systemPrompt: jsonMode ? STORY_JSON_SYSTEM_PROMPT : undefined,
       temperature,
@@ -2002,7 +2006,7 @@ async function handleAiCommentPost(req, res) {
 
     const text = llmResult.text;
 
-    if (isGarbageModelLine(text, llmResult.model || STORY_CREATION_ANTHROPIC_MODEL)) {
+    if (isGarbageModelLine(text, llmResult.model || CHAT_LLM_ANTHROPIC_MODEL)) {
       console.log("[comment] rejected garbage model-line reply");
       return res.status(502).json({ text: "댓글 생성 실패" });
     }
@@ -6275,7 +6279,10 @@ if (isAnthropicConfigured()) {
     `[live-comments] provider=anthropic model=${LIVE_COMMENT_ANTHROPIC_MODEL}`,
   );
   console.log(
-    `[comment] provider=anthropic model=${STORY_CREATION_ANTHROPIC_MODEL}`,
+    `[comment] provider=anthropic model=${CHAT_LLM_ANTHROPIC_MODEL}`,
+  );
+  console.log(
+    `[story-creation] provider=anthropic model=${STORY_CREATION_ANTHROPIC_MODEL}`,
   );
   console.log(
     `[story-chat-scene] provider=anthropic model=${STORY_SCENE_ANTHROPIC_MODEL}`,
