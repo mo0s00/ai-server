@@ -11,14 +11,13 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-5.4-nano").trim();
 
 const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_COUNT_TOKENS_URL = "https://api.anthropic.com/v1/messages/count_tokens";
 const ANTHROPIC_API_KEY = (process.env.ANTHROPIC_API_KEY || "").trim();
 const ANTHROPIC_MODEL = (
   process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
-/** 스토리 본문 대사·나레이션 — Claude Haiku 4.5 */
+/** 스토리 본문 대사·나레이션 — Claude Sonnet 5 */
 const STORY_CHAT_ANTHROPIC_MODEL = (
-  process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
+  process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-sonnet-5"
 ).trim();
 /** 플레이어 추천문 2~3개 — Claude Haiku 4.5 */
 const STORY_SUGGESTION_ANTHROPIC_MODEL = (
@@ -112,13 +111,13 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-story-sonnet-5-v2";
+const SERVER_REV = "story-chat-sonnet-5-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
   "You write parallel SIDE scenes (separate location from MAIN). " +
-  'Return ONE JSON object: {"show":true,"worldTime":"...","place":"...","entries":[{"speaker":"name or empty","text":"..."}],"statePatch":{optional}}. ' +
-  "entries: 1-4. Empty speaker = narration. Do NOT use narrator/lines/voiceText. No markdown.";
+  'Reply with ONE JSON object only: {"show":true,"place":"...","entries":[{"kind":"narration|dialogue|beat|timeMark","speaker":"name or empty","text":"..."}],"statePatch":{optional}}. ' +
+  "entries: 4-6. Do NOT output worldTime or world_time. Do NOT use narrator/lines/voiceText. No markdown.";
 const PARALLEL_STORY_LLM_TIMEOUT_MS = 20000;
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
@@ -506,16 +505,14 @@ function anthropicRetryMaxTokens(currentMax, { empty = false, truncated = false 
 function logAnthropicUsage({ logTag, modelId, max_tokens, text, raw, attempt = 0 }) {
   const usage = raw?.usage || {};
   const thinkingTokens = usage?.output_tokens_details?.thinking_tokens;
-  const cacheRead = usage.cache_read_input_tokens ?? 0;
-  const cacheCreate = usage.cache_creation_input_tokens ?? 0;
   console.log(
     `[${logTag}] anthropic usage model=${modelId} attempt=${attempt} ` +
       `max_tokens=${max_tokens} ` +
       `input_tokens=${usage.input_tokens ?? "?"} ` +
       `output_tokens=${usage.output_tokens ?? "?"} ` +
+      `cache_read_input_tokens=${usage.cache_read_input_tokens ?? "?"} ` +
+      `cache_creation_input_tokens=${usage.cache_creation_input_tokens ?? "?"} ` +
       `thinking_tokens=${thinkingTokens ?? "?"} ` +
-      `cache_read_input_tokens=${cacheRead} ` +
-      `cache_creation_input_tokens=${cacheCreate} ` +
       `replyLen=${(text || "").length}`,
   );
 }
@@ -622,7 +619,6 @@ async function callOpenAiCompletion({
   userPrompt,
   temperature,
   max_tokens,
-  model,
   logTag,
   systemPrompt,
   jsonMode = false,
@@ -642,8 +638,6 @@ async function callOpenAiCompletion({
       skipped: true,
     };
   }
-  const effectiveModel =
-    typeof model === "string" && model.trim() ? model.trim() : llm.model;
 
   const messages = [];
   if (typeof systemPrompt === "string" && systemPrompt.trim()) {
@@ -654,9 +648,9 @@ async function callOpenAiCompletion({
   let payload;
   try {
     payload = JSON.stringify({
-      model: effectiveModel,
+      model: llm.model,
       temperature,
-      ...chatCompletionTokenLimit(max_tokens, effectiveModel),
+      ...chatCompletionTokenLimit(max_tokens, llm.model),
       messages,
       ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     });
@@ -722,7 +716,7 @@ async function callOpenAiCompletion({
     const apiMsg = openAiErrorMessage(json) || "LLM 요청에 실패했습니다.";
     const statusOut = oaiRes.status >= 500 ? 502 : oaiRes.status;
     console.log(
-      `[${logTag}] ${llm.provider} HTTP ${oaiRes.status} model=${effectiveModel}`,
+      `[${logTag}] ${llm.provider} HTTP ${oaiRes.status} model=${llm.model}`,
     );
     return {
       ok: false,
@@ -747,12 +741,12 @@ async function callOpenAiCompletion({
         ? msgObj.reasoning_content.length
         : 0;
     console.log(
-      `[${logTag}] No assistant content provider=${llm.provider} model=${effectiveModel} ` +
+      `[${logTag}] No assistant content provider=${llm.provider} model=${llm.model} ` +
         `attempt=${_attempt} finish_reason=${finishReason} reasoningLen=${reasoningLength}`,
     );
     if (_attempt === 0) {
       // v4/reasoning 모델은 추론 토큰만 먼저 소진해 content가 비는 경우가 있다.
-      const retryFloor = isReasoningHeavyDeepSeekModel(effectiveModel) ? 4096 : 2048;
+      const retryFloor = isReasoningHeavyDeepSeekModel(llm.model) ? 4096 : 2048;
       const retryMaxTokens = Math.max(max_tokens, retryFloor);
       if (jsonMode) {
         console.log(
@@ -762,7 +756,6 @@ async function callOpenAiCompletion({
           userPrompt,
           temperature,
           max_tokens: retryMaxTokens,
-          model: effectiveModel,
           logTag,
           systemPrompt,
           jsonMode: false,
@@ -779,7 +772,6 @@ async function callOpenAiCompletion({
         userPrompt,
         temperature,
         max_tokens: retryMaxTokens,
-        model: effectiveModel,
         logTag,
         systemPrompt,
         jsonMode,
@@ -802,7 +794,7 @@ async function callOpenAiCompletion({
     };
   }
 
-  console.log(`[${logTag}] provider=${llm.provider} model=${effectiveModel}`);
+  console.log(`[${logTag}] provider=${llm.provider} model=${llm.model}`);
   return {
     ok: true,
     provider: llm.provider,
@@ -841,39 +833,35 @@ function anthropicSupportsTemperature(modelStr) {
   return true;
 }
 
-/** story-chat Prompt Caching — Anthropic ephemeral prefix (2048+ tok). */
-const STORY_CHAT_PROMPT_CACHE_ENABLED = process.env.STORY_CHAT_PROMPT_CACHE !== "false";
-
-function readStoryChatPromptSegments(body) {
-  const raw =
-    (body && body.prompt_segments) || (body && body.prompt_token_audit);
+function readPromptSegments(body) {
+  const raw = body && body.prompt_segments;
   if (!raw || typeof raw !== "object") return null;
   const staticEngine = readString(raw, "static_engine");
   const nodeStatic = readString(raw, "node_static");
   const dynamicContext = readString(raw, "dynamic_context");
-  const nodeId = readString(raw, "node_id");
-  if (!staticEngine && !nodeStatic && !dynamicContext) return null;
-  return { staticEngine, nodeStatic, dynamicContext, nodeId };
+  if (!staticEngine.trim()) return null;
+  return {
+    staticEngine: staticEngine.trim(),
+    nodeStatic: nodeStatic.trim(),
+    dynamicContext: dynamicContext.trim(),
+    nodeId: readString(raw, "node_id"),
+  };
 }
 
-function buildStoryChatAnthropicUserContent({
-  staticEngine,
-  nodeStatic,
-  dynamicContext,
-  fullUserPrompt,
-}) {
-  const prefix = buildStoryChatCacheablePrefix(staticEngine, nodeStatic);
-  if (!STORY_CHAT_PROMPT_CACHE_ENABLED || !prefix.trim()) {
-    return { content: fullUserPrompt, cached: false };
+function storyChatAnthropicPromptArgs(body, cleanedPrompt) {
+  const segs = readPromptSegments(body);
+  if (segs) {
+    return {
+      promptSegments: segs,
+      userPrompt: segs.dynamicContext || cleanedPrompt,
+      systemPrompt: segs.staticEngine,
+    };
   }
-  const dynamicBlock = buildStoryChatDynamicContextBlock(dynamicContext);
-  const blocks = [
-    { type: "text", text: prefix, cache_control: { type: "ephemeral" } },
-  ];
-  if (dynamicBlock.trim()) {
-    blocks.push({ type: "text", text: `\n\n${dynamicBlock}` });
-  }
-  return { content: blocks, cached: true };
+  return {
+    promptSegments: null,
+    userPrompt: cleanedPrompt,
+    systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+  };
 }
 
 function buildAnthropicMessagesBody({
@@ -886,25 +874,39 @@ function buildAnthropicMessagesBody({
   disableThinking = false,
   promptSegments = null,
 }) {
-  let messageContent = userPrompt;
-  if (promptSegments) {
-    const built = buildStoryChatAnthropicUserContent({
-      staticEngine: promptSegments.staticEngine,
-      nodeStatic: promptSegments.nodeStatic,
-      dynamicContext: promptSegments.dynamicContext,
-      fullUserPrompt: userPrompt,
-    });
-    messageContent = built.content;
-    if (built.cached) {
-      console.log("[story-chat] prompt_cache prefix=ephemeral");
-    }
-  }
   const body = {
     model: (model || ANTHROPIC_MODEL).trim(),
     max_tokens,
-    messages: [{ role: "user", content: messageContent }],
+    messages: [{ role: "user", content: userPrompt }],
   };
-  if (typeof systemPrompt === "string" && systemPrompt.trim()) {
+
+  if (promptSegments?.staticEngine) {
+    body.system = [
+      {
+        type: "text",
+        text: promptSegments.staticEngine,
+        cache_control: { type: "ephemeral" },
+      },
+    ];
+    const userBlocks = [];
+    if (promptSegments.nodeStatic) {
+      userBlocks.push({
+        type: "text",
+        text: promptSegments.nodeStatic,
+        cache_control: { type: "ephemeral" },
+      });
+    }
+    const dynamicText =
+      promptSegments.dynamicContext?.trim() || (userPrompt || "").trim();
+    if (dynamicText) {
+      userBlocks.push({ type: "text", text: dynamicText });
+    }
+    if (userBlocks.length === 0) {
+      userBlocks.push({ type: "text", text: userPrompt });
+    }
+    body.messages = [{ role: "user", content: userBlocks }];
+    console.log("[story-chat] prompt_cache prefix=ephemeral segments=system+node");
+  } else if (typeof systemPrompt === "string" && systemPrompt.trim()) {
     body.system = systemPrompt.trim();
   }
   if (
@@ -919,140 +921,6 @@ function buildAnthropicMessagesBody({
   }
   if (stream) body.stream = true;
   return body;
-}
-
-/** story-chat Prompt Caching 사전 실측 — Anthropic count_tokens (cache_control 없음). */
-const _promptAuditPrevByNode = new Map();
-
-async function countAnthropicInputTokens({ model, system, userContent }) {
-  if (!ANTHROPIC_API_KEY) return null;
-  const userText =
-    typeof userContent === "string" && userContent.trim()
-      ? userContent.trim()
-      : ".";
-  const body = {
-    model: (model || STORY_CHAT_ANTHROPIC_MODEL).trim(),
-    messages: [{ role: "user", content: userText }],
-  };
-  if (typeof system === "string" && system.trim()) {
-    body.system = system.trim();
-  }
-  try {
-    const response = await fetch(ANTHROPIC_COUNT_TOKENS_URL, {
-      method: "POST",
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": ANTHROPIC_VERSION,
-        "Content-Type": "application/json; charset=utf-8",
-      },
-      body: JSON.stringify(body),
-    });
-    const raw = await response.text();
-    let json = {};
-    try {
-      json = raw ? JSON.parse(raw) : {};
-    } catch (_) {
-      console.error("[promptTokenAudit] count_tokens parse failed");
-      return null;
-    }
-    if (!response.ok) {
-      console.error(
-        "[promptTokenAudit] count_tokens http",
-        response.status,
-        json?.error?.message || raw.slice(0, 200),
-      );
-      return null;
-    }
-    return typeof json.input_tokens === "number" ? json.input_tokens : null;
-  } catch (e) {
-    console.error("[promptTokenAudit] count_tokens error", e?.message || e);
-    return null;
-  }
-}
-
-function buildStoryChatCacheablePrefix(staticEngine, nodeStatic) {
-  const a = (staticEngine || "").trim();
-  const b = (nodeStatic || "").trim();
-  if (!a) return b;
-  if (!b) return a;
-  return `${a}\n\n${b}`;
-}
-
-function buildStoryChatDynamicContextBlock(dynamicContext) {
-  const d = (dynamicContext || "").trim();
-  if (!d) return "";
-  return `[엔진 story_context]\n${d}`;
-}
-
-async function auditStoryChatPromptTokens({
-  model,
-  anthropicSystem,
-  staticEngine,
-  nodeStatic,
-  dynamicContext,
-  fullUserPrompt,
-  nodeId,
-  storyId,
-}) {
-  const cacheablePrefix = buildStoryChatCacheablePrefix(staticEngine, nodeStatic);
-  const dynamicBlock = buildStoryChatDynamicContextBlock(dynamicContext);
-
-  const [
-    anthropicSystemTokens,
-    staticEngineTokens,
-    nodeStaticTokens,
-    dynamicContextTokens,
-    fullInputTokens,
-    cacheablePrefixTokens,
-  ] = await Promise.all([
-    countAnthropicInputTokens({
-      model,
-      system: anthropicSystem,
-      userContent: "",
-    }),
-    countAnthropicInputTokens({ model, userContent: (staticEngine || "").trim() }),
-    countAnthropicInputTokens({ model, userContent: (nodeStatic || "").trim() }),
-    countAnthropicInputTokens({ model, userContent: dynamicBlock }),
-    countAnthropicInputTokens({
-      model,
-      system: anthropicSystem,
-      userContent: (fullUserPrompt || "").trim(),
-    }),
-    countAnthropicInputTokens({ model, userContent: cacheablePrefix }),
-  ]);
-
-  const auditKey = `${storyId || "(none)"}|${nodeId || "(none)"}`;
-  const prev = _promptAuditPrevByNode.get(auditKey);
-  const cacheablePrefixSame =
-    prev != null && prev.cacheablePrefix === cacheablePrefix;
-  _promptAuditPrevByNode.set(auditKey, {
-    cacheablePrefix,
-    at: Date.now(),
-  });
-
-  const result = {
-    anthropicSystemTokens,
-    staticEngineTokens,
-    nodeStaticTokens,
-    dynamicContextTokens,
-    fullInputTokens,
-    cacheablePrefixTokens,
-    cacheablePrefixSame,
-    nodeId: nodeId || "",
-  };
-
-  console.log("[promptTokenAudit]");
-  console.log(`anthropicSystemTokens=${anthropicSystemTokens ?? "?"}`);
-  console.log(`staticEngineTokens=${staticEngineTokens ?? "?"}`);
-  console.log(`nodeStaticTokens=${nodeStaticTokens ?? "?"}`);
-  console.log(`dynamicContextTokens=${dynamicContextTokens ?? "?"}`);
-  console.log(`fullInputTokens=${fullInputTokens ?? "?"}`);
-  console.log(`cacheablePrefixTokens=${cacheablePrefixTokens ?? "?"}`);
-  console.log(`cacheablePrefixSame=${cacheablePrefixSame}`);
-  if (nodeId) {
-    console.log(`nodeId=${nodeId}`);
-  }
-  return result;
 }
 
 function normalizeAnthropicStoryReply(text) {
@@ -1237,8 +1105,8 @@ async function callAnthropicCompletionStream({
   onFirstToken,
   fetchTimeoutMs = STORY_LLM_TIMEOUT_MS,
   disableThinking = false,
-  promptSegments = null,
   _attempt = 0,
+  promptSegments = null,
 }) {
   const modelId = (model || STORY_CHAT_ANTHROPIC_MODEL).trim();
   if (!ANTHROPIC_API_KEY) {
@@ -1309,6 +1177,7 @@ async function callAnthropicCompletionStream({
   let buffer = "";
   let fullText = "";
   let firstTokenSent = false;
+  let streamUsage = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -1326,6 +1195,12 @@ async function callAnthropicCompletionStream({
         chunk = JSON.parse(data);
       } catch (_) {
         continue;
+      }
+      if (chunk?.type === "message_start" && chunk?.message?.usage) {
+        streamUsage = chunk.message.usage;
+      }
+      if (chunk?.type === "message_delta" && chunk?.usage) {
+        streamUsage = { ...(streamUsage || {}), ...chunk.usage };
       }
       const piece =
         chunk?.delta?.text ||
@@ -1364,8 +1239,6 @@ async function callAnthropicCompletionStream({
         onDelta,
         onFirstToken,
         fetchTimeoutMs,
-        disableThinking,
-        promptSegments,
         _attempt: 1,
       });
     }
@@ -1373,12 +1246,22 @@ async function callAnthropicCompletionStream({
   }
 
   console.log(`[${logTag}] stream complete provider=anthropic model=${modelId}`);
+  if (streamUsage) {
+    logAnthropicUsage({
+      logTag,
+      modelId,
+      max_tokens,
+      text: fullText,
+      raw: { usage: streamUsage },
+      attempt: _attempt,
+    });
+  }
   return {
     ok: true,
     provider: "anthropic",
     model: modelId,
     text: fullText,
-    raw: { stream: true, model: modelId },
+    raw: { stream: true, model: modelId, usage: streamUsage || undefined },
   };
 }
 
@@ -1646,13 +1529,33 @@ async function callOpenAiCompletionStream({
 
 function writeSse(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  if (typeof res.flush === "function") res.flush();
 }
 
+/** turnId별 story-chat 요청 횟수 — 중복 Claude 호출 감지용. */
+const storyChatTurnRequestCounts = new Map();
+
+function noteStoryChatTurnRequest(turnId, mode) {
+  const key = turnId || "(none)";
+  const next = (storyChatTurnRequestCounts.get(key) || 0) + 1;
+  storyChatTurnRequestCounts.set(key, next);
+  console.log(
+    `[story-chat turn] turnId=${key} mode=${mode} requestCount=${next}`,
+  );
+  if (next > 1) {
+    console.warn(
+      `[story-chat turn] duplicate request turnId=${key} count=${next} mode=${mode}`,
+    );
+  }
+}
+
+/** 불완전한 `suggestions` JSON에서도 닫힌 문자열만 순서대로 읽는다. */
 function streamedSuggestionTexts(raw) {
   const match = /"suggestions"\s*:\s*\[([\s\S]*)$/m.exec(raw || "");
   if (!match) return [];
   const out = [];
-  for (const entry of match[1].matchAll(/"((?:\\.|[^"\\])*)"/g)) {
+  const re = /"((?:\\.|[^"\\])*)"/g;
+  for (const entry of match[1].matchAll(re)) {
     try {
       out.push(JSON.parse(`"${entry[1]}"`));
     } catch (_) {}
@@ -1660,26 +1563,34 @@ function streamedSuggestionTexts(raw) {
   return out;
 }
 
+/** 스토리 제작 화면의 장면 추천 풀 전용 SSE. */
 async function handleStoryCreationSuggestionsStream(req, res) {
   const prompt = sanitizePromptForApi(readString(req.body, "prompt"));
   if (!prompt) return res.status(400).json({ error: "prompt 필드가 필요합니다." });
   if (!isAnthropicConfigured()) {
     return res.status(503).json({ error: "Anthropic is not configured" });
   }
+
   const requestedTemperature = Number(req.body?.temperature);
   const requestedMaxTokens = Number(req.body?.maxTokens);
-  const temperature = Number.isFinite(requestedTemperature) ? requestedTemperature : 0.88;
-  const max_tokens = Number.isFinite(requestedMaxTokens)
-    ? Math.min(4096, Math.floor(requestedMaxTokens))
-    : 3072;
+  const temperature =
+    Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
+      ? requestedTemperature
+      : 0.88;
+  const max_tokens =
+    Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
+      ? Math.min(4096, Math.floor(requestedMaxTokens))
+      : 3072;
+
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
+
   let accumulated = "";
   let sentCount = 0;
   try {
-    const result = await callAnthropicCompletionStream({
+    const llmResult = await callAnthropicCompletionStream({
       model: STORY_CREATION_ANTHROPIC_MODEL,
       userPrompt: prompt,
       systemPrompt: STORY_JSON_SYSTEM_PROMPT,
@@ -1690,15 +1601,22 @@ async function handleStoryCreationSuggestionsStream(req, res) {
         accumulated += piece;
         const suggestions = streamedSuggestionTexts(accumulated);
         while (sentCount < suggestions.length) {
-          writeSse(res, { type: "suggestion", index: sentCount, text: suggestions[sentCount++] });
+          writeSse(res, {
+            type: "suggestion",
+            index: sentCount,
+            text: suggestions[sentCount],
+          });
+          sentCount += 1;
         }
       },
       fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
       disableThinking: true,
     });
-    writeSse(res, result.ok
-      ? { type: "done", text: result.text }
-      : { type: "error", error: result.errorText || "AI 생성 실패" });
+    if (!llmResult.ok) {
+      writeSse(res, { type: "error", error: llmResult.errorText || "AI 생성 실패" });
+    } else {
+      writeSse(res, { type: "done", text: llmResult.text });
+    }
   } catch (e) {
     writeSse(res, { type: "error", error: e?.message || "AI 생성 실패" });
   }
@@ -2173,32 +2091,13 @@ async function handleLiveCommentsPost(req, res) {
   return res.json({ text: result.text });
 }
 
-const PARALLEL_PATCH_KEYS = new Set([
+const PARALLEL_STORY_ALLOWED_STATE_PATCH_KEYS = new Set([
   "currentPlace",
-  "worldTime",
   "factsAdd",
   "unresolvedThreadsAdd",
   "unresolvedThreadsResolve",
 ]);
 
-function limitedString(value, max = 240) {
-  return typeof value === "string" && value.trim() && value.trim().length <= max
-    ? value.trim()
-    : null;
-}
-
-function limitedStringList(value, maxItems = 12, maxLength = 240) {
-  if (!Array.isArray(value) || value.length > maxItems) return null;
-  const items = [];
-  for (const item of value) {
-    const text = limitedString(item, maxLength);
-    if (!text) return null;
-    items.push(text);
-  }
-  return items;
-}
-
-/** 클라이언트가 보낸 노드 엔진 메타데이터의 수동 스키마/허용목록 검증. */
 function parseParallelStoryPerspective(rawPerspective, rawImpact) {
   const source =
     rawPerspective && typeof rawPerspective === "object" && !Array.isArray(rawPerspective)
@@ -2207,93 +2106,74 @@ function parseParallelStoryPerspective(rawPerspective, rawImpact) {
         ? rawImpact
         : null;
   if (!source) return null;
-  const allowedKeys = new Set([
-    "parallelId",
-    "place",
-    "characters",
-    "direction",
-    "eventHints",
-    "selectionReason",
-    "trigger",
-    "eventId",
-    "delayMinutes",
-  ]);
-  if (Object.keys(source).some((key) => !allowedKeys.has(key))) return null;
-  const parallelId = limitedString(source.parallelId, 120);
-  const place = limitedString(source.place);
+  const parallelId = (
+    readString(source, "parallelId") || readString(source, "parallel_id")
+  ).trim();
+  const place = (
+    readString(source, "place") || readString(source, "target")
+  ).trim();
   if (!parallelId || !place) return null;
-  const direction = source.direction == null ? "" : limitedString(source.direction, 480);
-  const characters =
-    source.characters == null ? [] : limitedStringList(source.characters, 16, 120);
-  if (direction === null || characters === null) return null;
-  return { parallelId, place, direction, characters };
+  return { parallelId, place };
 }
 
 function parseParallelStoryMetadata(body) {
-  const raw = body && body.parallelStory;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const allowedTop = new Set([
-    "nodeId",
-    "perspective",
-    "impact",
-    "canonicalState",
-    "engineWorldTime",
-    "revealedFacts",
-    "withhold",
-    "currentEvent",
-    "mainLocation",
-    "turnIndex",
-  ]);
-  if (Object.keys(raw).some((key) => !allowedTop.has(key))) return null;
-  const nodeId = limitedString(raw.nodeId, 120);
-  const perspective = parseParallelStoryPerspective(raw.perspective, raw.impact);
-  const canonicalState = raw.canonicalState;
-  if (!nodeId || !perspective) return null;
-  if (!canonicalState || typeof canonicalState !== "object" || Array.isArray(canonicalState)) return null;
-  if (Object.keys(canonicalState).some((key) => !["currentPlace", "worldTime", "facts", "unresolvedThreads"].includes(key))) {
-    return null;
-  }
-  const currentPlace = limitedString(canonicalState.currentPlace || "", 240);
-  const worldTime = limitedString(canonicalState.worldTime || "", 120);
-  const facts = limitedStringList(canonicalState.facts || [], 64, 240);
-  const unresolvedThreads = limitedStringList(canonicalState.unresolvedThreads || [], 64, 240);
-  if ((canonicalState.currentPlace && !currentPlace) || (canonicalState.worldTime && !worldTime) || !facts || !unresolvedThreads) {
-    return null;
-  }
-  const revealedFacts =
-    raw.revealedFacts == null ? [] : limitedStringList(raw.revealedFacts, 64, 240);
-  if (revealedFacts === null) return null;
-  const withhold = raw.withhold == null ? "" : limitedString(raw.withhold, 1200) ?? "";
-  const currentEvent = raw.currentEvent == null ? "" : limitedString(raw.currentEvent, 480) ?? "";
-  const mainLocation = raw.mainLocation == null ? "" : limitedString(raw.mainLocation, 240) ?? "";
-  const turnIndex =
-    raw.turnIndex == null || Number.isFinite(Number(raw.turnIndex))
-      ? Math.max(0, Math.min(9999, Number(raw.turnIndex ?? 0)))
-      : null;
-  if (turnIndex === null) return null;
-  const engineWorldTime =
-    raw.engineWorldTime == null ? "" : limitedString(raw.engineWorldTime, 120) ?? "";
+  const ps = body && body.parallelStory;
+  if (!ps || typeof ps !== "object") return null;
+  const perspective = parseParallelStoryPerspective(ps.perspective, ps.impact);
+  if (!perspective) return null;
+  const canonicalState = ps.canonicalState;
+  if (!canonicalState || typeof canonicalState !== "object") return null;
   return {
-    nodeId,
+    nodeId: readString(ps, "nodeId"),
     perspective,
-    canonicalState: {
-      currentPlace: currentPlace || "",
-      worldTime: worldTime || "",
-      facts,
-      unresolvedThreads,
-    },
-    engineWorldTime,
-    revealedFacts,
-    withhold,
-    currentEvent,
-    mainLocation,
-    turnIndex,
+    canonicalState,
+    engineWorldTime: readString(ps, "engineWorldTime"),
+    revealedFacts: ps.revealedFacts,
+    withhold: readString(ps, "withhold"),
+    currentEvent: readString(ps, "currentEvent"),
+    mainLocation: readString(ps, "mainLocation"),
+    turnIndex: ps.turnIndex,
   };
 }
 
-/** 잘린 SIDE JSON — speaker/text·narrator만 salvage. */
+function normalizeParallelStoryStringList(raw, maxItems = 12, maxLen = 240) {
+  if (raw == null) return [];
+  if (!Array.isArray(raw) || raw.length > maxItems) return null;
+  const out = [];
+  for (const item of raw) {
+    if (typeof item !== "string") return null;
+    const text = item.trim();
+    if (!text || text.length > maxLen) return null;
+    out.push(text);
+  }
+  return out;
+}
+
+function normalizeParallelStoryStatePatch(raw) {
+  if (raw == null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return null;
+  const patch = {};
+  for (const key of Object.keys(raw)) {
+    if (!PARALLEL_STORY_ALLOWED_STATE_PATCH_KEYS.has(key)) continue;
+    const value = raw[key];
+    if (key === "currentPlace") {
+      if (value == null) continue;
+      if (typeof value !== "string") return null;
+      const text = value.trim();
+      if (text) patch[key] = text;
+      continue;
+    }
+    const list = normalizeParallelStoryStringList(value);
+    if (list == null) return null;
+    patch[key] = list;
+  }
+  return patch;
+}
+
+/** 잘린 SIDE JSON — 닫힌 speaker/text 쌍만 salvage. */
 function salvageParallelStoryFromPartial(rawText, hints = {}) {
   if (typeof rawText !== "string" || !rawText.trim()) return null;
+
   const unescapeJsonString = (s) => {
     try {
       return JSON.parse(`"${s}"`);
@@ -2301,8 +2181,10 @@ function salvageParallelStoryFromPartial(rawText, hints = {}) {
       return s.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
     }
   };
+
   const hintPlace = (hints.place || "").trim();
   const hintWorldTime = (hints.worldTime || "").trim();
+
   const worldTimeM = rawText.match(/"worldTime"\s*:\s*"((?:\\.|[^"\\])*)"/);
   const worldTimeAltM = rawText.match(/"world_time"\s*:\s*"((?:\\.|[^"\\])*)"/);
   const placeM = rawText.match(/"place"\s*:\s*"((?:\\.|[^"\\])*)"/);
@@ -2311,201 +2193,310 @@ function salvageParallelStoryFromPartial(rawText, hints = {}) {
     : worldTimeAltM
       ? unescapeJsonString(worldTimeAltM[1]).trim()
       : hintWorldTime || "방금";
-  const place = placeM ? unescapeJsonString(placeM[1]).trim() : hintPlace;
+  const place = placeM
+    ? unescapeJsonString(placeM[1]).trim()
+    : hintPlace;
   if (!place) return null;
 
   const entries = [];
-  const narratorM = rawText.match(/"narrator"\s*:\s*"((?:\\.|[^"\\])*)"/);
-  if (narratorM) {
-    const narrator = unescapeJsonString(narratorM[1]).trim();
-    if (narrator) entries.push({ speaker: "", text: narrator });
-  }
   const entryRe =
     /"speaker"\s*:\s*"((?:\\.|[^"\\])*)"\s*,\s*"text"\s*:\s*"((?:\\.|[^"\\])*)"/g;
   for (const m of rawText.matchAll(entryRe)) {
     const text = unescapeJsonString(m[2]).trim();
     if (!text) continue;
-    entries.push({ speaker: unescapeJsonString(m[1]).trim(), text });
+    const speaker = unescapeJsonString(m[1]).trim();
+    entries.push({ speaker, text });
   }
-  if (!entries.length) return null;
-  return { show: true, worldTime, place, entries: entries.slice(0, 4) };
+
+  // MAIN 형식 narrator — 잘린 JSON salvage
+  const narratorM = rawText.match(/"narrator"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (narratorM) {
+    const narrator = unescapeJsonString(narratorM[1]).trim();
+    if (narrator) entries.unshift({ speaker: "", text: narrator });
+  }
+
+  if (entries.length === 0) return null;
+  return { show: true, place, entries: entries.slice(0, 6) };
 }
 
-/** 모델 응답은 SIDE 상태만 바꿀 수 있도록 응답 스키마를 재검증·정규화한다. */
-function validateParallelStoryResponse(rawText, metadata = null) {
-  const fallbackPlace = limitedString(
-    metadata?.perspective?.place ?? metadata?.impact?.place,
-    240,
-  );
-  const fallbackTime = limitedString(metadata?.canonicalState?.worldTime, 120);
-  const sideHints = {
-    place: fallbackPlace || "",
-    worldTime: fallbackTime || "방금",
-  };
+/** MAIN story-chat JSON(narrator/lines) → SIDE 형식 변환. */
+function convertMainStyleToParallelStory(parsed, hints = {}) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const hintPlace = (hints.place || "").trim();
+  const hintWorldTime = (hints.worldTime || "").trim();
 
-  const objectText = extractJsonObjectFromText(rawText);
-  if (!objectText) {
-    return salvageParallelStoryFromPartial(rawText, sideHints);
+  const entries = [];
+  const narrator = (
+    typeof parsed.narrator === "string" ? parsed.narrator : ""
+  ).trim();
+  if (narrator) entries.push({ speaker: "", text: narrator });
+
+  const rawLines = Array.isArray(parsed.lines) ? parsed.lines : null;
+  if (rawLines) {
+    for (const line of rawLines.slice(0, 4)) {
+      if (!line || typeof line !== "object" || Array.isArray(line)) continue;
+      const text = (typeof line.text === "string" ? line.text : "").trim();
+      if (!text) continue;
+      const speaker = (
+        typeof line.speaker === "string" ? line.speaker : ""
+      ).trim();
+      entries.push({ speaker, text });
+    }
   }
-  let raw;
+
+  if (entries.length === 0) return null;
+
+  const worldTime = (
+    typeof parsed.worldTime === "string"
+      ? parsed.worldTime
+      : typeof parsed.world_time === "string"
+        ? parsed.world_time
+        : hintWorldTime || "방금"
+  ).trim();
+  const place = (
+    typeof parsed.place === "string"
+      ? parsed.place
+      : typeof parsed.sceneLabel === "string"
+        ? parsed.sceneLabel
+        : hintPlace
+  ).trim();
+  if (!place) return null;
+
+  const out = { show: true, place, entries: entries.slice(0, 6) };
+  if (Object.prototype.hasOwnProperty.call(parsed, "statePatch")) {
+    const patch = normalizeParallelStoryStatePatch(parsed.statePatch);
+    if (patch !== null) out.statePatch = patch;
+  }
+  return out;
+}
+
+/** Claude SIDE 응답 — show·entries·statePatch만 정규화해 앱 파서와 맞춘다. */
+function validateParallelStoryResponse(rawText, hints = {}) {
+  if (typeof rawText !== "string" || !rawText.trim()) {
+    return { ok: false, errorText: "SIDE 응답이 비어 있습니다." };
+  }
+  let parsed;
+  const extracted = extractJsonObjectFromText(rawText);
   try {
-    raw = JSON.parse(objectText);
-  } catch (_) {
-    return salvageParallelStoryFromPartial(rawText, sideHints);
+    parsed = JSON.parse(extracted || rawText.trim());
+  } catch (_e) {
+    const salvaged = salvageParallelStoryFromPartial(rawText, hints);
+    if (salvaged) {
+      console.log(
+        `[parallel-story] salvaged partial JSON entries=${salvaged.entries.length}`,
+      );
+      return { ok: true, text: JSON.stringify(salvaged) };
+    }
+    return { ok: false, errorText: "SIDE JSON 파싱 실패" };
   }
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return salvageParallelStoryFromPartial(rawText, sideHints);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, errorText: "SIDE 응답 형식이 올바르지 않습니다." };
   }
-  if (raw.show === false) return null;
 
-  let worldTime = limitedString(raw.worldTime ?? raw.world_time, 120);
-  let place = limitedString(raw.place ?? raw.location, 240);
-  const rawEntries = Array.isArray(raw.entries)
-    ? raw.entries
-    : Array.isArray(raw.messages)
-      ? raw.messages
-      : Array.isArray(raw.lines)
-        ? raw.lines
-        : null;
-  if (!rawEntries || rawEntries.length < 1) {
-    return salvageParallelStoryFromPartial(rawText, sideHints);
+  const showOk =
+    parsed.show === true ||
+    parsed.show === "true" ||
+    parsed.show === 1;
+  if (!showOk) {
+    const converted = convertMainStyleToParallelStory(parsed, hints);
+    if (converted) {
+      console.log(
+        `[parallel-story] converted MAIN-style JSON entries=${converted.entries.length}`,
+      );
+      return { ok: true, text: JSON.stringify(converted) };
+    }
+    if (parsed.show === false || parsed.show === "false") {
+      return { ok: false, errorText: "SIDE show=false 거부" };
+    }
+  }
+
+  let place = (typeof parsed.place === "string" ? parsed.place : "").trim();
+  let rawEntries = Array.isArray(parsed.entries)
+    ? parsed.entries
+    : Array.isArray(parsed.messages)
+      ? parsed.messages
+      : null;
+
+  if ((!place || !rawEntries) && Array.isArray(parsed.lines)) {
+    const converted = convertMainStyleToParallelStory(parsed, hints);
+    if (converted) {
+      console.log(
+        `[parallel-story] converted lines→entries count=${converted.entries.length}`,
+      );
+      return { ok: true, text: JSON.stringify(converted) };
+    }
+  }
+
+  if (!place) place = (hints.place || "").trim();
+
+  if (!place || !rawEntries) {
+    const salvaged = salvageParallelStoryFromPartial(rawText, hints);
+    if (salvaged?.entries?.length) {
+      console.log(
+        `[parallel-story] salvaged missing fields entries=${salvaged.entries.length}`,
+      );
+      return { ok: true, text: JSON.stringify(salvaged) };
+    }
+    return { ok: false, errorText: "SIDE 필수 필드 누락" };
   }
 
   const entries = [];
-  const narrator = limitedString(raw.narrator, 800);
-  if (narrator) entries.push({ speaker: "", text: narrator });
-  for (const entry of rawEntries.slice(0, 4)) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    const text = limitedString(
-      entry.text ?? entry.content ?? entry.body ?? entry.line ?? entry.dialogue,
-      800,
-    );
-    if (!text) continue;
-    let speaker = "";
-    const rawSpeaker = entry.speaker ?? entry.name ?? entry.character ?? entry.role;
-    if (rawSpeaker != null && String(rawSpeaker).trim()) {
-      const parsedSpeaker = limitedString(String(rawSpeaker), 120);
-      speaker = parsedSpeaker || String(rawSpeaker).trim().slice(0, 120);
+  for (const rawEntry of rawEntries.slice(0, 6)) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      continue;
     }
-    entries.push({ speaker, text });
+    const text = (typeof rawEntry.text === "string" ? rawEntry.text : "")
+      .trim();
+    if (!text) continue;
+    const speaker = (
+      typeof rawEntry.speaker === "string" ? rawEntry.speaker : ""
+    ).trim();
+    const kind = (
+      typeof rawEntry.kind === "string" ? rawEntry.kind : ""
+    ).trim();
+    const normalizedEntry = { speaker, text };
+    if (kind) normalizedEntry.kind = kind;
+    entries.push(normalizedEntry);
   }
-  if (!entries.length) {
-    return salvageParallelStoryFromPartial(rawText, sideHints);
+  if (entries.length === 0) {
+    const salvaged = salvageParallelStoryFromPartial(rawText, hints);
+    if (salvaged?.entries?.length) {
+      console.log(
+        `[parallel-story] salvaged empty entries entries=${salvaged.entries.length}`,
+      );
+      return { ok: true, text: JSON.stringify(salvaged) };
+    }
+    const converted = convertMainStyleToParallelStory(parsed, hints);
+    if (converted?.entries?.length) {
+      return { ok: true, text: JSON.stringify(converted) };
+    }
+    return { ok: false, errorText: "SIDE entries가 비어 있습니다." };
   }
-
-  if (!place && fallbackPlace) place = fallbackPlace;
-  if (!worldTime) worldTime = fallbackTime || "방금";
-  if (!place) place = "다른 곳";
 
   let statePatch;
-  if (raw.statePatch && typeof raw.statePatch === "object" && !Array.isArray(raw.statePatch)) {
-    statePatch = {};
-    for (const key of ["currentPlace", "worldTime"]) {
-      if (raw.statePatch[key] === undefined) continue;
-      const value = limitedString(raw.statePatch[key], key === "worldTime" ? 120 : 240);
-      if (value) statePatch[key] = value;
+  if (Object.prototype.hasOwnProperty.call(parsed, "statePatch")) {
+    statePatch = normalizeParallelStoryStatePatch(parsed.statePatch);
+    if (parsed.statePatch != null && statePatch == null) {
+      console.log("[parallel-story] ignored invalid statePatch");
+      statePatch = undefined;
     }
-    for (const key of ["factsAdd", "unresolvedThreadsAdd", "unresolvedThreadsResolve"]) {
-      if (raw.statePatch[key] === undefined) continue;
-      const value = limitedStringList(raw.statePatch[key], 12, 240);
-      if (value) statePatch[key] = value;
-    }
-    if (!Object.keys(statePatch).length) statePatch = undefined;
-  } else if (raw.statePatch === null) {
-    statePatch = undefined;
   }
-  return { show: true, worldTime, place, entries, ...(statePatch ? { statePatch } : {}) };
+
+  const normalized = { show: true, place, entries };
+  if (statePatch !== undefined) normalized.statePatch = statePatch;
+  return { ok: true, text: JSON.stringify(normalized) };
 }
 
-/** 노드 기반 movie_story — MAIN 턴마다 Claude Sonnet 5로 별도 장소 시점 1턴을 생성한다. */
+/** 메인 확정 뒤 「한편…」 SIDE — Claude Sonnet 5 전용. */
 async function handleParallelStoryPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
-  const promptRaw = req.body && req.body.prompt;
-  if (typeof promptRaw !== "string" || !promptRaw.trim()) {
-    return res.status(400).json({ text: "prompt 필드가 필요합니다." });
-  }
-  const metadata = parseParallelStoryMetadata(req.body);
-  if (!metadata) {
-    return res.status(400).json({ text: "유효한 노드 엔진 SIDE 메타데이터가 필요합니다." });
-  }
-  if (!isAnthropicConfigured()) {
-    return res.status(503).json({ text: "Anthropic is not configured" });
-  }
+  try {
+    const promptRaw = req.body && req.body.prompt;
+    if (typeof promptRaw !== "string" || !promptRaw.trim()) {
+      return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+    }
+    const metadata = parseParallelStoryMetadata(req.body);
+    if (!metadata) {
+      return res
+        .status(400)
+        .json({ text: "유효한 노드 엔진 SIDE 메타데이터가 필요합니다." });
+    }
 
-  const prompt = sanitizePromptForApi(promptRaw).slice(0, MAX_PROMPT_CHARS);
-  if (!prompt) {
-    return res.status(400).json({ text: "prompt 필드가 필요합니다." });
-  }
+    let cleanedPrompt = sanitizePromptForApi(promptRaw);
+    if (!cleanedPrompt) {
+      return res.status(400).json({ text: "prompt 필드가 필요합니다." });
+    }
+    if (cleanedPrompt.length > MAX_PROMPT_CHARS) {
+      cleanedPrompt =
+        cleanedPrompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[…prompt truncated]";
+    }
 
-  const requestedTemperature = Number(req.body && req.body.temperature);
-  const temperature =
-    Number.isFinite(requestedTemperature) &&
-    requestedTemperature >= 0 &&
-    requestedTemperature <= 2
-      ? requestedTemperature
-      : 0.78;
-  const requestedMax = Number(req.body && req.body.maxTokens);
-  const max_tokens =
-    Number.isFinite(requestedMax) && requestedMax > 0
-      ? Math.min(640, Math.max(360, Math.floor(requestedMax)))
-      : 480;
+    if (!isAnthropicConfigured()) {
+      console.error(
+        "[parallel-story] Anthropic is not configured (set ANTHROPIC_API_KEY)",
+      );
+      return res.status(503).json({ text: "Anthropic is not configured" });
+    }
 
-  console.log(
-    `[parallel-story] provider=anthropic model=${PARALLEL_STORY_ANTHROPIC_MODEL} promptLen=${prompt.length}`,
-  );
-  const result = await callAnthropicCompletion({
-    userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
-    systemPrompt: PARALLEL_STORY_SYSTEM_PROMPT,
-    temperature,
-    max_tokens,
-    model: PARALLEL_STORY_ANTHROPIC_MODEL,
-    logTag: "parallel-story",
-    fetchTimeoutMs: PARALLEL_STORY_LLM_TIMEOUT_MS,
-    disableThinking: true,
-  });
-  if (!result.ok) {
-    return res
-      .status(result.status || 502)
-      .json({ text: result.errorText || "동시 진행 생성 실패" });
-  }
-  let validated = validateParallelStoryResponse(result.text, metadata);
-  if (!validated) {
-    console.warn(
-      `[parallel-story] rejected rawLen=${(result.text || "").length} ` +
-        `raw=${JSON.stringify(String(result.text || "").slice(0, 2000))} — retry`,
+    const requestedTemperature = Number(req.body && req.body.temperature);
+    const temperature =
+      Number.isFinite(requestedTemperature) &&
+      requestedTemperature >= 0 &&
+      requestedTemperature <= 2
+        ? requestedTemperature
+        : 0.78;
+    const requestedMax = Number(req.body && req.body.maxTokens);
+    const max_tokens =
+      Number.isFinite(requestedMax) && requestedMax > 0
+        ? Math.min(640, Math.max(360, Math.floor(requestedMax)))
+        : 480;
+    const sideHints = {
+      place: metadata.perspective.place,
+      worldTime:
+        readString(req.body && req.body.parallelStory, "engineWorldTime") ||
+        readString(metadata.canonicalState, "worldTime") ||
+        "방금",
+    };
+
+    console.log(
+      `[parallel-story] provider=anthropic model=${PARALLEL_STORY_ANTHROPIC_MODEL} ` +
+        `nodeId=${metadata.nodeId || "(none)"} ` +
+        `place=${metadata.perspective.place} ` +
+        `promptLen=${cleanedPrompt.length} maxTokens=${max_tokens}`,
     );
-    const retry = await callAnthropicCompletion({
-      userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
+
+    const llmResult = await callAnthropicCompletion({
+      model: PARALLEL_STORY_ANTHROPIC_MODEL,
+      userPrompt: cleanedPrompt,
       systemPrompt: PARALLEL_STORY_SYSTEM_PROMPT,
       temperature,
       max_tokens,
-      model: PARALLEL_STORY_ANTHROPIC_MODEL,
-      logTag: "parallel-story-retry",
+      logTag: "parallel-story",
       fetchTimeoutMs: PARALLEL_STORY_LLM_TIMEOUT_MS,
       disableThinking: true,
     });
-    if (retry.ok) {
-      validated = validateParallelStoryResponse(retry.text, metadata);
-      if (!validated) {
-        console.warn(
-          `[parallel-story] retry rejected rawLen=${(retry.text || "").length} ` +
-            `raw=${JSON.stringify(String(retry.text || "").slice(0, 2000))}`,
-        );
-      }
-    } else {
-      console.warn(
-        `[parallel-story] retry failed status=${retry.status || 0} ` +
-          `error=${JSON.stringify(retry.errorText || "")}`,
-      );
+
+    if (!llmResult.ok) {
+      const statusOut = llmResult.status || 502;
+      return res
+        .status(statusOut)
+        .json({ text: llmResult.errorText || "SIDE 생성 실패" });
     }
-  }
-  if (!validated) {
-    console.warn(
-      `[parallel-story] rejected invalid SIDE response rawLen=${(result.text || "").length} preview=${String(result.text || "").slice(0, 240)}`,
+
+    const validated = validateParallelStoryResponse(
+      llmResult.text || "",
+      sideHints,
     );
-    return res.status(502).json({ text: "SIDE 응답 형식이 올바르지 않습니다." });
+    if (!validated.ok) {
+      const salvaged = salvageParallelStoryFromPartial(
+        llmResult.text || "",
+        sideHints,
+      );
+      if (salvaged) {
+        console.log(
+          `[parallel-story] validator fail → salvaged entries=${salvaged.entries.length} ` +
+            `err=${validated.errorText}`,
+        );
+        return res.json({ text: JSON.stringify(salvaged) });
+      }
+      console.log(
+        `[parallel-story] validator rejected: ${validated.errorText} ` +
+          `rawLen=${(llmResult.text || "").length}`,
+      );
+      return res.status(502).json({
+        text: validated.errorText || "SIDE 응답 형식이 올바르지 않습니다.",
+      });
+    }
+
+    return res.json({ text: validated.text });
+  } catch (e) {
+    const msg = e && e.message ? String(e.message) : String(e);
+    console.error("[ai-server] POST /api/parallel-story error:", msg);
+    if (e && e.name === "AbortError") {
+      return res.status(504).json({ text: "요청 시간이 초과되었습니다." });
+    }
+    return res.status(500).json({ text: "server error" });
   }
-  return res.json({ text: JSON.stringify(validated) });
 }
 
 function resolveStorySuggestionMaxTokens(requested) {
@@ -3994,10 +3985,15 @@ app.post("/api/story-chat", async (req, res) => {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
   const t0 = Date.now();
+  const turnId = readString(req.body, "turn_id");
+  const wantStreamEarly = req.body && req.body.stream === true;
+  noteStoryChatTurnRequest(turnId, wantStreamEarly ? "stream" : "json");
   const logTiming = (label) => {
-    console.log(`[story-chat timing] ${label} +${Date.now() - t0}ms`);
+    console.log(
+      `[story-chat timing] turnId=${turnId || "(none)"} ${label} +${Date.now() - t0}ms`,
+    );
   };
-  logTiming("request_received");
+  logTiming(`request_received mode=${wantStreamEarly ? "stream" : "json"}`);
 
   try {
     const promptRaw = req.body && req.body.prompt;
@@ -4039,40 +4035,10 @@ app.post("/api/story-chat", async (req, res) => {
     }
     logTiming("prompt_ready");
 
-    const promptSegments = readStoryChatPromptSegments(req.body);
-    const auditRaw = req.body && req.body.prompt_token_audit;
-    const storyId = readString(req.body, "story_id");
-    let promptTokenAuditResult = null;
-    if (auditRaw && typeof auditRaw === "object") {
-      const auditStaticEngine =
-        readString(auditRaw, "static_engine") ||
-        (promptSegments ? promptSegments.staticEngine : "");
-      const auditNodeStatic =
-        readString(auditRaw, "node_static") ||
-        (promptSegments ? promptSegments.nodeStatic : "");
-      const auditDynamicContext =
-        readString(auditRaw, "dynamic_context") ||
-        (promptSegments ? promptSegments.dynamicContext : "");
-      const auditNodeId =
-        readString(auditRaw, "node_id") ||
-        (promptSegments ? promptSegments.nodeId : "");
-      if (auditStaticEngine || auditNodeStatic || auditDynamicContext) {
-        logTiming("token_audit_start");
-        promptTokenAuditResult = await auditStoryChatPromptTokens({
-          model: STORY_CHAT_ANTHROPIC_MODEL,
-          anthropicSystem: STORY_JSON_SYSTEM_PROMPT,
-          staticEngine: auditStaticEngine,
-          nodeStatic: auditNodeStatic,
-          dynamicContext: auditDynamicContext,
-          fullUserPrompt: cleanedPrompt,
-          nodeId: auditNodeId,
-          storyId,
-        });
-        logTiming("token_audit_done");
-      }
-    }
+    const anthropicPrompt = storyChatAnthropicPromptArgs(req.body, cleanedPrompt);
 
     const sceneContext = storyContext || cleanedPrompt;
+    const storyId = readString(req.body, "story_id");
     const programId = readString(req.body, "program_id");
     const beatScene = readString(req.body, "beat_scene");
 
@@ -4107,7 +4073,13 @@ app.post("/api/story-chat", async (req, res) => {
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
       res.setHeader("Cache-Control", "no-cache, no-transform");
       res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
       res.flushHeaders?.();
+
+      writeSse(res, {
+        type: "heartbeat",
+        turn_id: turnId || null,
+      });
 
       let sceneData = {
         scene: "default",
@@ -4132,12 +4104,12 @@ app.post("/api/story-chat", async (req, res) => {
       logTiming("provider_started");
       const llmResult = await callAnthropicCompletionStream({
         model: STORY_CHAT_ANTHROPIC_MODEL,
-        userPrompt: cleanedPrompt,
+        userPrompt: anthropicPrompt.userPrompt,
         temperature,
         max_tokens,
         logTag: "story-chat-stream",
-        systemPrompt: STORY_JSON_SYSTEM_PROMPT,
-        promptSegments,
+        systemPrompt: anthropicPrompt.systemPrompt,
+        promptSegments: anthropicPrompt.promptSegments,
         onFirstToken: () => logTiming("first_token"),
         onDelta: (piece) => {
           writeSse(res, { type: "delta", text: piece });
@@ -4170,7 +4142,6 @@ app.post("/api/story-chat", async (req, res) => {
         preload: sceneData.preload,
         scene_source: sceneData.source,
         raw: llmResult.raw,
-        ...(promptTokenAuditResult ? { prompt_token_audit: promptTokenAuditResult } : {}),
       });
       res.end();
       return;
@@ -4178,14 +4149,14 @@ app.post("/api/story-chat", async (req, res) => {
 
     const llmResult = await callAnthropicCompletion({
       model: STORY_CHAT_ANTHROPIC_MODEL,
-      userPrompt: cleanedPrompt,
-      systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+      userPrompt: anthropicPrompt.userPrompt,
+      systemPrompt: anthropicPrompt.systemPrompt,
+      promptSegments: anthropicPrompt.promptSegments,
       temperature,
       max_tokens,
       logTag: "story-chat",
       fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
       disableThinking: true,
-      promptSegments,
     });
     logTiming("provider_completed");
 
@@ -4201,15 +4172,15 @@ app.post("/api/story-chat", async (req, res) => {
       );
       finalLlm = await callAnthropicCompletion({
         model: STORY_CHAT_ANTHROPIC_MODEL,
-        userPrompt: cleanedPrompt,
-        systemPrompt: STORY_JSON_SYSTEM_PROMPT,
+        userPrompt: anthropicPrompt.userPrompt,
+        systemPrompt: anthropicPrompt.systemPrompt,
+        promptSegments: anthropicPrompt.promptSegments,
         temperature,
         max_tokens: retryMax,
         logTag: "story-chat",
         fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
         _attempt: 1,
         disableThinking: true,
-        promptSegments,
       });
       logTiming("provider_json_retry_completed");
     }
@@ -4285,7 +4256,6 @@ app.post("/api/story-chat", async (req, res) => {
       preload: sceneData.preload,
       scene_source: sceneData.source,
       raw: upstreamRaw,
-      ...(promptTokenAuditResult ? { prompt_token_audit: promptTokenAuditResult } : {}),
     });
   } catch (e) {
     console.error("[story-chat server error]", e);
