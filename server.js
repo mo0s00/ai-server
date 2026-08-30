@@ -36,6 +36,10 @@ const STORY_CREATION_ANTHROPIC_MODEL = (
 const STORY_SCENE_ANTHROPIC_MODEL = (
   process.env.STORY_SCENE_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
 ).trim();
+/** 오른쪽 「한편…」 SIDE — Claude Sonnet 5 */
+const PARALLEL_STORY_ANTHROPIC_MODEL = (
+  process.env.PARALLEL_STORY_ANTHROPIC_MODEL || "claude-sonnet-5"
+).trim();
 const ANTHROPIC_VERSION = "2023-06-01";
 
 /** 스토리 텍스트 LLM — Anthropic 전용. TTS·이미지는 OpenAI. DeepSeek 미사용. */
@@ -44,10 +48,6 @@ const DEEPSEEK_CHAT_URL = (
 ).trim();
 const DEEPSEEK_API_KEY = (process.env.DEEPSEEK_API_KEY || "").trim();
 const DEEPSEEK_MODEL = (process.env.DEEPSEEK_MODEL || "deepseek-chat").trim();
-/** 「한편…」 동시 진행 전용 — 메인 Claude와 비용·역할을 분리한다. */
-const PARALLEL_STORY_DEEPSEEK_MODEL = (
-  process.env.PARALLEL_STORY_DEEPSEEK_MODEL || DEEPSEEK_MODEL
-).trim();
 
 /** @returns {{ provider: string, url: string, apiKey: string, model: string } | null} */
 function resolveDeepSeekConfig() {
@@ -112,14 +112,14 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-story-v6";
+const SERVER_REV = "parallel-story-sonnet-5";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
   "You write parallel SIDE scenes (separate location from MAIN). " +
   'Return ONE JSON object: {"show":true,"worldTime":"...","place":"...","entries":[{"speaker":"name or empty","text":"..."}],"statePatch":{optional}}. ' +
   "entries: 1-4. Empty speaker = narration. Do NOT use narrator/lines/voiceText. No markdown.";
-const PARALLEL_STORY_LLM_TIMEOUT_MS = 12000;
+const PARALLEL_STORY_LLM_TIMEOUT_MS = 20000;
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -223,6 +223,10 @@ function buildHealthPayload() {
     storyCreationModel: isAnthropicConfigured() ? STORY_CREATION_ANTHROPIC_MODEL : "",
     storySceneProvider: isAnthropicConfigured() ? "anthropic" : "none",
     storySceneModel: isAnthropicConfigured() ? STORY_SCENE_ANTHROPIC_MODEL : "",
+    parallelStoryProvider: isAnthropicConfigured() ? "anthropic" : "none",
+    parallelStoryModel: isAnthropicConfigured()
+      ? PARALLEL_STORY_ANTHROPIC_MODEL
+      : "",
     deepseekConfigured: isDeepSeekConfigured(),
     chatLlmProvider: isAnthropicConfigured() ? "anthropic" : "none",
     chatLlmModel: isAnthropicConfigured() ? STORY_CREATION_ANTHROPIC_MODEL : "",
@@ -2409,7 +2413,7 @@ function validateParallelStoryResponse(rawText, metadata = null) {
   return { show: true, worldTime, place, entries, ...(statePatch ? { statePatch } : {}) };
 }
 
-/** 노드 기반 movie_story — MAIN 턴마다 DeepSeek로 별도 장소 시점 1턴을 생성한다. */
+/** 노드 기반 movie_story — MAIN 턴마다 Claude Sonnet 5로 별도 장소 시점 1턴을 생성한다. */
 async function handleParallelStoryPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
   const promptRaw = req.body && req.body.prompt;
@@ -2420,8 +2424,8 @@ async function handleParallelStoryPost(req, res) {
   if (!metadata) {
     return res.status(400).json({ text: "유효한 노드 엔진 SIDE 메타데이터가 필요합니다." });
   }
-  if (!isDeepSeekConfigured()) {
-    return res.status(503).json({ text: "DeepSeek is not configured" });
+  if (!isAnthropicConfigured()) {
+    return res.status(503).json({ text: "Anthropic is not configured" });
   }
 
   const prompt = sanitizePromptForApi(promptRaw).slice(0, MAX_PROMPT_CHARS);
@@ -2429,19 +2433,31 @@ async function handleParallelStoryPost(req, res) {
     return res.status(400).json({ text: "prompt 필드가 필요합니다." });
   }
 
+  const requestedTemperature = Number(req.body && req.body.temperature);
+  const temperature =
+    Number.isFinite(requestedTemperature) &&
+    requestedTemperature >= 0 &&
+    requestedTemperature <= 2
+      ? requestedTemperature
+      : 0.78;
+  const requestedMax = Number(req.body && req.body.maxTokens);
+  const max_tokens =
+    Number.isFinite(requestedMax) && requestedMax > 0
+      ? Math.min(640, Math.max(360, Math.floor(requestedMax)))
+      : 480;
+
   console.log(
-    `[parallel-story] provider=deepseek model=${PARALLEL_STORY_DEEPSEEK_MODEL} promptLen=${prompt.length}`,
+    `[parallel-story] provider=anthropic model=${PARALLEL_STORY_ANTHROPIC_MODEL} promptLen=${prompt.length}`,
   );
-  const result = await callOpenAiCompletion({
+  const result = await callAnthropicCompletion({
     userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
     systemPrompt: PARALLEL_STORY_SYSTEM_PROMPT,
-    temperature: 0.78,
-    max_tokens: 720,
-    model: PARALLEL_STORY_DEEPSEEK_MODEL,
+    temperature,
+    max_tokens,
+    model: PARALLEL_STORY_ANTHROPIC_MODEL,
     logTag: "parallel-story",
-    jsonMode: true,
-    preferJson: true,
     fetchTimeoutMs: PARALLEL_STORY_LLM_TIMEOUT_MS,
+    disableThinking: true,
   });
   if (!result.ok) {
     return res
@@ -2451,31 +2467,30 @@ async function handleParallelStoryPost(req, res) {
   let validated = validateParallelStoryResponse(result.text, metadata);
   if (!validated) {
     console.warn(
-      `[parallel-story] jsonMode rejected rawLen=${(result.text || "").length} ` +
-        `raw=${JSON.stringify(String(result.text || "").slice(0, 2000))} — retry plain`,
+      `[parallel-story] rejected rawLen=${(result.text || "").length} ` +
+        `raw=${JSON.stringify(String(result.text || "").slice(0, 2000))} — retry`,
     );
-    const retry = await callOpenAiCompletion({
+    const retry = await callAnthropicCompletion({
       userPrompt: `${prompt}\n\n[서버 검증 노드 메타데이터]\n${JSON.stringify(metadata)}`,
       systemPrompt: PARALLEL_STORY_SYSTEM_PROMPT,
-      temperature: 0.78,
-      max_tokens: 720,
-      model: PARALLEL_STORY_DEEPSEEK_MODEL,
+      temperature,
+      max_tokens,
+      model: PARALLEL_STORY_ANTHROPIC_MODEL,
       logTag: "parallel-story-retry",
-      jsonMode: false,
-      preferJson: true,
       fetchTimeoutMs: PARALLEL_STORY_LLM_TIMEOUT_MS,
+      disableThinking: true,
     });
     if (retry.ok) {
       validated = validateParallelStoryResponse(retry.text, metadata);
       if (!validated) {
         console.warn(
-          `[parallel-story] plain retry rejected rawLen=${(retry.text || "").length} ` +
+          `[parallel-story] retry rejected rawLen=${(retry.text || "").length} ` +
             `raw=${JSON.stringify(String(retry.text || "").slice(0, 2000))}`,
         );
       }
     } else {
       console.warn(
-        `[parallel-story] plain retry failed status=${retry.status || 0} ` +
+        `[parallel-story] retry failed status=${retry.status || 0} ` +
           `error=${JSON.stringify(retry.errorText || "")}`,
       );
     }
