@@ -19,9 +19,9 @@ const ANTHROPIC_MODEL = (
 const STORY_CHAT_ANTHROPIC_MODEL = (
   process.env.STORY_CHAT_ANTHROPIC_MODEL || "claude-sonnet-5"
 ).trim();
-/** 플레이어 추천문 2~3개 — Claude Haiku 4.5 */
+/** 플레이어 추천문 2~3개 — Claude Sonnet 5 */
 const STORY_SUGGESTION_ANTHROPIC_MODEL = (
-  process.env.STORY_SUGGESTION_ANTHROPIC_MODEL || "claude-haiku-4-5-20251001"
+  process.env.STORY_SUGGESTION_ANTHROPIC_MODEL || "claude-sonnet-5"
 ).trim();
 /** 스토리 실시간 관중 댓글 — Claude Opus 5 */
 const LIVE_COMMENT_ANTHROPIC_MODEL = (
@@ -111,7 +111,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "story-chat-sonnet-5-v1";
+const SERVER_REV = "story-suggestion-sonnet-5-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -2506,7 +2506,7 @@ function resolveStorySuggestionMaxTokens(requested) {
   return resolveStoryLlmMaxTokens(requested, model);
 }
 
-/** 스토리 beat 추천 재작성 — Claude Opus 4.6 (Anthropic 필수). */
+/** 스토리 beat 추천 재작성 — Claude Sonnet 5 (Anthropic 필수). */
 async function handleStorySuggestionsPost(req, res) {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
@@ -2565,6 +2565,7 @@ async function handleStorySuggestionsPost(req, res) {
       max_tokens,
       logTag: "story-suggestions",
       fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+      disableThinking: true,
     });
 
     if (!llmResult.ok) {
