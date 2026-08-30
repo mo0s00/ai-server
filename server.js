@@ -112,7 +112,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-story-sonnet-5";
+const SERVER_REV = "parallel-story-sonnet-5-v2";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -2237,6 +2237,7 @@ function parseParallelStoryMetadata(body) {
     "perspective",
     "impact",
     "canonicalState",
+    "engineWorldTime",
     "revealedFacts",
     "withhold",
     "currentEvent",
@@ -2270,6 +2271,8 @@ function parseParallelStoryMetadata(body) {
       ? Math.max(0, Math.min(9999, Number(raw.turnIndex ?? 0)))
       : null;
   if (turnIndex === null) return null;
+  const engineWorldTime =
+    raw.engineWorldTime == null ? "" : limitedString(raw.engineWorldTime, 120) ?? "";
   return {
     nodeId,
     perspective,
@@ -2279,6 +2282,7 @@ function parseParallelStoryMetadata(body) {
       facts,
       unresolvedThreads,
     },
+    engineWorldTime,
     revealedFacts,
     withhold,
     currentEvent,
