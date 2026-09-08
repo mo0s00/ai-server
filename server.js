@@ -5,6 +5,11 @@ import FormData from "form-data";
 import { PassThrough } from "node:stream";
 import { createClient } from "@supabase/supabase-js";
 import { handleIapCookieVerifyPost } from "./iap-cookie.js";
+import {
+  isElevenLabsConfigured,
+  synthesizeElevenLabsMp3,
+  elevenLabsTtsModel,
+} from "./elevenlabs-tts.js";
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
@@ -115,7 +120,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "chat-llm-sonnet-5-v1";
+const SERVER_REV = "parallel-tts-elevenlabs-presets-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -211,6 +216,8 @@ function buildHealthPayload() {
   return {
     ok: true,
     openaiConfigured: !!OPENAI_API_KEY,
+    elevenlabsConfigured: isElevenLabsConfigured(),
+    elevenlabsTtsModel: isElevenLabsConfigured() ? elevenLabsTtsModel() : "",
     anthropicConfigured: isAnthropicConfigured(),
     storyChatProvider,
     storyChatModel,
@@ -4297,13 +4304,51 @@ app.post("/api/story-tts", async (req, res) => {
     const text = readString(req.body, "text");
     const voiceRaw = readString(req.body, "voice") || "alloy";
     const provider = (readString(req.body, "provider") || "openai").toLowerCase();
+    const voicePreset = readString(req.body, "voicePreset");
+    const ageStyle = readString(req.body, "ageStyle");
+    const gender = readString(req.body, "gender");
+    const language = readString(req.body, "language") || "ko";
+    const wantsEleven =
+      provider === "elevenlabs" || provider === "eleven" || provider === "11labs";
 
     if (!text) {
       return res.status(400).json({ ok: false, error: "no text" });
     }
-    if (provider !== "openai") {
+
+    if (wantsEleven) {
+      if (isElevenLabsConfigured()) {
+        try {
+          const buffer = await synthesizeElevenLabsMp3({
+            text,
+            voiceRaw,
+            voicePreset,
+            voiceSettings: req.body && req.body.voiceSettings,
+            ageStyle,
+            gender,
+            language,
+          });
+          res.setHeader("Content-Type", "audio/mpeg");
+          res.setHeader("Cache-Control", "private, max-age=86400");
+          return res.send(buffer);
+        } catch (e) {
+          const raw = e?.upstream || e?.message || "elevenlabs tts failed";
+          console.error("[story-tts] elevenlabs error", e?.status || "", raw);
+          return res.status(e?.status || 502).json({
+            ok: false,
+            error: String(raw).slice(0, 200),
+          });
+        }
+      }
+      if (!OPENAI_API_KEY) {
+        return res.status(500).json({ ok: false, error: "no ELEVENLABS_API_KEY" });
+      }
+      console.warn(
+        `[story-tts] elevenlabs missing key → openai fallback preset=${voicePreset || "none"}`,
+      );
+    } else if (provider !== "openai") {
       return res.status(400).json({ ok: false, error: "unsupported provider" });
     }
+
     if (!OPENAI_API_KEY) {
       return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
     }
@@ -6291,7 +6336,11 @@ if (isAnthropicConfigured()) {
   console.error("[story-chat] ERROR Anthropic is not configured (set ANTHROPIC_API_KEY)");
 }
 console.log(
-  `[ai-server] openaiConfigured=${!!OPENAI_API_KEY} (TTS/image only)`,
+  `[ai-server] openaiConfigured=${!!OPENAI_API_KEY} (image / TTS fallback)`,
+);
+console.log(
+  `[ai-server] elevenlabsConfigured=${isElevenLabsConfigured()} ` +
+    `(parallel TTS model=${isElevenLabsConfigured() ? elevenLabsTtsModel() : "none"})`,
 );
 if (!isAnthropicConfigured()) {
   console.log(
