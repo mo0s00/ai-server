@@ -1,5 +1,7 @@
 /** ElevenLabs TTS — 품질 우선. 라이브러리 음성을 먼저 쓰고, 막히면 계정 목소리로 내린다. */
 
+import { voiceSettingsFromEmotionPreset } from "./elevenlabs-emotion-presets.js";
+
 const ELEVENLABS_API_KEY = (
   process.env.ELEVENLABS_API_KEY ||
   process.env.ELEVEN_API_KEY ||
@@ -324,6 +326,8 @@ export async function synthesizeElevenLabsMp3({
   text,
   voiceRaw,
   voicePreset,
+  voiceEmotion,
+  voiceIntensity,
   voiceSettings,
   ageStyle,
   gender,
@@ -369,7 +373,20 @@ export async function synthesizeElevenLabsMp3({
     throw err;
   }
 
-  const settings = normalizeElevenLabsVoiceSettings(voiceSettings);
+  const emotionPreset =
+    String(voiceEmotion || "").trim().length > 0
+      ? voiceSettingsFromEmotionPreset(voiceEmotion, voiceIntensity)
+      : null;
+  const settings = emotionPreset
+    ? {
+        stability: emotionPreset.stability,
+        similarity_boost: emotionPreset.similarity_boost,
+        style: emotionPreset.style,
+        speed: emotionPreset.speed,
+        use_speaker_boost: emotionPreset.use_speaker_boost,
+      }
+    : normalizeElevenLabsVoiceSettings(voiceSettings);
+  const effectivePreset = emotionPreset?.presetId || voicePreset || "calm";
   const lang = String(language || "ko").trim().toLowerCase() || "ko";
   const isLowLatency = /flash|turbo/i.test(ELEVENLABS_TTS_MODEL);
   const body = {
@@ -393,7 +410,9 @@ export async function synthesizeElevenLabsMp3({
     const voiceName = voiceNameById(voices, voiceId);
     console.log(
       `[story-tts] elevenlabs requested=${requested || "(empty)"} ` +
-        `locked=${locked ? 1 : 0} preset=${voicePreset || "calm"} ` +
+        `locked=${locked ? 1 : 0} preset=${effectivePreset} ` +
+        `emotion=${String(voiceEmotion || "").trim() || "-"} ` +
+        `intensity=${String(voiceIntensity || "").trim() || "-"} ` +
         `voice=${voiceId} name=${voiceName || "?"} model=${ELEVENLABS_TTS_MODEL} ` +
         `output=${ELEVENLABS_OUTPUT_FORMAT} ` +
         `speed=${settings.speed} stability=${settings.stability} ` +

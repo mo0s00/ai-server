@@ -5,6 +5,7 @@ import FormData from "form-data";
 import { PassThrough } from "node:stream";
 import { createClient } from "@supabase/supabase-js";
 import { handleIapCookieVerifyPost } from "./iap-cookie.js";
+import { primeCharacterProfilesFromBody } from "./character-profile-cache.js";
 import {
   isElevenLabsConfigured,
   synthesizeElevenLabsMp3,
@@ -120,14 +121,15 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-tts-mp3-128-v1";
+const SERVER_REV = "parallel-voice-cast-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
   "You write parallel SIDE scenes (separate location from MAIN). " +
-  'Reply with ONE JSON object only: {"show":true,"place":"...","entries":[{"kind":"narration|dialogue|beat|timeMark","speaker":"name or empty","text":"..."}],"statePatch":{optional}}. ' +
-  "entries: 4-6. Do NOT output worldTime or world_time. Do NOT use narrator/lines/voiceText. No markdown.";
-const PARALLEL_STORY_LLM_TIMEOUT_MS = 20000;
+  'Reply with ONE JSON object only: {"show":true,"place":"...","entries":[{"kind":"narration|dialogue|beat|timeMark","speaker":"name or empty","text":"...","voiceEmotion":"calm|happy|sad|tense|frightened|angry|irritated|cold|threatening|whisper","voiceIntensity":"low|medium|high"}],"statePatch":{optional}}. ' +
+  "entries: 4-6. For every dialogue entry include voiceEmotion and voiceIntensity (categorical only, never numeric TTS settings). " +
+  "Do NOT output worldTime or world_time. Do NOT use narrator/lines/voiceText. No markdown.";
+const PARALLEL_STORY_LLM_TIMEOUT_MS = 35000;
 
 /** 표지·장면 배경 GPT 이미지 — 기본 꺼짐. Render에 `STORY_IMAGE_GENERATION=1` 일 때만 허용. */
 function storyImageGenerationEnabled() {
@@ -2367,6 +2369,14 @@ function validateParallelStoryResponse(rawText, hints = {}) {
     ).trim();
     const normalizedEntry = { speaker, text };
     if (kind) normalizedEntry.kind = kind;
+    const voiceEmotion = (
+      typeof rawEntry.voiceEmotion === "string" ? rawEntry.voiceEmotion : ""
+    ).trim();
+    const voiceIntensity = (
+      typeof rawEntry.voiceIntensity === "string" ? rawEntry.voiceIntensity : ""
+    ).trim();
+    if (voiceEmotion) normalizedEntry.voiceEmotion = voiceEmotion;
+    if (voiceIntensity) normalizedEntry.voiceIntensity = voiceIntensity;
     entries.push(normalizedEntry);
   }
   if (entries.length === 0) {
@@ -4053,6 +4063,12 @@ app.post("/api/story-chat", async (req, res) => {
     const storyId = readString(req.body, "story_id");
     const programId = readString(req.body, "program_id");
     const beatScene = readString(req.body, "beat_scene");
+    const primed = primeCharacterProfilesFromBody(req.body);
+    if (primed > 0) {
+      console.log(
+        `[story-chat] character_cache sliding_ttl=1h primed=${primed} storyId=${storyId || "(none)"}`,
+      );
+    }
 
     if (process.env.STORY_PROMPT_DUMP === "1") {
       console.log("[storyPromptDump] === SERVER START ===");
@@ -4321,6 +4337,8 @@ app.post("/api/story-tts", async (req, res) => {
     const voiceRaw = readString(req.body, "voice") || "alloy";
     const provider = (readString(req.body, "provider") || "openai").toLowerCase();
     const voicePreset = readString(req.body, "voicePreset");
+    const voiceEmotion = readString(req.body, "voiceEmotion");
+    const voiceIntensity = readString(req.body, "voiceIntensity");
     const ageStyle = readString(req.body, "ageStyle");
     const gender = readString(req.body, "gender");
     const language = readString(req.body, "language") || "ko";
@@ -4338,6 +4356,8 @@ app.post("/api/story-tts", async (req, res) => {
             text,
             voiceRaw,
             voicePreset,
+            voiceEmotion,
+            voiceIntensity,
             voiceSettings: req.body && req.body.voiceSettings,
             ageStyle,
             gender,
