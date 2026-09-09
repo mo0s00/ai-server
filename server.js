@@ -120,7 +120,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-tts-quality-multilingual-v1";
+const SERVER_REV = "parallel-tts-lock-voice-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -4297,15 +4297,16 @@ const OPENAI_TTS_VOICES = new Set([
   "verse",
 ]);
 
-function setStoryTtsAudioHeaders(res, { provider, fallback, voice, voiceName, model }) {
+function setStoryTtsAudioHeaders(res, { provider, fallback, voice, voiceName, model, locked }) {
   res.setHeader("X-TTS-Provider", provider);
   res.setHeader("X-TTS-Fallback", fallback ? "1" : "0");
   if (voice) res.setHeader("X-TTS-Voice", voice);
   if (voiceName) res.setHeader("X-TTS-Voice-Name", encodeURIComponent(voiceName));
   if (model) res.setHeader("X-TTS-Model", model);
+  if (locked) res.setHeader("X-TTS-Voice-Locked", "1");
   res.setHeader(
     "Access-Control-Expose-Headers",
-    "X-TTS-Provider, X-TTS-Fallback, X-TTS-Voice, X-TTS-Voice-Name, X-TTS-Model, X-AI-Server-Rev",
+    "X-TTS-Provider, X-TTS-Fallback, X-TTS-Voice, X-TTS-Voice-Name, X-TTS-Model, X-TTS-Voice-Locked, X-AI-Server-Rev",
   );
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Cache-Control", "private, max-age=86400");
@@ -4347,6 +4348,7 @@ app.post("/api/story-tts", async (req, res) => {
             voice: result.voiceId,
             voiceName: result.voiceName,
             model: result.model,
+            locked: result.locked,
           });
           return res.send(result.buffer);
         } catch (e) {

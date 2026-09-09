@@ -333,20 +333,27 @@ export async function synthesizeElevenLabsMp3({
   }
 
   const voices = await fetchAccountVoices();
-  const mapped = mappedPremadeId(voiceRaw);
-  const picked = pickAccountVoiceId({
-    voices,
-    gender,
-    ageStyle,
-    voiceRaw,
-    allowPremade: !libraryVoicesBlocked,
-  });
-  const candidates = uniqueIds([
-    libraryVoicesBlocked ? "" : mapped,
-    picked,
-    ENV_DEFAULT_VOICE,
-    fallbackOwnedVoiceId(voices, picked),
-  ]);
+  const requested = String(voiceRaw || "").trim();
+  const locked = isElevenLabsVoiceId(requested);
+  let candidates;
+  if (locked) {
+    candidates = [requested];
+  } else {
+    const mapped = mappedPremadeId(requested);
+    const picked = pickAccountVoiceId({
+      voices,
+      gender,
+      ageStyle,
+      voiceRaw: requested,
+      allowPremade: !libraryVoicesBlocked,
+    });
+    candidates = uniqueIds([
+      libraryVoicesBlocked ? "" : mapped,
+      picked,
+      ENV_DEFAULT_VOICE,
+      fallbackOwnedVoiceId(voices, picked),
+    ]);
+  }
   if (!candidates.length) {
     const err = new Error("no usable elevenlabs voice on this account");
     err.status = 502;
@@ -376,8 +383,9 @@ export async function synthesizeElevenLabsMp3({
   for (const voiceId of candidates) {
     const voiceName = voiceNameById(voices, voiceId);
     console.log(
-      `[story-tts] elevenlabs preset=${voicePreset || "calm"} voice=${voiceId} ` +
-        `name=${voiceName || "?"} model=${ELEVENLABS_TTS_MODEL} ` +
+      `[story-tts] elevenlabs requested=${requested || "(empty)"} ` +
+        `locked=${locked ? 1 : 0} preset=${voicePreset || "calm"} ` +
+        `voice=${voiceId} name=${voiceName || "?"} model=${ELEVENLABS_TTS_MODEL} ` +
         `speed=${settings.speed} stability=${settings.stability} ` +
         `style=${settings.style} similarity=${settings.similarity_boost} ` +
         `ageStyle=${ageStyle || ""}`,
@@ -389,9 +397,16 @@ export async function synthesizeElevenLabsMp3({
         voiceId,
         voiceName,
         model: ELEVENLABS_TTS_MODEL,
+        locked,
       };
     } catch (e) {
       lastErr = e;
+      if (locked) {
+        console.error(
+          `[story-tts] locked voice failed voice=${voiceId} — no substitute`,
+        );
+        throw e;
+      }
       if (!isLibraryVoiceBlocked(e.httpStatus, e.upstream || e.message)) {
         throw e;
       }
