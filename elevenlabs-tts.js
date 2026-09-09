@@ -1,4 +1,4 @@
-/** ElevenLabs TTS — 계정에서 쓸 수 있는 목소리만 고른다. */
+/** ElevenLabs TTS — 품질 우선. 라이브러리 음성을 먼저 쓰고, 막히면 계정 목소리로 내린다. */
 
 const ELEVENLABS_API_KEY = (
   process.env.ELEVENLABS_API_KEY ||
@@ -7,7 +7,7 @@ const ELEVENLABS_API_KEY = (
 ).trim();
 
 const ELEVENLABS_TTS_MODEL = (
-  process.env.ELEVENLABS_TTS_MODEL || "eleven_flash_v2_5"
+  process.env.ELEVENLABS_TTS_MODEL || "eleven_multilingual_v2"
 ).trim();
 
 const ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech";
@@ -17,23 +17,33 @@ const ENV_DEFAULT_VOICE = (process.env.ELEVENLABS_DEFAULT_VOICE_ID || "").trim()
 const ENV_FEMALE_VOICE = (process.env.ELEVENLABS_VOICE_FEMALE || "").trim();
 const ENV_MALE_VOICE = (process.env.ELEVENLABS_VOICE_MALE || "").trim();
 
-const DEFAULT_VOICE_SETTINGS = {
-  stability: 0.68,
-  similarity_boost: 0.8,
-  style: 0.08,
-  speed: 0.95,
-  use_speaker_boost: true,
+/** OpenAI 보이스 이름 → ElevenLabs premade. 한국어에 무난한 쪽을 고른다. */
+const OPENAI_TO_ELEVENLABS_VOICE = {
+  nova: "EXAVITQu4vr4xnSDxMaL", // Sarah
+  shimmer: "pFZP5JQG7iQjIQuC4Bku", // Lily
+  coral: "XB0fDUnXU5powFXDhCwa", // Charlotte
+  sage: "XrExE9yKIg1WjnnlVkGX", // Matilda
+  onyx: "pNInz6obpgDQGcFmaJgB", // Adam
+  echo: "onwK4e9ZLuTAKqWW03F9", // Daniel
+  fable: "JBFqnCBsd6RMkjVDRZzb", // George
+  alloy: "21m00Tcm4TlvDq8ikWAM", // Rachel
+  ash: "N2lVS1w4EtoT3xRj7jJY", // Callum
+  ballad: "IKne3meq5aSn9XLyUdCD", // Charlie
+  verse: "XB0fDUnXU5powFXDhCwa", // Charlotte
 };
 
-const CATEGORY_RANK = {
-  generated: 0,
-  cloned: 1,
-  premade: 2,
+const DEFAULT_VOICE_SETTINGS = {
+  stability: 0.62,
+  similarity_boost: 0.75,
+  style: 0.08,
+  speed: 0.98,
+  use_speaker_boost: true,
 };
 
 let voicesCache = null;
 let voicesCacheAt = 0;
 const VOICES_TTL_MS = 10 * 60 * 1000;
+let libraryVoicesBlocked = false;
 
 export function isElevenLabsConfigured() {
   return !!ELEVENLABS_API_KEY;
@@ -134,14 +144,26 @@ function voiceAgeHint(voice) {
   return "adult";
 }
 
-function categoryRank(voice) {
-  const cat = String((voice && voice.category) || "").toLowerCase();
-  return CATEGORY_RANK[cat] ?? 9;
+function categoryOf(voice) {
+  return String((voice && voice.category) || "").toLowerCase();
 }
 
-function isPreferredApiVoice(voice) {
-  const cat = String((voice && voice.category) || "").toLowerCase();
-  return cat === "generated" || cat === "cloned";
+function isOwnedVoice(voice) {
+  const cat = categoryOf(voice);
+  return cat === "cloned" || cat === "generated" || cat === "professional";
+}
+
+function categoryRank(voice, { allowPremade }) {
+  const cat = categoryOf(voice);
+  if (allowPremade) {
+    if (cat === "premade") return 0;
+    if (cat === "cloned" || cat === "professional") return 1;
+    if (cat === "generated") return 2;
+    return 3;
+  }
+  if (cat === "cloned" || cat === "professional") return 0;
+  if (cat === "generated") return 1;
+  return 9;
 }
 
 async function fetchAccountVoices() {
@@ -174,7 +196,17 @@ async function fetchAccountVoices() {
   return voices;
 }
 
-function pickAccountVoiceId({ voices, gender, ageStyle, voiceRaw }) {
+function voiceNameById(voices, voiceId) {
+  const found = voices.find((v) => v.voice_id === voiceId);
+  return found && found.name ? String(found.name) : "";
+}
+
+function mappedPremadeId(voiceRaw) {
+  const key = String(voiceRaw || "").trim().toLowerCase();
+  return OPENAI_TO_ELEVENLABS_VOICE[key] || "";
+}
+
+function pickAccountVoiceId({ voices, gender, ageStyle, voiceRaw, allowPremade }) {
   if (!voices.length) return "";
   const female = isFemaleHint(gender);
   const male = isMaleHint(gender);
@@ -195,10 +227,9 @@ function pickAccountVoiceId({ voices, gender, ageStyle, voiceRaw }) {
     return ENV_DEFAULT_VOICE;
   }
 
-  const ranked = [...voices].sort((a, b) => {
-    const own = Number(isPreferredApiVoice(a)) - Number(isPreferredApiVoice(b));
-    if (own !== 0) return own > 0 ? -1 : 1;
-    const cat = categoryRank(a) - categoryRank(b);
+  const pool = allowPremade ? voices : voices.filter(isOwnedVoice);
+  const ranked = [...(pool.length ? pool : voices)].sort((a, b) => {
+    const cat = categoryRank(a, { allowPremade }) - categoryRank(b, { allowPremade });
     if (cat !== 0) return cat;
     const ageA = voiceAgeHint(a) === wantAge ? 0 : 1;
     const ageB = voiceAgeHint(b) === wantAge ? 0 : 1;
@@ -210,11 +241,11 @@ function pickAccountVoiceId({ voices, gender, ageStyle, voiceRaw }) {
     const matchB = want && gB === want ? 0 : 1;
     return matchA - matchB;
   });
-  return String(ranked[0].voice_id || "");
+  return String((ranked[0] && ranked[0].voice_id) || "");
 }
 
 function fallbackOwnedVoiceId(voices, failedId) {
-  const owned = voices.filter(isPreferredApiVoice);
+  const owned = voices.filter(isOwnedVoice);
   const pool = owned.length ? owned : voices;
   const next = pool.find((v) => v.voice_id && v.voice_id !== failedId);
   return next ? String(next.voice_id) : "";
@@ -237,17 +268,17 @@ export function normalizeElevenLabsVoiceSettings(raw) {
     similarity_boost: clamp(
       src.similarity_boost ?? src.similarity,
       0,
-      1,
+      0.85,
       DEFAULT_VOICE_SETTINGS.similarity_boost,
     ),
-    style: clamp(src.style, 0, 1, DEFAULT_VOICE_SETTINGS.style),
-    speed: clamp(src.speed, 0.7, 1.2, DEFAULT_VOICE_SETTINGS.speed),
+    style: clamp(src.style, 0, 0.28, DEFAULT_VOICE_SETTINGS.style),
+    speed: clamp(src.speed, 0.85, 1.08, DEFAULT_VOICE_SETTINGS.speed),
     use_speaker_boost: src.use_speaker_boost !== false,
   };
 }
 
 async function postSpeech({ voiceId, body }) {
-  const url = `${ELEVENLABS_TTS_URL}/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`;
+  const url = `${ELEVENLABS_TTS_URL}/${encodeURIComponent(voiceId)}?output_format=mp3_44100_192`;
   const ttsRes = await fetch(url, {
     method: "POST",
     headers: {
@@ -266,6 +297,18 @@ async function postSpeech({ voiceId, body }) {
     throw err;
   }
   return Buffer.from(await ttsRes.arrayBuffer());
+}
+
+function uniqueIds(ids) {
+  const seen = new Set();
+  const out = [];
+  for (const id of ids) {
+    const v = String(id || "").trim();
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
 }
 
 export async function synthesizeElevenLabsMp3({
@@ -290,10 +333,21 @@ export async function synthesizeElevenLabsMp3({
   }
 
   const voices = await fetchAccountVoices();
-  let voiceId =
-    pickAccountVoiceId({ voices, gender, ageStyle, voiceRaw }) ||
-    ENV_DEFAULT_VOICE;
-  if (!voiceId) {
+  const mapped = mappedPremadeId(voiceRaw);
+  const picked = pickAccountVoiceId({
+    voices,
+    gender,
+    ageStyle,
+    voiceRaw,
+    allowPremade: !libraryVoicesBlocked,
+  });
+  const candidates = uniqueIds([
+    libraryVoicesBlocked ? "" : mapped,
+    picked,
+    ENV_DEFAULT_VOICE,
+    fallbackOwnedVoiceId(voices, picked),
+  ]);
+  if (!candidates.length) {
     const err = new Error("no usable elevenlabs voice on this account");
     err.status = 502;
     throw err;
@@ -301,33 +355,51 @@ export async function synthesizeElevenLabsMp3({
 
   const settings = normalizeElevenLabsVoiceSettings(voiceSettings);
   const lang = String(language || "ko").trim().toLowerCase() || "ko";
+  const isLowLatency = /flash|turbo/i.test(ELEVENLABS_TTS_MODEL);
   const body = {
     text: input.length > 4096 ? input.slice(0, 4096) : input,
     model_id: ELEVENLABS_TTS_MODEL,
-    voice_settings: settings,
+    voice_settings: {
+      stability: settings.stability,
+      similarity_boost: settings.similarity_boost,
+      style: settings.style,
+      speed: settings.speed,
+      use_speaker_boost: settings.use_speaker_boost,
+    },
+    apply_text_normalization: "auto",
   };
-  if (lang && lang !== "auto" && /flash|turbo/i.test(ELEVENLABS_TTS_MODEL)) {
+  if (lang && lang !== "auto" && isLowLatency) {
     body.language_code = lang.slice(0, 8);
   }
 
-  console.log(
-    `[story-tts] elevenlabs preset=${voicePreset || "calm"} voice=${voiceId} ` +
-      `model=${ELEVENLABS_TTS_MODEL} speed=${settings.speed} ` +
-      `stability=${settings.stability} style=${settings.style} ` +
-      `similarity=${settings.similarity_boost} ageStyle=${ageStyle || ""}`,
-  );
-
-  try {
-    return await postSpeech({ voiceId, body });
-  } catch (e) {
-    if (!isLibraryVoiceBlocked(e.httpStatus, e.upstream || e.message)) {
-      throw e;
-    }
-    const retryId = fallbackOwnedVoiceId(voices, voiceId);
-    if (!retryId) throw e;
-    console.warn(
-      `[story-tts] elevenlabs library voice blocked → retry owned voice=${retryId}`,
+  let lastErr = null;
+  for (const voiceId of candidates) {
+    const voiceName = voiceNameById(voices, voiceId);
+    console.log(
+      `[story-tts] elevenlabs preset=${voicePreset || "calm"} voice=${voiceId} ` +
+        `name=${voiceName || "?"} model=${ELEVENLABS_TTS_MODEL} ` +
+        `speed=${settings.speed} stability=${settings.stability} ` +
+        `style=${settings.style} similarity=${settings.similarity_boost} ` +
+        `ageStyle=${ageStyle || ""}`,
     );
-    return postSpeech({ voiceId: retryId, body });
+    try {
+      const buffer = await postSpeech({ voiceId, body });
+      return {
+        buffer,
+        voiceId,
+        voiceName,
+        model: ELEVENLABS_TTS_MODEL,
+      };
+    } catch (e) {
+      lastErr = e;
+      if (!isLibraryVoiceBlocked(e.httpStatus, e.upstream || e.message)) {
+        throw e;
+      }
+      libraryVoicesBlocked = true;
+      console.warn(
+        `[story-tts] elevenlabs library voice blocked voice=${voiceId} → try owned`,
+      );
+    }
   }
+  throw lastErr || new Error("elevenlabs tts failed");
 }
