@@ -10,6 +10,11 @@ const ELEVENLABS_TTS_MODEL = (
   process.env.ELEVENLABS_TTS_MODEL || "eleven_multilingual_v2"
 ).trim();
 
+/** Starter 플랜은 192kbps 불가. 128은 전 플랜에서 됨. */
+const ELEVENLABS_OUTPUT_FORMAT = (
+  process.env.ELEVENLABS_OUTPUT_FORMAT || "mp3_44100_128"
+).trim();
+
 const ELEVENLABS_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech";
 const ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices";
 
@@ -51,6 +56,10 @@ export function isElevenLabsConfigured() {
 
 export function elevenLabsTtsModel() {
   return ELEVENLABS_TTS_MODEL;
+}
+
+export function elevenLabsOutputFormat() {
+  return ELEVENLABS_OUTPUT_FORMAT;
 }
 
 function clamp(n, min, max, fallback) {
@@ -278,7 +287,7 @@ export function normalizeElevenLabsVoiceSettings(raw) {
 }
 
 async function postSpeech({ voiceId, body }) {
-  const url = `${ELEVENLABS_TTS_URL}/${encodeURIComponent(voiceId)}?output_format=mp3_44100_192`;
+  const url = `${ELEVENLABS_TTS_URL}/${encodeURIComponent(voiceId)}?output_format=${encodeURIComponent(ELEVENLABS_OUTPUT_FORMAT)}`;
   const ttsRes = await fetch(url, {
     method: "POST",
     headers: {
@@ -386,6 +395,7 @@ export async function synthesizeElevenLabsMp3({
       `[story-tts] elevenlabs requested=${requested || "(empty)"} ` +
         `locked=${locked ? 1 : 0} preset=${voicePreset || "calm"} ` +
         `voice=${voiceId} name=${voiceName || "?"} model=${ELEVENLABS_TTS_MODEL} ` +
+        `output=${ELEVENLABS_OUTPUT_FORMAT} ` +
         `speed=${settings.speed} stability=${settings.stability} ` +
         `style=${settings.style} similarity=${settings.similarity_boost} ` +
         `ageStyle=${ageStyle || ""}`,
@@ -397,6 +407,7 @@ export async function synthesizeElevenLabsMp3({
         voiceId,
         voiceName,
         model: ELEVENLABS_TTS_MODEL,
+        output: ELEVENLABS_OUTPUT_FORMAT,
         locked,
       };
     } catch (e) {
