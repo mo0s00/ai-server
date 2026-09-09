@@ -120,7 +120,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-tts-elevenlabs-account-voices-v1";
+const SERVER_REV = "parallel-tts-provider-header-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -4297,6 +4297,17 @@ const OPENAI_TTS_VOICES = new Set([
   "verse",
 ]);
 
+function setStoryTtsAudioHeaders(res, { provider, fallback }) {
+  res.setHeader("X-TTS-Provider", provider);
+  res.setHeader("X-TTS-Fallback", fallback ? "1" : "0");
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "X-TTS-Provider, X-TTS-Fallback, X-AI-Server-Rev",
+  );
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "private, max-age=86400");
+}
+
 app.post("/api/story-tts", async (req, res) => {
   res.setHeader("X-AI-Server-Rev", SERVER_REV);
 
@@ -4327,8 +4338,7 @@ app.post("/api/story-tts", async (req, res) => {
             gender,
             language,
           });
-          res.setHeader("Content-Type", "audio/mpeg");
-          res.setHeader("Cache-Control", "private, max-age=86400");
+          setStoryTtsAudioHeaders(res, { provider: "elevenlabs", fallback: false });
           return res.send(buffer);
         } catch (e) {
           const raw = e?.upstream || e?.message || "elevenlabs tts failed";
@@ -4377,8 +4387,7 @@ app.post("/api/story-tts", async (req, res) => {
     }
 
     const buffer = Buffer.from(await ttsRes.arrayBuffer());
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "private, max-age=86400");
+    setStoryTtsAudioHeaders(res, { provider: "openai", fallback: wantsEleven });
     return res.send(buffer);
   } catch (e) {
     console.error("[story-tts] error", e);
