@@ -29,6 +29,7 @@ export function normalizeVoiceEmotion(raw) {
   if (v === "fear") return "frightened";
   if (v === "anger") return "angry";
   if (v === "cheerful") return "happy";
+  if (v === "suspicion" || v === "suspicious") return "suspicious";
   if (Object.prototype.hasOwnProperty.call(BASE, v)) return v;
   return "calm";
 }

@@ -342,10 +342,14 @@ export async function synthesizeElevenLabsMp3({
   voicePreset,
   voiceEmotion,
   voiceIntensity,
+  voiceDelivery,
+  voicePace,
+  voiceReaction,
   voiceSettings,
   ageStyle,
   gender,
   language,
+  speaker,
 }) {
   if (!ELEVENLABS_API_KEY) {
     const err = new Error("no ELEVENLABS_API_KEY");
@@ -387,63 +391,90 @@ export async function synthesizeElevenLabsMp3({
     throw err;
   }
 
-  const emotionPreset =
-    String(voiceEmotion || "").trim().length > 0
-      ? voiceSettingsFromEmotionPreset(voiceEmotion, voiceIntensity)
-      : null;
-  const settings = emotionPreset
-    ? normalizeElevenLabsVoiceSettings(
-        {
-          stability: emotionPreset.stability,
-          similarity_boost: emotionPreset.similarity_boost,
-          style: emotionPreset.style,
-          speed: emotionPreset.speed,
-          use_speaker_boost: emotionPreset.use_speaker_boost,
-        },
-        { modelId: ELEVENLABS_TTS_MODEL },
-      )
-    : normalizeElevenLabsVoiceSettings(voiceSettings, {
-        modelId: ELEVENLABS_TTS_MODEL,
-      });
-  const effectivePreset = emotionPreset?.presetId || voicePreset || "calm";
+  const isV3 = isElevenV3Model(ELEVENLABS_TTS_MODEL);
+  const actingInput = {
+    voiceEmotion,
+    voiceIntensity,
+    voiceDelivery,
+    voicePace,
+    voiceReaction,
+    voicePreset,
+  };
+  const tagged = isV3
+    ? applyElevenV3AudioTags(input, actingInput)
+    : { text: input, tags: [], tagString: "" };
+  const spokenText = tagged.text;
+
+  let settings;
+  if (isV3) {
+    settings = { stability: 0.38 };
+  } else {
+    const emotionPreset =
+      String(voiceEmotion || "").trim().length > 0
+        ? voiceSettingsFromEmotionPreset(voiceEmotion, voiceIntensity)
+        : null;
+    settings = emotionPreset
+      ? normalizeElevenLabsVoiceSettings(
+          {
+            stability: emotionPreset.stability,
+            similarity_boost: emotionPreset.similarity_boost,
+            style: emotionPreset.style,
+            speed: emotionPreset.speed,
+            use_speaker_boost: emotionPreset.use_speaker_boost,
+          },
+          { modelId: ELEVENLABS_TTS_MODEL },
+        )
+      : normalizeElevenLabsVoiceSettings(voiceSettings, {
+          modelId: ELEVENLABS_TTS_MODEL,
+        });
+  }
+  const effectivePreset = voicePreset || "calm";
   const lang = String(language || "ko").trim().toLowerCase() || "ko";
   const isLowLatency = /flash|turbo/i.test(ELEVENLABS_TTS_MODEL);
-  const isV3 = isElevenV3Model(ELEVENLABS_TTS_MODEL);
-  const spokenText = isV3
-    ? applyElevenV3AudioTags(input, {
-        voiceEmotion,
-        voiceIntensity,
-        voicePreset,
-      })
-    : input;
   const body = {
     text: spokenText.length > 4096 ? spokenText.slice(0, 4096) : spokenText,
     model_id: ELEVENLABS_TTS_MODEL,
-    voice_settings: {
-      stability: settings.stability,
-      similarity_boost: settings.similarity_boost,
-      style: settings.style,
-      speed: settings.speed,
-      use_speaker_boost: settings.use_speaker_boost,
-    },
+    voice_settings: isV3
+      ? { stability: settings.stability }
+      : {
+          stability: settings.stability,
+          similarity_boost: settings.similarity_boost,
+          style: settings.style,
+          speed: settings.speed,
+          use_speaker_boost: settings.use_speaker_boost,
+        },
     apply_text_normalization: "auto",
   };
   if (lang && lang !== "auto" && isLowLatency) {
     body.language_code = lang.slice(0, 8);
   }
 
+  if (isV3) {
+    console.log(
+      `[tts-acting] speaker=${String(speaker || "").trim() || "-"} ` +
+        `emotion=${String(voiceEmotion || "").trim() || "-"} ` +
+        `intensity=${String(voiceIntensity || "").trim() || "-"} ` +
+        `delivery=${String(voiceDelivery || "").trim() || "-"} ` +
+        `pace=${String(voicePace || "").trim() || "-"} ` +
+        `reaction=${String(voiceReaction || "").trim() || "-"} ` +
+        `tags=${tagged.tagString || "-"}`,
+    );
+  }
+
   let lastErr = null;
   for (const voiceId of candidates) {
     const voiceName = voiceNameById(voices, voiceId);
+    const settingsLog = isV3
+      ? `stability=${settings.stability}`
+      : `speed=${settings.speed} stability=${settings.stability} ` +
+        `style=${settings.style} similarity=${settings.similarity_boost}`;
     console.log(
       `[story-tts] elevenlabs requested=${requested || "(empty)"} ` +
         `locked=${locked ? 1 : 0} preset=${effectivePreset} ` +
-        `emotion=${String(voiceEmotion || "").trim() || "-"} ` +
-        `intensity=${String(voiceIntensity || "").trim() || "-"} ` +
-        `voice=${voiceId} name=${voiceName || "?"} model=${ELEVENLABS_TTS_MODEL} ` +
-        `output=${ELEVENLABS_OUTPUT_FORMAT} ` +
-        `speed=${settings.speed} stability=${settings.stability} ` +
-        `style=${settings.style} similarity=${settings.similarity_boost} ` +
+        `provider=elevenlabs fallback=false ` +
+        `model=${ELEVENLABS_TTS_MODEL} ` +
+        `voice=${voiceId} name=${voiceName || "?"} ` +
+        `output=${ELEVENLABS_OUTPUT_FORMAT} ${settingsLog} ` +
         `ageStyle=${ageStyle || ""} ` +
         `text=${spokenText.slice(0, 120)}${spokenText.length > 120 ? "…" : ""}`,
     );

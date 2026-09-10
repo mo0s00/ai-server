@@ -121,15 +121,15 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-voice-cast-p0";
+const SERVER_REV = "parallel-voice-acting-p1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
   "You write parallel SIDE scenes (separate location from MAIN). " +
-  'Reply with ONE JSON object only: {"show":true,"place":"...","entries":[{"kind":"narration|dialogue|beat|timeMark","speaker":"name or role label","speakerId":"stable_slug_for_new_npc","text":"...","voiceEmotion":"calm|happy|sad|tense|frightened|angry|irritated|cold|threatening|whisper","voiceIntensity":"low|medium|high"}],"statePatch":{optional}}. ' +
+  'Reply with ONE JSON object only: {"show":true,"place":"...","entries":[{"kind":"narration|dialogue|beat|timeMark","speaker":"name or role label","speakerId":"stable_slug_for_new_npc","text":"...","voiceEmotion":"calm|happy|sad|tense|frightened|angry|irritated|cold|threatening|whisper|suspicious","voiceIntensity":"low|medium|high","voiceDelivery":"none|under_breath|restrained|weary|sarcastic|panicked|cold|hesitant|emphatic|timid|menacing|flustered","voicePace":"slow|normal|fast|drawn_out","voiceReaction":"none|sigh|gasp|gulp|laugh|chuckle|breath|pause"}],"statePatch":{optional}}. ' +
   "entries: 4-6. dialogue 0-2 allowed — use 1-2 when natural speech fits; 0 when silence/atmosphere only. TTS reads dialogue only. Every dialogue MUST have non-empty speaker (name or role). Never use empty speaker for dialogue. Never put spoken lines or narration in dialogue kind. narration/beat/timeMark must have empty speaker. " +
   "New NPCs MUST include speakerId (stable slug, e.g. side_guard_01). Same speakerId = same character. " +
-  "Every dialogue MUST include voiceEmotion and voiceIntensity (categorical only, never numeric TTS settings). " +
+  "Every dialogue MUST include voiceEmotion, voiceIntensity, voiceDelivery, voicePace, voiceReaction (categorical semantic acting only — never numeric TTS settings, never ElevenLabs tag strings). " +
   "Do NOT output worldTime or world_time. Do NOT use narrator/lines/voiceText. No markdown.";
 const PARALLEL_STORY_LLM_TIMEOUT_MS = 35000;
 
@@ -2393,6 +2393,15 @@ function validateParallelStoryResponse(rawText, hints = {}) {
     const voiceIntensity = (
       typeof rawEntry.voiceIntensity === "string" ? rawEntry.voiceIntensity : ""
     ).trim();
+    const voiceDelivery = (
+      typeof rawEntry.voiceDelivery === "string" ? rawEntry.voiceDelivery : ""
+    ).trim();
+    const voicePace = (
+      typeof rawEntry.voicePace === "string" ? rawEntry.voicePace : ""
+    ).trim();
+    const voiceReaction = (
+      typeof rawEntry.voiceReaction === "string" ? rawEntry.voiceReaction : ""
+    ).trim();
     const speakerId = (
       typeof rawEntry.speakerId === "string"
         ? rawEntry.speakerId
@@ -2403,6 +2412,9 @@ function validateParallelStoryResponse(rawText, hints = {}) {
     if (speakerId) normalizedEntry.speakerId = speakerId;
     if (voiceEmotion) normalizedEntry.voiceEmotion = voiceEmotion;
     if (voiceIntensity) normalizedEntry.voiceIntensity = voiceIntensity;
+    if (voiceDelivery) normalizedEntry.voiceDelivery = voiceDelivery;
+    if (voicePace) normalizedEntry.voicePace = voicePace;
+    if (voiceReaction) normalizedEntry.voiceReaction = voiceReaction;
     if ((kind === "dialogue" || kind === "line") && !speaker) {
       continue;
     }
@@ -4370,6 +4382,10 @@ app.post("/api/story-tts", async (req, res) => {
     const voicePreset = readString(req.body, "voicePreset");
     const voiceEmotion = readString(req.body, "voiceEmotion");
     const voiceIntensity = readString(req.body, "voiceIntensity");
+    const voiceDelivery = readString(req.body, "voiceDelivery");
+    const voicePace = readString(req.body, "voicePace");
+    const voiceReaction = readString(req.body, "voiceReaction");
+    const speaker = readString(req.body, "speaker");
     const ageStyle = readString(req.body, "ageStyle");
     const gender = readString(req.body, "gender");
     const language = readString(req.body, "language") || "ko";
@@ -4389,10 +4405,14 @@ app.post("/api/story-tts", async (req, res) => {
             voicePreset,
             voiceEmotion,
             voiceIntensity,
+            voiceDelivery,
+            voicePace,
+            voiceReaction,
             voiceSettings: req.body && req.body.voiceSettings,
             ageStyle,
             gender,
             language,
+            speaker,
           });
           setStoryTtsAudioHeaders(res, {
             provider: "elevenlabs",
