@@ -121,7 +121,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-voice-acting-p1";
+const SERVER_REV = "parallel-voice-cast-p2";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -130,6 +130,7 @@ const PARALLEL_STORY_SYSTEM_PROMPT =
   "entries: 4-6. dialogue 0-2 allowed — use 1-2 when natural speech fits; 0 when silence/atmosphere only. TTS reads dialogue only. Every dialogue MUST have non-empty speaker (name or role). Never use empty speaker for dialogue. Never put spoken lines or narration in dialogue kind. narration/beat/timeMark must have empty speaker. " +
   "New NPCs MUST include speakerId (stable slug, e.g. side_guard_01). Same speakerId = same character. " +
   "Every dialogue MUST include voiceEmotion, voiceIntensity, voiceDelivery, voicePace, voiceReaction (categorical semantic acting only — never numeric TTS settings, never ElevenLabs tag strings). " +
+  "Use calm only when truly calm. Muttering, suspicion, guarded tone → suspicious or tense (not calm). Anger → angry/irritated. Whisper → whisper. under_breath for aside/mutter, restrained for held anger, slow for deliberate asides. " +
   "Do NOT output worldTime or world_time. Do NOT use narrator/lines/voiceText. No markdown.";
 const PARALLEL_STORY_LLM_TIMEOUT_MS = 35000;
 
