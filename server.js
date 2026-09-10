@@ -121,13 +121,15 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-voice-cast-v1";
+const SERVER_REV = "parallel-voice-cast-p0";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
   "You write parallel SIDE scenes (separate location from MAIN). " +
-  'Reply with ONE JSON object only: {"show":true,"place":"...","entries":[{"kind":"narration|dialogue|beat|timeMark","speaker":"name or empty","text":"...","voiceEmotion":"calm|happy|sad|tense|frightened|angry|irritated|cold|threatening|whisper","voiceIntensity":"low|medium|high"}],"statePatch":{optional}}. ' +
-  "entries: 4-6. For every dialogue entry include voiceEmotion and voiceIntensity (categorical only, never numeric TTS settings). " +
+  'Reply with ONE JSON object only: {"show":true,"place":"...","entries":[{"kind":"narration|dialogue|beat|timeMark","speaker":"name or role label","speakerId":"stable_slug_for_new_npc","text":"...","voiceEmotion":"calm|happy|sad|tense|frightened|angry|irritated|cold|threatening|whisper","voiceIntensity":"low|medium|high"}],"statePatch":{optional}}. ' +
+  "entries: 4-6. dialogue 0-2 allowed — use 1-2 when natural speech fits; 0 when silence/atmosphere only. TTS reads dialogue only. Every dialogue MUST have non-empty speaker (name or role). Never use empty speaker for dialogue. Never put spoken lines or narration in dialogue kind. narration/beat/timeMark must have empty speaker. " +
+  "New NPCs MUST include speakerId (stable slug, e.g. side_guard_01). Same speakerId = same character. " +
+  "Every dialogue MUST include voiceEmotion and voiceIntensity (categorical only, never numeric TTS settings). " +
   "Do NOT output worldTime or world_time. Do NOT use narrator/lines/voiceText. No markdown.";
 const PARALLEL_STORY_LLM_TIMEOUT_MS = 35000;
 
@@ -2126,7 +2128,12 @@ function parseParallelStoryPerspective(rawPerspective, rawImpact) {
     readString(source, "place") || readString(source, "target")
   ).trim();
   if (!parallelId || !place) return null;
-  return { parallelId, place };
+  const characters = Array.isArray(source.characters)
+    ? source.characters
+        .map((c) => (typeof c === "string" ? c : "").trim())
+        .filter(Boolean)
+    : [];
+  return { parallelId, place, characters };
 }
 
 function parseParallelStoryMetadata(body) {
@@ -2361,22 +2368,44 @@ function validateParallelStoryResponse(rawText, hints = {}) {
     const text = (typeof rawEntry.text === "string" ? rawEntry.text : "")
       .trim();
     if (!text) continue;
-    const speaker = (
+    let speaker = (
       typeof rawEntry.speaker === "string" ? rawEntry.speaker : ""
     ).trim();
-    const kind = (
+    let kind = (
       typeof rawEntry.kind === "string" ? rawEntry.kind : ""
     ).trim();
+    if (!kind && speaker) kind = "dialogue";
+    if (
+      kind === "narration" ||
+      kind === "narrator" ||
+      kind === "beat" ||
+      kind === "timeMark" ||
+      kind === "sfx" ||
+      kind === "action"
+    ) {
+      speaker = "";
+    }
     const normalizedEntry = { speaker, text };
-    if (kind) normalizedEntry.kind = kind;
+    if (kind) normalizedEntry.kind = kind === "line" ? "dialogue" : kind;
     const voiceEmotion = (
       typeof rawEntry.voiceEmotion === "string" ? rawEntry.voiceEmotion : ""
     ).trim();
     const voiceIntensity = (
       typeof rawEntry.voiceIntensity === "string" ? rawEntry.voiceIntensity : ""
     ).trim();
+    const speakerId = (
+      typeof rawEntry.speakerId === "string"
+        ? rawEntry.speakerId
+        : typeof rawEntry.speaker_id === "string"
+          ? rawEntry.speaker_id
+          : ""
+    ).trim();
+    if (speakerId) normalizedEntry.speakerId = speakerId;
     if (voiceEmotion) normalizedEntry.voiceEmotion = voiceEmotion;
     if (voiceIntensity) normalizedEntry.voiceIntensity = voiceIntensity;
+    if ((kind === "dialogue" || kind === "line") && !speaker) {
+      continue;
+    }
     entries.push(normalizedEntry);
   }
   if (entries.length === 0) {
@@ -2453,6 +2482,8 @@ async function handleParallelStoryPost(req, res) {
         : 480;
     const sideHints = {
       place: metadata.perspective.place,
+      parallelId: metadata.perspective.parallelId,
+      castNames: metadata.perspective.characters || [],
       worldTime:
         readString(req.body && req.body.parallelStory, "engineWorldTime") ||
         readString(metadata.canonicalState, "worldTime") ||
