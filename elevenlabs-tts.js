@@ -276,6 +276,16 @@ function isLibraryVoiceBlocked(status, raw) {
   );
 }
 
+function isVoiceNotFound(status, raw) {
+  const text = String(raw || "").toLowerCase();
+  return status === 404 || text.includes("voice_not_found");
+}
+
+function voiceExistsOnAccount(voices, voiceId) {
+  const id = String(voiceId || "").trim();
+  return !!id && voices.some((v) => v.voice_id === id);
+}
+
 export function normalizeElevenLabsVoiceSettings(raw, { modelId } = {}) {
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const v3 = isElevenV3Model(modelId || ELEVENLABS_TTS_MODEL);
@@ -365,20 +375,27 @@ export async function synthesizeElevenLabsMp3({
 
   const voices = await fetchAccountVoices();
   const requested = String(voiceRaw || "").trim();
-  const locked = isElevenLabsVoiceId(requested);
+  let locked = isElevenLabsVoiceId(requested);
+  const mapped = mappedPremadeId(requested);
+  const picked = pickAccountVoiceId({
+    voices,
+    gender,
+    ageStyle,
+    voiceRaw: requested,
+    allowPremade: !libraryVoicesBlocked,
+  });
   let candidates;
-  if (locked) {
+  if (locked && voiceExistsOnAccount(voices, requested)) {
     candidates = [requested];
   } else {
-    const mapped = mappedPremadeId(requested);
-    const picked = pickAccountVoiceId({
-      voices,
-      gender,
-      ageStyle,
-      voiceRaw: requested,
-      allowPremade: !libraryVoicesBlocked,
-    });
+    if (locked && !voiceExistsOnAccount(voices, requested)) {
+      console.warn(
+        `[story-tts] locked voice missing on account voice=${requested} → substitute`,
+      );
+      locked = false;
+    }
     candidates = uniqueIds([
+      locked ? requested : "",
       libraryVoicesBlocked ? "" : mapped,
       picked,
       ENV_DEFAULT_VOICE,
@@ -491,12 +508,46 @@ export async function synthesizeElevenLabsMp3({
     } catch (e) {
       lastErr = e;
       if (locked) {
+        if (isVoiceNotFound(e.httpStatus, e.upstream || e.message)) {
+          console.warn(
+            `[story-tts] locked voice not found voice=${voiceId} → try substitute`,
+          );
+          locked = false;
+          const substitute = uniqueIds([
+            mapped,
+            picked,
+            ENV_DEFAULT_VOICE,
+            fallbackOwnedVoiceId(voices, voiceId),
+          ]).filter((id) => id && id !== voiceId);
+          for (const altId of substitute) {
+            try {
+              const altName = voiceNameById(voices, altId);
+              const buffer = await postSpeech({ voiceId: altId, body });
+              console.warn(
+                `[story-tts] substituted voice ${voiceId} → ${altId} name=${altName || "?"}`,
+              );
+              return {
+                buffer,
+                voiceId: altId,
+                voiceName: altName,
+                model: ELEVENLABS_TTS_MODEL,
+                output: ELEVENLABS_OUTPUT_FORMAT,
+                locked: false,
+              };
+            } catch (altErr) {
+              lastErr = altErr;
+            }
+          }
+        }
         console.error(
           `[story-tts] locked voice failed voice=${voiceId} — no substitute`,
         );
         throw e;
       }
-      if (!isLibraryVoiceBlocked(e.httpStatus, e.upstream || e.message)) {
+      if (
+        !isLibraryVoiceBlocked(e.httpStatus, e.upstream || e.message) &&
+        !isVoiceNotFound(e.httpStatus, e.upstream || e.message)
+      ) {
         throw e;
       }
       libraryVoicesBlocked = true;
