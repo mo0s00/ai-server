@@ -11,6 +11,11 @@ import {
   synthesizeElevenLabsMp3,
   elevenLabsTtsModel,
 } from "./elevenlabs-tts.js";
+import {
+  isElevenLabsSfxConfigured,
+  synthesizeElevenLabsSfxMp3,
+  elevenLabsSfxModel,
+} from "./elevenlabs-sfx.js";
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
@@ -121,7 +126,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "user-story-image-storage-fix";
+const SERVER_REV = "user-story-image-ascii-keys";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -290,6 +295,8 @@ function buildHealthPayload() {
     openaiConfigured: !!OPENAI_API_KEY,
     elevenlabsConfigured: isElevenLabsConfigured(),
     elevenlabsTtsModel: isElevenLabsConfigured() ? elevenLabsTtsModel() : "",
+    elevenlabsSfxConfigured: isElevenLabsSfxConfigured(),
+    elevenlabsSfxModel: isElevenLabsSfxConfigured() ? elevenLabsSfxModel() : "",
     anthropicConfigured: isAnthropicConfigured(),
     storyChatProvider,
     storyChatModel,
@@ -4551,6 +4558,41 @@ app.post("/api/story-tts", async (req, res) => {
   }
 });
 
+app.post("/api/story-sfx", async (req, res) => {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+  try {
+    const text = readString(req.body, "text");
+    const loop = req.body?.loop === true || req.body?.loop === 1;
+    const durationSeconds = Number(req.body?.durationSeconds);
+    if (!text) {
+      return res.status(400).json({ ok: false, error: "no text" });
+    }
+    if (!isElevenLabsSfxConfigured()) {
+      return res.status(500).json({ ok: false, error: "no ELEVENLABS_API_KEY" });
+    }
+    const result = await synthesizeElevenLabsSfxMp3({
+      text,
+      loop,
+      durationSeconds: Number.isFinite(durationSeconds)
+        ? durationSeconds
+        : undefined,
+    });
+    res.setHeader("X-SFX-Provider", "elevenlabs");
+    res.setHeader("X-SFX-Model", result.model);
+    res.setHeader("X-SFX-Loop", result.loop ? "1" : "0");
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    return res.send(result.buffer);
+  } catch (e) {
+    const raw = e?.upstream || e?.message || "story sfx failed";
+    console.error("[story-sfx] error", e?.status || "", raw);
+    return res.status(e?.status || 500).json({
+      ok: false,
+      error: String(raw).slice(0, 200),
+    });
+  }
+});
+
 // =========================
 // STORY IMAGE GENERATION (GPT cover + scene backgrounds)
 // =========================
@@ -4813,9 +4855,22 @@ ${emo ? `\nEmotion:\n${emo}` : ""}`.trim();
 }
 
 function sanitizeStoryImagePathSegment(raw, maxLen = 80) {
-  return String(raw || "scene")
-    .replace(/[^a-zA-Z0-9._\u3131-\uD79D-]/g, "_")
-    .slice(0, maxLen) || "scene";
+  const t = String(raw || "scene").trim();
+  if (!t) return "scene";
+  const ascii = t
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+  if (ascii) {
+    const out = ascii.slice(0, maxLen);
+    return out || "scene";
+  }
+  let h = 5381;
+  for (let i = 0; i < t.length; i++) {
+    h = ((h << 5) + h + t.charCodeAt(i)) | 0;
+  }
+  const slug = `u${(h >>> 0).toString(16)}`;
+  return slug.slice(0, maxLen) || "scene";
 }
 
 async function uploadStoryImageToSupabase(sessionKey, subfolder, fileStem, pngBuffer) {
@@ -4913,7 +4968,7 @@ async function handleCharacterImagePost(req, res) {
 
     const user_id = readString(req.body, "user_id");
     const commenter_id = readString(req.body, "commenter_id");
-    const kind = sanitizeStoryImagePathSegment(readString(req.body, "kind") || "profile", 40);
+    const kind = sanitizeStoryImagePathSegment(readString(req.body, "kind") || "profile", 96);
     const buf = decodeUserAssetImageBase64(req.body && req.body.image_base64);
 
     if (!user_id || !commenter_id || !buf) {
@@ -4946,7 +5001,7 @@ async function handleUserStoryImagePost(req, res) {
 
     const user_id = readString(req.body, "user_id");
     const story_id = readString(req.body, "story_id");
-    const kind = sanitizeStoryImagePathSegment(readString(req.body, "kind") || "cover", 40);
+    const kind = sanitizeStoryImagePathSegment(readString(req.body, "kind") || "cover", 96);
     const buf = decodeUserAssetImageBase64(req.body && req.body.image_base64);
 
     if (!user_id || !story_id || !buf) {
