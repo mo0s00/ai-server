@@ -121,7 +121,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "parallel-voice-pool-fix";
+const SERVER_REV = "user-story-image-storage-fix";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -191,6 +191,73 @@ function getSupabase() {
   return createClient(url, key);
 }
 
+function getSupabaseServiceRole() {
+  const url = (process.env.SUPABASE_URL || "").trim();
+  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  if (!url || !key) return null;
+  return createClient(url, key);
+}
+
+const USER_ASSET_STORAGE_BUCKET = "story-covers";
+let userAssetStorageReady;
+
+async function getUserAssetStorage() {
+  if (userAssetStorageReady) return userAssetStorageReady;
+
+  userAssetStorageReady = (async () => {
+    try {
+      const supabase = getSupabaseServiceRole();
+      if (!supabase) {
+        return {
+          supabase: null,
+          error: "SUPABASE_SERVICE_ROLE_KEY is required for image uploads",
+        };
+      }
+
+      const bucket = await supabase.storage.getBucket(USER_ASSET_STORAGE_BUCKET);
+      if (bucket.error) {
+        const created = await supabase.storage.createBucket(
+          USER_ASSET_STORAGE_BUCKET,
+          {
+            public: true,
+            fileSizeLimit: 6 * 1024 * 1024,
+            allowedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+          },
+        );
+        if (created.error) {
+          console.error(
+            "[user-asset-image bucket create]",
+            created.error.message,
+          );
+          return { supabase: null, error: created.error.message };
+        }
+      } else if (bucket.data?.public !== true) {
+        const updated = await supabase.storage.updateBucket(
+          USER_ASSET_STORAGE_BUCKET,
+          { public: true },
+        );
+        if (updated.error) {
+          console.error(
+            "[user-asset-image bucket update]",
+            updated.error.message,
+          );
+          return { supabase: null, error: updated.error.message };
+        }
+      }
+
+      return { supabase, error: null };
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      console.error("[user-asset-image bucket]", error);
+      return { supabase: null, error };
+    }
+  })();
+
+  const result = await userAssetStorageReady;
+  if (result.error) userAssetStorageReady = undefined;
+  return result;
+}
+
 function requireSupabase(res) {
   const supabase = getSupabase();
   if (!supabase) {
@@ -250,6 +317,10 @@ function buildHealthPayload() {
     rev: SERVER_REV,
     storyImageGeneration: storyImageGenerationEnabled(),
     supabaseConfigured: !!(url && key),
+    supabaseServiceRoleConfigured: !!(
+      process.env.SUPABASE_SERVICE_ROLE_KEY &&
+      String(process.env.SUPABASE_SERVICE_ROLE_KEY).trim()
+    ),
   };
 }
 
@@ -4810,19 +4881,29 @@ function decodeUserAssetImageBase64(raw) {
   }
 }
 
-async function uploadUserAssetImage(bucket, storagePath, buf, contentType) {
-  const supabase = getSupabase();
-  if (!supabase || !buf?.length) return null;
-  const { error } = await supabase.storage.from(bucket).upload(storagePath, buf, {
-    contentType,
-    upsert: true,
-  });
+async function uploadUserAssetImage(storagePath, buf, contentType) {
+  if (!buf?.length) return { url: null, error: "empty image" };
+  const storage = await getUserAssetStorage();
+  if (!storage.supabase) {
+    return { url: null, error: storage.error || "storage unavailable" };
+  }
+
+  const supabase = storage.supabase;
+  const { error } = await supabase.storage
+    .from(USER_ASSET_STORAGE_BUCKET)
+    .upload(storagePath, buf, {
+      contentType,
+      upsert: true,
+    });
   if (error) {
     console.error("[user-asset-image upload]", storagePath, error.message);
-    return null;
+    return { url: null, error: error.message };
   }
-  const { data } = supabase.storage.from(bucket).getPublicUrl(storagePath);
-  return data?.publicUrl || null;
+  const { data } = supabase.storage
+    .from(USER_ASSET_STORAGE_BUCKET)
+    .getPublicUrl(storagePath);
+  const url = data?.publicUrl || null;
+  return { url, error: url ? null : "public URL unavailable" };
 }
 
 async function handleCharacterImagePost(req, res) {
@@ -4847,9 +4928,11 @@ async function handleCharacterImagePost(req, res) {
     const safeUser = sanitizeStoryImagePathSegment(user_id, 120);
     const safeId = sanitizeStoryImagePathSegment(commenter_id, 120);
     const path = `commenters/${safeUser}/${safeId}/${kind}.${detected.ext}`;
-    const url = await uploadUserAssetImage("story-covers", path, buf, detected.contentType);
-    if (!url) return res.status(500).json({ ok: false, error: "upload failed" });
-    return res.json({ ok: true, image_url: url });
+    const uploaded = await uploadUserAssetImage(path, buf, detected.contentType);
+    if (!uploaded.url) {
+      return res.status(503).json({ ok: false, error: uploaded.error });
+    }
+    return res.json({ ok: true, image_url: uploaded.url });
   } catch (e) {
     console.error("[character-image]", e);
     return res.status(500).json({ ok: false, error: e.message });
@@ -4878,9 +4961,11 @@ async function handleUserStoryImagePost(req, res) {
     const safeUser = sanitizeStoryImagePathSegment(user_id, 120);
     const safeStory = sanitizeStoryImagePathSegment(story_id, 120);
     const path = `user-stories/${safeUser}/${safeStory}/${kind}.${detected.ext}`;
-    const url = await uploadUserAssetImage("story-covers", path, buf, detected.contentType);
-    if (!url) return res.status(500).json({ ok: false, error: "upload failed" });
-    return res.json({ ok: true, image_url: url });
+    const uploaded = await uploadUserAssetImage(path, buf, detected.contentType);
+    if (!uploaded.url) {
+      return res.status(503).json({ ok: false, error: uploaded.error });
+    }
+    return res.json({ ok: true, image_url: uploaded.url });
   } catch (e) {
     console.error("[user-story-image]", e);
     return res.status(500).json({ ok: false, error: e.message });
