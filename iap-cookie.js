@@ -228,11 +228,15 @@ export async function handleIapCookieVerifyPost(req, res, deps) {
     }
 
     if (existingRows && existingRows.length > 0) {
-      const balance = await sumCookieBalance(supabase, user_id);
+      const meta = await fetchCookieLedgerMeta(supabase, user_id);
+      if (!meta) {
+        return res.status(500).json({ ok: false, error: "balance sum failed" });
+      }
       console.log(
         "[iap-cookie] duplicate purchase skipped",
         `user=${user_id}`,
         `productId=${canonicalProductId}`,
+        `balance=${meta.balance}`,
       );
       return res.json({
         ok: true,
@@ -242,7 +246,7 @@ export async function handleIapCookieVerifyPost(req, res, deps) {
         firstPurchaseBonus: 0,
         totalGranted: Number(existingRows[0].delta) || productSpec.grantAmount,
         firstPurchaseBonusApplied: false,
-        balance,
+        balance: meta.balance,
       });
     }
 
@@ -286,7 +290,10 @@ export async function handleIapCookieVerifyPost(req, res, deps) {
       return res.status(500).json({ ok: false, error: insertErr.message });
     }
 
-    const balance = await sumCookieBalance(supabase, user_id);
+    const meta = await fetchCookieLedgerMeta(supabase, user_id);
+    if (!meta) {
+      return res.status(500).json({ ok: false, error: "balance sum failed" });
+    }
     console.log(
       "[iap-cookie] granted",
       `user=${user_id}`,
@@ -294,7 +301,7 @@ export async function handleIapCookieVerifyPost(req, res, deps) {
       `pack=${productSpec.grantAmount}`,
       `firstBonus=${firstPurchaseBonus}`,
       `total=${totalGranted}`,
-      `balance=${balance}`,
+      `balance=${meta.balance}`,
     );
 
     return res.status(201).json({
@@ -307,7 +314,7 @@ export async function handleIapCookieVerifyPost(req, res, deps) {
       firstPurchaseBonus,
       totalGranted,
       firstPurchaseBonusApplied,
-      balance,
+      balance: meta.balance,
     });
   } catch (e) {
     console.log("[iap-cookie]", e);
@@ -315,17 +322,75 @@ export async function handleIapCookieVerifyPost(req, res, deps) {
   }
 }
 
-export async function sumCookieBalance(supabase, userId) {
-  const { data, error } = await supabase
-    .from("cookie_transactions")
-    .select("delta")
-    .eq("user_id", userId);
-  if (error) return 0;
+function parseLedgerAggregateRow(data) {
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || typeof row !== "object") return null;
+  const balanceRaw = row.balance ?? row.sum;
+  const countRaw = row.tx_count ?? row.count;
+  if (balanceRaw == null && countRaw == null) return null;
+  const balanceNum = Number(balanceRaw);
+  const countNum = Number(countRaw);
+  return {
+    balance: Number.isFinite(balanceNum) ? Math.trunc(balanceNum) : 0,
+    count: Number.isFinite(countNum) ? Math.trunc(countNum) : 0,
+  };
+}
+
+/** PostgREST 기본 1000행 제한을 피한다. 일부만 더하면 잔액이 요청마다 달라진다. */
+async function sumCookieLedgerPaginated(supabase, userId) {
+  const pageSize = 1000;
+  let from = 0;
   let balance = 0;
-  for (const row of data || []) {
-    balance += Number(row.delta) || 0;
+  let count = 0;
+  for (let page = 0; page < 200; page++) {
+    let query = supabase
+      .from("cookie_transactions")
+      .select("delta")
+      .eq("user_id", userId)
+      .range(from, from + pageSize - 1);
+    let res = await query.order("id", { ascending: true });
+    if (res.error) {
+      res = await supabase
+        .from("cookie_transactions")
+        .select("delta")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: true })
+        .range(from, from + pageSize - 1);
+    }
+    if (res.error) return null;
+    const rows = res.data || [];
+    for (const row of rows) {
+      balance += Number(row.delta) || 0;
+      count += 1;
+    }
+    if (rows.length < pageSize) return { balance, count };
+    from += pageSize;
   }
-  return balance;
+  return { balance, count };
+}
+
+/** 계정 캔디 ledger 전체 SUM·건수. DB aggregate, 실패 시 페이지 합산. */
+export async function fetchCookieLedgerMeta(supabase, userId) {
+  const agg = await supabase
+    .from("cookie_transactions")
+    .select("balance:delta.sum(),tx_count:id.count()")
+    .eq("user_id", userId);
+  if (!agg.error) {
+    const parsed = parseLedgerAggregateRow(agg.data);
+    if (parsed) return parsed;
+  } else {
+    console.log(
+      "[cookie-ledger] aggregate failed:",
+      agg.error.message || agg.error,
+    );
+  }
+  return sumCookieLedgerPaginated(supabase, userId);
+}
+
+export async function sumCookieBalance(supabase, userId) {
+  const meta = await fetchCookieLedgerMeta(supabase, userId);
+  if (!meta) return 0;
+  return meta.balance;
 }
 
 async function userHasPriorIapPurchase(supabase, userId) {

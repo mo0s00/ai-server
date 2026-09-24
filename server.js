@@ -4,7 +4,10 @@ import express from "express";
 import FormData from "form-data";
 import { PassThrough } from "node:stream";
 import { createClient } from "@supabase/supabase-js";
-import { handleIapCookieVerifyPost, sumCookieBalance } from "./iap-cookie.js";
+import {
+  fetchCookieLedgerMeta,
+  handleIapCookieVerifyPost,
+} from "./iap-cookie.js";
 import { primeCharacterProfilesFromBody } from "./character-profile-cache.js";
 import {
   isElevenLabsConfigured,
@@ -3668,8 +3671,11 @@ async function handleCookieTxPost(req, res) {
       logSupabaseErr("[cookie-tx] insert", error);
       return res.status(500).json({ ok: false, error: error.message });
     }
-    const balance = await sumCookieBalance(supabase, user_id);
-    return res.status(201).json({ ok: true, balance });
+    const meta = await fetchCookieLedgerMeta(supabase, user_id);
+    if (!meta) {
+      return res.status(201).json({ ok: true });
+    }
+    return res.status(201).json({ ok: true, balance: meta.balance });
   } catch (e) {
     console.log("[cookie-tx]", e);
     return res.status(500).json({ ok: false });
@@ -3700,22 +3706,11 @@ async function handleCookieBalanceGet(req, res) {
     const userId = decodeURIComponent(req.params.userId || "").trim();
     if (!userId) return res.status(400).json({ balance: 0, count: 0 });
 
-    const { data, error } = await supabase
-      .from("cookie_transactions")
-      .select("delta")
-      .eq("user_id", userId);
-
-    if (error) {
-      logSupabaseErr("[cookie-balance]", error);
-      return res.status(500).json({ error: error.message });
+    const meta = await fetchCookieLedgerMeta(supabase, userId);
+    if (!meta) {
+      return res.status(500).json({ error: "balance sum failed" });
     }
-
-    const rows = data || [];
-    let balance = 0;
-    for (const r of rows) {
-      balance += Number(r.delta) || 0;
-    }
-    res.json({ balance, count: rows.length });
+    res.json({ balance: meta.balance, count: meta.count });
   } catch (e) {
     console.log("[cookie-balance]", e);
     res.status(500).json({ error: "server error" });
