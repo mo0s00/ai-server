@@ -3658,19 +3658,59 @@ async function handleCookieTxPost(req, res) {
     const platformRaw = readString(req.body, "platform");
     const platform = platformRaw || null;
 
-    const { error } = await supabase.from("cookie_transactions").insert([
-      {
-        user_id,
-        delta,
-        reason,
-        platform,
-      },
-    ]);
+    // 지급(delta>0)은 그대로 둔다. 차감만 잔액 0 미만을 거절한다.
+    if (delta < 0) {
+      const before = await fetchCookieLedgerMeta(supabase, user_id);
+      if (before && before.balance + delta < 0) {
+        return res.status(409).json({
+          ok: false,
+          error: "insufficient_balance",
+          balance: before.balance,
+        });
+      }
+    }
+
+    const { data: inserted, error } = await supabase
+      .from("cookie_transactions")
+      .insert([
+        {
+          user_id,
+          delta,
+          reason,
+          platform,
+        },
+      ])
+      .select("id")
+      .maybeSingle();
 
     if (error) {
       logSupabaseErr("[cookie-tx] insert", error);
       return res.status(500).json({ ok: false, error: error.message });
     }
+
+    // 동시에 들어온 차감이 0 미만을 만들면 방금 넣은 행만 되돌린다.
+    if (delta < 0 && inserted && inserted.id != null) {
+      const afterInsert = await fetchCookieLedgerMeta(supabase, user_id);
+      if (afterInsert && afterInsert.balance < 0) {
+        const { error: delErr } = await supabase
+          .from("cookie_transactions")
+          .delete()
+          .eq("id", inserted.id);
+        if (delErr) {
+          logSupabaseErr("[cookie-tx] rollback negative", delErr);
+          return res.status(500).json({ ok: false, error: delErr.message });
+        }
+        const restored = await fetchCookieLedgerMeta(supabase, user_id);
+        return res.status(409).json({
+          ok: false,
+          error: "insufficient_balance",
+          balance: restored
+            ? restored.balance
+            : afterInsert.balance - delta,
+        });
+      }
+    }
+
     const meta = await fetchCookieLedgerMeta(supabase, user_id);
     if (!meta) {
       return res.status(201).json({ ok: true });
