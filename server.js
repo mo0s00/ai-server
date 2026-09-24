@@ -4,7 +4,7 @@ import express from "express";
 import FormData from "form-data";
 import { PassThrough } from "node:stream";
 import { createClient } from "@supabase/supabase-js";
-import { handleIapCookieVerifyPost } from "./iap-cookie.js";
+import { handleIapCookieVerifyPost, sumCookieBalance } from "./iap-cookie.js";
 import { primeCharacterProfilesFromBody } from "./character-profile-cache.js";
 import {
   isElevenLabsConfigured,
@@ -1717,6 +1717,57 @@ async function handleStoryCreationSuggestionsStream(req, res) {
   res.end();
 }
 
+/** 코모카 장면 이미지 프롬프트 — `/comment`와 동일 프롬프트, SSE delta. */
+async function handleKomokaScenePromptStream(req, res) {
+  res.setHeader("X-AI-Server-Rev", SERVER_REV);
+  const prompt = sanitizePromptForApi(readString(req.body, "prompt"));
+  if (!prompt) {
+    return res.status(400).json({ error: "prompt 필드가 필요합니다." });
+  }
+  if (!isAnthropicConfigured()) {
+    return res.status(503).json({ error: "Anthropic is not configured" });
+  }
+
+  const requestedTemperature = Number(req.body?.temperature);
+  const requestedMaxTokens = Number(req.body?.maxTokens);
+  const temperature =
+    Number.isFinite(requestedTemperature) && requestedTemperature >= 0 && requestedTemperature <= 2
+      ? requestedTemperature
+      : 0.7;
+  const max_tokens =
+    Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
+      ? Math.min(2048, Math.floor(requestedMaxTokens))
+      : 800;
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  try {
+    const llmResult = await callAnthropicCompletionStream({
+      model: CHAT_LLM_ANTHROPIC_MODEL,
+      userPrompt: prompt,
+      temperature,
+      max_tokens,
+      logTag: "komoka-scene-prompt-stream",
+      onDelta: (piece) => {
+        if (piece) writeSse(res, { type: "delta", text: piece });
+      },
+      fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+      disableThinking: true,
+    });
+    if (!llmResult.ok) {
+      writeSse(res, { type: "error", error: llmResult.errorText || "AI 생성 실패" });
+    } else {
+      writeSse(res, { type: "done", text: llmResult.text });
+    }
+  } catch (e) {
+    writeSse(res, { type: "error", error: e?.message || "AI 생성 실패" });
+  }
+  res.end();
+}
+
 /** 모델명만 던지는 쓰레기 응답(동형 문자·ZWSP 등) 거르기. */
 function isGarbageModelLine(s, modelStr) {
   const chatLlm = resolveDeepSeekConfig();
@@ -2809,6 +2860,8 @@ async function handleCommenterStatePost(req, res) {
 app.post("/api/comment", handleAiCommentPost);
 app.post("/comment", handleAiCommentPost);
 app.post("/api/story-creation-suggestions-stream", handleStoryCreationSuggestionsStream);
+app.post("/api/komoka-scene-prompt-stream", handleKomokaScenePromptStream);
+app.post("/komoka-scene-prompt-stream", handleKomokaScenePromptStream);
 app.post("/api/live-comments", handleLiveCommentsPost);
 app.post("/live-comments", handleLiveCommentsPost);
 app.post("/api/parallel-story", handleParallelStoryPost);
@@ -3615,7 +3668,8 @@ async function handleCookieTxPost(req, res) {
       logSupabaseErr("[cookie-tx] insert", error);
       return res.status(500).json({ ok: false, error: error.message });
     }
-    return res.status(201).json({ ok: true });
+    const balance = await sumCookieBalance(supabase, user_id);
+    return res.status(201).json({ ok: true, balance });
   } catch (e) {
     console.log("[cookie-tx]", e);
     return res.status(500).json({ ok: false });

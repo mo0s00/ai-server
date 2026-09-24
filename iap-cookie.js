@@ -315,7 +315,7 @@ export async function handleIapCookieVerifyPost(req, res, deps) {
   }
 }
 
-async function sumCookieBalance(supabase, userId) {
+export async function sumCookieBalance(supabase, userId) {
   const { data, error } = await supabase
     .from("cookie_transactions")
     .select("delta")
