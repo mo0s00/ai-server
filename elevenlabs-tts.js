@@ -302,11 +302,11 @@ export function normalizeElevenLabsVoiceSettings(raw, { modelId } = {}) {
     use_speaker_boost: src.use_speaker_boost !== false,
   };
   if (!v3) return settings;
-  // v3: audio tags가 연기를 담당. Creative~Natural 구간 + style/speed는 보조.
+  // v3: audio tags가 연기를 담당. stability·style은 미리보기·대사 튜닝용.
   return {
     stability: clamp(settings.stability, 0.28, 0.48, 0.38),
     similarity_boost: clamp(settings.similarity_boost, 0.65, 0.85, 0.75),
-    style: clamp(settings.style, 0, 0.12, 0.04),
+    style: clamp(settings.style, 0, 1, 0.04),
     speed: clamp(settings.speed, 0.88, 1.05, 0.98),
     use_speaker_boost: false,
   };
@@ -422,29 +422,24 @@ export async function synthesizeElevenLabsMp3({
     : { text: input, tags: [], tagString: "" };
   const spokenText = tagged.text;
 
-  let settings;
-  if (isV3) {
-    settings = { stability: 0.38 };
-  } else {
-    const emotionPreset =
-      String(voiceEmotion || "").trim().length > 0
-        ? voiceSettingsFromEmotionPreset(voiceEmotion, voiceIntensity)
-        : null;
-    settings = emotionPreset
-      ? normalizeElevenLabsVoiceSettings(
-          {
-            stability: emotionPreset.stability,
-            similarity_boost: emotionPreset.similarity_boost,
-            style: emotionPreset.style,
-            speed: emotionPreset.speed,
-            use_speaker_boost: emotionPreset.use_speaker_boost,
-          },
-          { modelId: ELEVENLABS_TTS_MODEL },
-        )
-      : normalizeElevenLabsVoiceSettings(voiceSettings, {
-          modelId: ELEVENLABS_TTS_MODEL,
-        });
-  }
+  const emotionPreset =
+    String(voiceEmotion || "").trim().length > 0
+      ? voiceSettingsFromEmotionPreset(voiceEmotion, voiceIntensity)
+      : null;
+  const settings = emotionPreset
+    ? normalizeElevenLabsVoiceSettings(
+        {
+          stability: emotionPreset.stability,
+          similarity_boost: emotionPreset.similarity_boost,
+          style: emotionPreset.style,
+          speed: emotionPreset.speed,
+          use_speaker_boost: emotionPreset.use_speaker_boost,
+        },
+        { modelId: ELEVENLABS_TTS_MODEL },
+      )
+    : normalizeElevenLabsVoiceSettings(voiceSettings, {
+        modelId: ELEVENLABS_TTS_MODEL,
+      });
   const effectivePreset = voicePreset || "calm";
   const lang = String(language || "ko").trim().toLowerCase() || "ko";
   const isLowLatency = /flash|turbo/i.test(ELEVENLABS_TTS_MODEL);
@@ -452,7 +447,10 @@ export async function synthesizeElevenLabsMp3({
     text: spokenText.length > 4096 ? spokenText.slice(0, 4096) : spokenText,
     model_id: ELEVENLABS_TTS_MODEL,
     voice_settings: isV3
-      ? { stability: settings.stability }
+      ? {
+          stability: settings.stability,
+          style: settings.style,
+        }
       : {
           stability: settings.stability,
           similarity_boost: settings.similarity_boost,
@@ -482,7 +480,7 @@ export async function synthesizeElevenLabsMp3({
   for (const voiceId of candidates) {
     const voiceName = voiceNameById(voices, voiceId);
     const settingsLog = isV3
-      ? `stability=${settings.stability}`
+      ? `stability=${settings.stability} style=${settings.style}`
       : `speed=${settings.speed} stability=${settings.stability} ` +
         `style=${settings.style} similarity=${settings.similarity_boost}`;
     console.log(

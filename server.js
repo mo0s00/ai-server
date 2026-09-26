@@ -5172,6 +5172,86 @@ async function requestOpenAiStoryImageGeneration(prompt, imageSize = STORY_IMAGE
   });
 }
 
+function parseOpenAiImageErrorFields(raw) {
+  const body = String(raw || "").trim();
+  const empty = { code: "", message: "", type: "", param: "" };
+  if (!body) return empty;
+  try {
+    const parsed = JSON.parse(body);
+    const err = parsed?.error;
+    if (err && typeof err === "object") {
+      return {
+        code: String(err.code || "").trim(),
+        message: String(err.message || "").trim(),
+        type: String(err.type || "").trim(),
+        param: String(err.param || "").trim(),
+      };
+    }
+    if (typeof parsed?.message === "string") {
+      return { ...empty, message: parsed.message.trim() };
+    }
+  } catch (_e) {
+    // non-json body
+  }
+  return empty;
+}
+
+function classifyStoryImageFailure(status, fields, fallbackMessage = "") {
+  const statusNum = Number(status) || 0;
+  const blob = `${fields.code} ${fields.message} ${fields.type} ${fallbackMessage}`.toLowerCase();
+
+  if (statusNum === 429) return "rate_limit_429";
+  if (statusNum === 401 || statusNum === 403) return "auth_access";
+  if (statusNum === 404) return "model_or_route_404";
+  if (statusNum === 408 || blob.includes("timeout") || blob.includes("timed out")) {
+    return "timeout";
+  }
+  if (
+    blob.includes("billing") ||
+    blob.includes("quota") ||
+    blob.includes("insufficient") ||
+    blob.includes("exceeded your current quota")
+  ) {
+    return "billing_quota";
+  }
+  if (
+    blob.includes("model") &&
+    (blob.includes("not found") ||
+      blob.includes("does not exist") ||
+      blob.includes("not available") ||
+      blob.includes("access"))
+  ) {
+    return "model_access";
+  }
+  if (statusNum >= 500 && statusNum < 600) return "upstream_server_5xx";
+  if (statusNum >= 400 && statusNum < 500) return "openai_client_4xx";
+  if (statusNum === 0 && blob.includes("fetch")) return "network";
+  return "unknown";
+}
+
+function logStoryImageOpenAiResponse(label, status, raw, ok) {
+  const fields = parseOpenAiImageErrorFields(raw);
+  const fallback = ok ? "" : parseOpenAiImageError(raw, status);
+  const kind = ok ? "ok" : classifyStoryImageFailure(status, fields, fallback);
+  const payload = {
+    label,
+    httpStatus: status,
+    kind,
+    errorCode: fields.code || null,
+    errorMessage: fields.message || null,
+    errorType: fields.type || null,
+    errorParam: fields.param || null,
+    responseBody: raw,
+  };
+  const line = `[story-image openai] ${JSON.stringify(payload)}`;
+  if (ok) {
+    console.log(line);
+  } else {
+    console.error(line);
+  }
+  return { kind, fields };
+}
+
 function parseOpenAiImageError(raw, status = 0) {
   const body = String(raw || "").trim();
   if (!body) return `image generation failed (${status || "unknown"})`;
@@ -5192,18 +5272,15 @@ function parseOpenAiImageError(raw, status = 0) {
 
 async function readOpenAiStoryImageResponse(res, label) {
   const raw = await res.text();
-  console.log(`[story-image openai ${label}] status=${res.status}`);
-  console.log(`[story-image openai ${label}] body=${raw}`);
-  if (!res.ok) {
-    console.error(
-      `[story-image openai ${label}] failed status=${res.status} body=${raw}`,
-    );
-  }
+  const meta = logStoryImageOpenAiResponse(label, res.status, raw, res.ok);
   return {
     ok: res.ok,
     status: res.status,
     raw,
     errorMessage: res.ok ? "" : parseOpenAiImageError(raw, res.status),
+    errorKind: meta.kind,
+    errorCode: meta.fields.code,
+    errorType: meta.fields.type,
   };
 }
 
@@ -5341,7 +5418,18 @@ async function generateStoryImageFromPrompt(
 
   const raw = result.raw;
   if (!result.ok) {
-    throw new Error(result.errorMessage || `image generation failed (${result.status})`);
+    const err = new Error(
+      result.errorMessage || `image generation failed (${result.status})`,
+    );
+    err.openaiStatus = result.status;
+    err.openaiKind = result.errorKind || classifyStoryImageFailure(
+      result.status,
+      parseOpenAiImageErrorFields(raw),
+      result.errorMessage,
+    );
+    err.openaiCode = result.errorCode || "";
+    err.openaiType = result.errorType || "";
+    throw err;
   }
 
   let parsed;
@@ -5451,8 +5539,29 @@ app.post("/api/story-cover-image", async (req, res) => {
       fallback_used: genResult.fallbackUsed,
     });
   } catch (e) {
-    console.error("[story-cover server error]", e);
-    return res.status(500).json({ ok: false, error: e.message });
+    const openaiStatus = e?.openaiStatus ?? null;
+    const openaiKind =
+      e?.openaiKind ??
+      classifyStoryImageFailure(0, parseOpenAiImageErrorFields(""), e?.message || "");
+    console.error(
+      "[story-cover-image]",
+      JSON.stringify({
+        route: "/api/story-cover-image",
+        kind: openaiKind,
+        openaiHttpStatus: openaiStatus,
+        openaiErrorCode: e?.openaiCode || null,
+        openaiErrorType: e?.openaiType || null,
+        message: e?.message || String(e),
+        stack: e?.stack || null,
+      }),
+    );
+    return res.status(500).json({
+      ok: false,
+      error: e.message,
+      error_kind: openaiKind,
+      openai_status: openaiStatus,
+      openai_code: e?.openaiCode || null,
+    });
   }
 });
 
