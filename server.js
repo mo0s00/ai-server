@@ -129,7 +129,7 @@ const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "user-story-image-ascii-keys";
+const SERVER_REV = "story-character-ref-identity-v2";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -4700,6 +4700,32 @@ Do not change body type.
 
 Only change pose, expression, scene, lighting and environment according to the story.`;
 
+/** 코모카·소환 참고 얼굴 — 배너/스타일 규칙보다 우선 */
+const STORY_CHARACTER_IDENTITY_REFERENCE_RULES = `IMPORTANT — CHARACTER IDENTITY (highest priority):
+
+The uploaded reference image is the canonical face and identity for this character.
+
+Preserve the same person from the reference:
+- facial structure, eyes, nose, mouth, jawline
+- hairstyle and hair color
+- skin tone and apparent age
+- overall recognizability
+
+Do NOT replace this person with a different character.
+Do NOT redesign the face to match a famous book, movie, or stock archetype for the character name.
+
+Adapt ONLY: clothing, pose, expression, lighting, environment, and story-appropriate props per the prompt below.
+
+No text, logos, UI, or watermarks in the image.`;
+
+const STORY_STYLE_REFERENCE_RULES = `IMPORTANT — STYLE REFERENCE ONLY:
+
+Use the reference image for art style, rendering technique, color palette, lighting mood, and quality.
+
+Do NOT copy the reference person's face identity or exact likeness.
+
+Create a new original character that fits the prompt while matching the reference visual style.`;
+
 const STORY_IMAGE_COMMON_RULES = `Visual rules:
 - vertical 9:16 composition
 - cinematic lighting
@@ -4755,6 +4781,28 @@ function normalizeStoryProgramType(raw) {
   if (t === "movie" || t === "film" || t === "영화" || t === "드라마") return "movie";
   if (Object.prototype.hasOwnProperty.call(STORY_CATEGORY_STYLES, t)) return t;
   return "fantasy";
+}
+
+/** 소환·코모카 장면 등 세로 인물 컷 — 가로 스토리 배너(isCover)와 구분 */
+function normalizeStoryReferenceMode(raw) {
+  return String(raw || "").trim().toLowerCase();
+}
+
+function storyCoverRouteUsesPortraitLayout(programType, referenceMode = "") {
+  const program = normalizeStoryProgramType(programType);
+  const mode = normalizeStoryReferenceMode(referenceMode);
+  if (program === "character_chat") return true;
+  if (mode === "character") return true;
+  return false;
+}
+
+function storyImagePromptUsesPortraitLayout({
+  programType,
+  referenceMode = "",
+  isCover = false,
+} = {}) {
+  if (storyCoverRouteUsesPortraitLayout(programType, referenceMode)) return true;
+  return !isCover;
 }
 
 function parseStoryReferenceImages(raw) {
@@ -4840,6 +4888,20 @@ function characterChatVisualFocus(styleType, referenceMode = "") {
       "Create a new original character per the prompt — do not copy the reference person's identity."
     );
   }
+  if (mode === "character") {
+    if (String(styleType || "").trim().toLowerCase() === "photo") {
+      return (
+        "Focus: Single photorealistic character portrait for vertical mobile chat wallpaper (9:16). " +
+        "The uploaded reference defines the exact same person — preserve face identity, hair, and skin tone. " +
+        "Center face and upper body; adapt outfit and background to the story prompt only."
+      );
+    }
+    return (
+      "Focus: Single illustrated character portrait for vertical mobile chat wallpaper (9:16). " +
+      "The uploaded reference defines the exact same person — preserve face identity, hair color, and hairstyle. " +
+      "Center face and upper body; adapt outfit and background to the story prompt only."
+    );
+  }
   if (String(styleType || "").trim().toLowerCase() === "photo") {
     return (
       "Focus: Single photorealistic character portrait for vertical mobile chat wallpaper. " +
@@ -4871,33 +4933,63 @@ function buildStoryImagePrompt({
   referenceMode = "",
 }) {
   const program = normalizeStoryProgramType(programType);
+  const refMode = normalizeStoryReferenceMode(referenceMode);
+  const portraitCharacter =
+    program === "character_chat" || refMode === "character";
   let style = STORY_CATEGORY_STYLES[program] || STORY_CATEGORY_STYLES.fantasy;
   let focus = STORY_CATEGORY_FOCUS[program] || STORY_CATEGORY_FOCUS.fantasy;
   if (program === "character_chat") {
     style = characterChatVisualStyle(styleType, mood);
     focus = characterChatVisualFocus(styleType, referenceMode);
-  } else if (isCover) {
-    focus = bannerVisualFocus(referenceMode);
   }
   const t = String(title || "").trim().slice(0, 200);
-  const op = String(opening || "").trim().slice(0, 600);
+  const openingMax = portraitCharacter ? 2200 : 600;
+  const op = String(opening || "").trim().slice(0, openingMax);
   const p = String(partner || "").trim().slice(0, 80);
   const m = String(mood || "cinematic dramatic").trim().slice(0, 120);
   const turns = String(recentTurns || "").trim().slice(0, 2000);
-  const scene = String(sceneSummary || "").trim().slice(0, 400);
+  const sceneMax = portraitCharacter ? 900 : 400;
+  const scene = String(sceneSummary || "").trim().slice(0, sceneMax);
   const chars = String(characters || "").trim().slice(0, 300);
   const emo = String(emotion || "").trim().slice(0, 120);
   const refNames = Array.isArray(referenceCharacterNames)
     ? referenceCharacterNames.map((n) => String(n || "").trim()).filter(Boolean)
     : [];
 
-  const kind = isCover
+  const portraitLayout = storyImagePromptUsesPortraitLayout({
+    programType: program,
+    referenceMode: refMode,
+    isCover,
+  });
+  const effectiveIsCover = portraitLayout ? false : isCover;
+
+  if (program !== "character_chat" && effectiveIsCover) {
+    focus = bannerVisualFocus(referenceMode);
+  }
+
+  const refBlock =
+    refNames.length > 0
+      ? refMode === "character"
+        ? `\nCanonical character reference (uploaded images in order — preserve this person's identity):\n${refNames.map((n, i) => `image${i + 1}: ${n}`).join("\n")}`
+        : `\nReference characters (uploaded images in order):\n${refNames.map((n, i) => `image${i + 1}: ${n}`).join("\n")}`
+      : "";
+
+  let refRules = STORY_IMAGE_REFERENCE_RULES;
+  if (refMode === "character") {
+    refRules = STORY_CHARACTER_IDENTITY_REFERENCE_RULES;
+  } else if (refMode === "style") {
+    refRules = STORY_STYLE_REFERENCE_RULES;
+  } else if (refMode === "banner" || (effectiveIsCover && refNames.length > 0)) {
+    refRules = STORY_BANNER_REFERENCE_RULES;
+  }
+
+  const kind = effectiveIsCover
     ? renderTitleInImage
       ? "Create one high-quality horizontal story banner cover with the title text rendered inside the image."
       : "Create one high-quality horizontal story banner background (16:9 landscape). No text in the image."
-    : "Create one high-quality vertical story scene background.";
+    : "Create one high-quality vertical character portrait (9:16 portrait). No text in the image.";
 
-  const visualRules = isCover
+  const visualRules = effectiveIsCover
     ? renderTitleInImage
       ? `${STORY_BANNER_TITLE_RULES}
 - only text allowed in the image is the story title shown below`
@@ -4905,20 +4997,9 @@ function buildStoryImagePrompt({
     : STORY_IMAGE_COMMON_RULES;
 
   const titleBlock =
-    isCover && renderTitleInImage && t
+    effectiveIsCover && renderTitleInImage && t
       ? `\nTitle text to render in the image (Korean, exact spelling): 「${t}」`
       : "";
-
-  const refBlock =
-    refNames.length > 0
-      ? `\nReference characters (uploaded images in order):\n${refNames.map((n, i) => `image${i + 1}: ${n}`).join("\n")}`
-      : "";
-
-  const refMode = String(referenceMode || "").trim().toLowerCase();
-  const refRules =
-    refMode === "banner" || (isCover && refNames.length > 0)
-      ? STORY_BANNER_REFERENCE_RULES
-      : STORY_IMAGE_REFERENCE_RULES;
 
   return `${refRules}
 ${refBlock}
@@ -5487,19 +5568,29 @@ app.post("/api/story-cover-image", async (req, res) => {
       render_title_in_image = false,
       style_type = "",
       reference_mode = "",
+      referenceMode: referenceModeCamel = "",
     } = req.body || {};
 
     if (!OPENAI_API_KEY) {
       return res.status(500).json({ ok: false, error: "no OPENAI_API_KEY" });
     }
 
+    const referenceModeResolved = normalizeStoryReferenceMode(
+      reference_mode || referenceModeCamel,
+    );
     const refs = parseStoryReferenceImages(reference_images);
     const refNames = refs.map((r) => r.name);
+    const portraitLayout = storyCoverRouteUsesPortraitLayout(
+      program_type,
+      referenceModeResolved,
+    );
     console.log(
       "[imageGen] story-cover-image",
+      `programType=${String(program_type || "").trim() || "(default)"}`,
       `styleType=${String(style_type || "").trim() || "(default)"}`,
-      `referenceMode=${String(reference_mode || "").trim() || "(default)"}`,
+      `referenceMode=${referenceModeResolved || "(default)"}`,
       `parsedReferenceCount=${refs.length}`,
+      `layout=${portraitLayout ? "portrait" : "banner"}`,
     );
 
     const promptUsed = buildStoryImagePrompt({
@@ -5512,20 +5603,21 @@ app.post("/api/story-cover-image", async (req, res) => {
       sceneSummary: scene_summary,
       characters: characters || refNames.join(", "),
       referenceCharacterNames: refNames,
-      isCover: true,
+      isCover: !portraitLayout,
       renderTitleInImage: !!render_title_in_image,
       styleType: style_type,
-      referenceMode: reference_mode,
+      referenceMode: referenceModeResolved,
     });
 
-    const imageSize = storyImageApiSize({ landscape: true });
+    const imageSize = storyImageApiSize({ landscape: !portraitLayout });
+    const fileStem = portraitLayout ? "character_chat" : "cover";
     const genResult = await generateStoryImageFromPrompt(
       promptUsed,
-      session_key || "cover",
-      "cover",
+      session_key || fileStem,
+      fileStem,
       refs,
       imageSize,
-      { referenceMode: reference_mode },
+      { referenceMode: referenceModeResolved },
     );
 
     return res.json({
@@ -5537,6 +5629,9 @@ app.post("/api/story-cover-image", async (req, res) => {
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
       fallback_used: genResult.fallbackUsed,
+      reference_mode: referenceModeResolved,
+      layout: portraitLayout ? "portrait" : "banner",
+      program_type: String(program_type || "").trim(),
     });
   } catch (e) {
     const openaiStatus = e?.openaiStatus ?? null;
