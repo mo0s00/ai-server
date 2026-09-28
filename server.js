@@ -124,12 +124,12 @@ function openAiCompletionTokenLimit(maxTokens) {
 const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-2.5-flare";
 const OPENAI_IMAGE_QUALITY = "medium";
-const STORY_IMAGE_SIZE_PORTRAIT = "1024x1536";
+const STORY_IMAGE_SIZE_PORTRAIT = "768x1152";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "image-flare-medium-v1";
+const SERVER_REV = "image-portrait-768-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
