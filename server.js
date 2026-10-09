@@ -4396,7 +4396,7 @@ app.post("/api/story-chat", async (req, res) => {
       temperature,
       max_tokens,
       logTag: "story-chat",
-      fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+      fetchTimeoutMs: Math.max(STORY_LLM_TIMEOUT_MS, 120000),
       disableThinking: true,
     });
     logTiming("provider_completed");
@@ -4419,7 +4419,7 @@ app.post("/api/story-chat", async (req, res) => {
         temperature,
         max_tokens: retryMax,
         logTag: "story-chat",
-        fetchTimeoutMs: STORY_LLM_TIMEOUT_MS,
+        fetchTimeoutMs: Math.max(STORY_LLM_TIMEOUT_MS, 120000),
         _attempt: 1,
         disableThinking: true,
       });
