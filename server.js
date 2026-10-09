@@ -569,8 +569,10 @@ function resolveStoryLlmMaxTokens(requested, modelStr) {
     return Math.min(4096, Math.max(base, 1200));
   }
   if (isAnthropicThinkingHeavyModel(modelStr)) {
-    // Sonnet/Opus 5 — 앱 요청(800~1100)을 존중. 4096 floor는 생성 지연·비용만 키움.
-    const cap = 1200;
+    // 노드 스토리는 본문 700~1200자 외에도 화자·포즈·진행 JSON을 포함한다.
+    // 기존 1200 상한은 앱 요청(1600~1800)도 잘라 짧은 턴과 재생성을 유발했다.
+    // 기본 요청량은 그대로 존중하고 확장 분량에만 6000 보호 상한을 적용한다.
+    const cap = 6000;
     const floor = 600;
     return Math.min(cap, Math.max(base, floor));
   }
