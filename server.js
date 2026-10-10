@@ -124,12 +124,12 @@ function openAiCompletionTokenLimit(maxTokens) {
 const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-2.5-flare";
 const OPENAI_IMAGE_QUALITY = "medium";
-const STORY_IMAGE_SIZE_PORTRAIT = "768x1152";
+const STORY_IMAGE_SIZE_PORTRAIT = "672x1008";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "image-portrait-768-v1";
+const SERVER_REV = "handdrawn-webtoon-672-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -4729,14 +4729,35 @@ Do NOT copy the reference person's face identity or exact likeness.
 Create a new original character that fits the prompt while matching the reference visual style.`;
 
 const STORY_IMAGE_COMMON_RULES = `Visual rules:
-- vertical 9:16 composition
-- cinematic lighting
+- vertical 2:3 composition matching the requested image size
+- deliberate hand-drawn lighting and shadows
 - full background scene
 - no speech bubbles
 - no text
 - no watermark
 - no UI elements
 - emotionally clear storytelling`;
+
+/** Hand-drawn comic styles, separate from photorealistic studio presets. */
+const STORY_WEBTOON_ART_STYLES = {
+  webtoon_bold:
+    "Bold ink comic: strong thick black outlines, graphic silhouette, flat vivid cel colors, exaggerated expressive faces, confident brush-pen contours, minimal gradients.",
+  webtoon_clean:
+    "Classic Korean webtoon: clearly visible clean line art with varied line weight, 2D drawn faces and anatomy, restrained flat cel shading, limited controlled palette, expressive hand-inked details.",
+  webtoon_detailed:
+    "Detailed hand-drawn webtoon: fine precise ink hatching and hair strands, intentional line-weight variation, thoughtfully drawn fabric folds, subtle hand-painted texture, detailed 2D cel colors.",
+  webtoon_ink:
+    "Dramatic graphic novel ink drawing: tactile brush strokes, bold irregular black ink shadows, expressive hatched texture, high-contrast comic lighting, limited color over authentic pen line work.",
+};
+function storyWebtoonArtDirection(rawStyle) {
+  const key = String(rawStyle || "").trim().toLowerCase();
+  const description = STORY_WEBTOON_ART_STYLES[key] || STORY_WEBTOON_ART_STYLES.webtoon_clean;
+  return "HIGHEST PRIORITY ART DIRECTION: " + description +
+    " Clearly two-dimensional comic illustration, hand-drawn editorial storytelling rather than synthetic AI gloss. " +
+    " Preserve recognizability of referenced characters but render them with deliberate ink lines. " +
+    " Absolutely avoid photorealistic skin, 3D CGI, airbrushed smooth plastic faces, glossy highlights, " +
+    " hyper-detailed cinematic rendering, lens blur, bloom, and oversaturated magical light.";
+}
 
 const STORY_CATEGORY_STYLES = {
   fantasy:
@@ -4932,6 +4953,7 @@ function buildStoryImagePrompt({
   isCover = false,
   renderTitleInImage = false,
   styleType = "",
+  artStyle = "",
   referenceMode = "",
 }) {
   const program = normalizeStoryProgramType(programType);
@@ -4944,6 +4966,13 @@ function buildStoryImagePrompt({
     style = characterChatVisualStyle(styleType, mood);
     focus = characterChatVisualFocus(styleType, referenceMode);
   }
+  // Keep explicit photo studio requests intact, but use inked webtoon
+  // art for fantasy cuts and illustrated character portraits by default.
+  const webtoonArt = String(styleType || "").trim().toLowerCase() !== "photo" &&
+      (program === "fantasy" || program === "character_chat")
+    ? storyWebtoonArtDirection(artStyle)
+    : "";
+  if (webtoonArt) style = webtoonArt;
   const t = String(title || "").trim().slice(0, 200);
   const openingMax = portraitCharacter ? 2200 : 600;
   const op = String(opening || "").trim().slice(0, openingMax);
@@ -5023,7 +5052,8 @@ Mood: ${m}
 ${turns ? `\nRecent Story (last user turns):\n${turns}` : ""}
 ${scene ? `\nScene Summary:\n${scene}` : ""}
 ${chars ? `\nCharacters:\n${chars}` : ""}
-${emo ? `\nEmotion:\n${emo}` : ""}`.trim();
+${emo ? `\nEmotion:\n${emo}` : ""}
+${webtoonArt ? `\nFINAL STYLE OVERRIDE (preserve character identity):\n${webtoonArt}` : ""}`.trim();
 }
 
 function sanitizeStoryImagePathSegment(raw, maxLen = 80) {
@@ -5477,22 +5507,13 @@ async function generateStoryImageFromPrompt(
     }
 
     if (editsFailed) {
-      console.warn(
-        "[imageGen]",
-        "edits failed; falling back to text-only generations",
-        `referenceMode=${refMode || "(default)"}`,
-        result?.errorMessage || "",
-      );
-      fallbackUsed = true;
-      generationMode = "generations-fallback";
-      const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
-      result = await readOpenAiStoryImageResponse(genRes, "generations-fallback");
-      console.log(
-        "[imageGen]",
-        `generationsStatus=${result.status}`,
-        "generationMode=generations-fallback",
-        "fallbackUsed=true",
-      );
+      // Do not pay for a second image that loses the supplied identity.
+      const error = new Error(result?.errorMessage || "reference image edit failed");
+      error.openaiStatus = result?.status || null;
+      error.openaiKind = result?.errorKind || "reference_edit_failed";
+      error.openaiCode = result?.errorCode || "";
+      error.openaiType = result?.errorType || "";
+      throw error;
     }
   } else {
     const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
@@ -5569,6 +5590,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       reference_images = [],
       render_title_in_image = false,
       style_type = "",
+      art_style = "",
       reference_mode = "",
       referenceMode: referenceModeCamel = "",
     } = req.body || {};
@@ -5608,6 +5630,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       isCover: !portraitLayout,
       renderTitleInImage: !!render_title_in_image,
       styleType: style_type,
+      artStyle: art_style,
       referenceMode: referenceModeResolved,
     });
 
