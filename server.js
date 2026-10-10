@@ -9,6 +9,7 @@ import {
   handleIapCookieVerifyPost,
 } from "./iap-cookie.js";
 import { primeCharacterProfilesFromBody } from "./character-profile-cache.js";
+import { buildStoryArtDirection, resolveStoryArtPreset } from "./story-image-art-style.js";
 import {
   isElevenLabsConfigured,
   synthesizeElevenLabsMp3,
@@ -124,12 +125,12 @@ function openAiCompletionTokenLimit(maxTokens) {
 const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-2.5-flare";
 const OPENAI_IMAGE_QUALITY = "medium";
-const STORY_IMAGE_SIZE_PORTRAIT = "768x1152";
-const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
+const STORY_IMAGE_SIZE_PORTRAIT = "672x1008";
+const STORY_IMAGE_SIZE_LANDSCAPE = "1152x656";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
 /** Bump when changing behavior (check with GET /health or GET /api/health). */
-const SERVER_REV = "image-portrait-768-v1";
+const SERVER_REV = "webtoon-ink-672-v1";
 const STORY_JSON_SYSTEM_PROMPT =
   "You are a story dialogue engine. Reply with ONE valid JSON object in the assistant message content field only. No markdown fences, no text outside JSON.";
 const PARALLEL_STORY_SYSTEM_PROMPT =
@@ -4700,7 +4701,7 @@ Do not change age.
 Do not change ethnicity.
 Do not change body type.
 
-Only change pose, expression, scene, lighting and environment according to the story.`;
+Keep identity stable while translating photorealistic reference rendering into the selected hand-inked comic medium. Change pose, expression, scene, lighting and environment according to the story.`;
 
 /** 코모카·소환 참고 얼굴 — 배너/스타일 규칙보다 우선 */
 const STORY_CHARACTER_IDENTITY_REFERENCE_RULES = `IMPORTANT — CHARACTER IDENTITY (highest priority):
@@ -4716,7 +4717,7 @@ Preserve the same person from the reference:
 Do NOT replace this person with a different character.
 Do NOT redesign the face to match a famous book, movie, or stock archetype for the character name.
 
-Adapt ONLY: clothing, pose, expression, lighting, environment, and story-appropriate props per the prompt below.
+Adapt ONLY: clothing, pose, expression, lighting, environment, art medium and story props. Preserve face identity in the selected hand-drawn medium.
 
 No text, logos, UI, or watermarks in the image.`;
 
@@ -4729,9 +4730,9 @@ Do NOT copy the reference person's face identity or exact likeness.
 Create a new original character that fits the prompt while matching the reference visual style.`;
 
 const STORY_IMAGE_COMMON_RULES = `Visual rules:
-- vertical 9:16 composition
-- cinematic lighting
-- full background scene
+- vertical 2:3 composition (match API dimensions)
+- consistent hand-inked 2D environment and foreground
+- clear silhouette and restrained illustrative lighting
 - no speech bubbles
 - no text
 - no watermark
@@ -4740,9 +4741,9 @@ const STORY_IMAGE_COMMON_RULES = `Visual rules:
 
 const STORY_CATEGORY_STYLES = {
   fantasy:
-    "fantasy cinematic illustration, epic fantasy atmosphere, magical world, enchanted lighting, ancient ruins, castles, forests, mythical creatures, glowing magic effects, dramatic composition, high detail, storybook fantasy, immersive adventure scene",
+    "hand-inked fantasy webtoon illustration, 2D ink-drawn sequential panels, expressive figure posing, visible black contours, flat shadow shapes, fantasy adventure environments",
   romance:
-    "romantic cinematic illustration, warm emotional atmosphere, soft natural lighting, expressive characters, intimate moment, modern daily life, cafe, bedroom, street at night, school, office, subtle facial expression, gentle mood, beautiful composition, no magic effects, no dragons",
+    "hand-drawn romantic webtoon, expressive inked faces, clean 2D cel color, subtle acting, intimate daily life scenes, no magic effects or dragons",
   movie:
     "cinematic movie still, dramatic lighting, realistic film composition, wide angle shot, strong visual storytelling, atmospheric scene, high contrast, professional cinematography, dynamic camera angle, movie poster quality, immersive scene",
   royal:
@@ -4752,7 +4753,7 @@ const STORY_CATEGORY_STYLES = {
   issue:
     "dramatic newsroom cinematic illustration, tense atmosphere, professional lighting",
   character_chat:
-    "high-quality character portrait illustration for mobile chat background, upper-body portrait, expressive face with clean detailed features, soft atmospheric background, cinematic lighting, art-style faithful to reference, no text, no UI, no watermark",
+    "hand-inked webtoon character portrait, clear upper-body face, expressive ink contours, restrained flat colors, match reference character identity, no text, no UI, no watermark",
 };
 
 const STORY_CATEGORY_FOCUS = {
@@ -4858,8 +4859,8 @@ function characterChatVisualStyle(styleType, mood = "") {
     );
   }
   return (
-    "high-quality character portrait illustration for mobile chat background, upper-body portrait, " +
-    "expressive illustrated rendering, soft atmospheric background, cinematic lighting, " +
+    "hand-drawn webtoon portrait for mobile chat background, upper-body portrait, " +
+    "varied-weight ink outlines, restrained cel colors, illustrative background, " +
     "no text, no UI, no watermark. Mood: " +
     m
   );
@@ -4932,6 +4933,7 @@ function buildStoryImagePrompt({
   isCover = false,
   renderTitleInImage = false,
   styleType = "",
+  stylePreset = "",
   referenceMode = "",
 }) {
   const program = normalizeStoryProgramType(programType);
@@ -4969,6 +4971,7 @@ function buildStoryImagePrompt({
     focus = bannerVisualFocus(referenceMode);
   }
 
+  const artDirection = buildStoryArtDirection(styleType, stylePreset);
   const refBlock =
     refNames.length > 0
       ? refMode === "character"
@@ -4989,7 +4992,7 @@ function buildStoryImagePrompt({
     ? renderTitleInImage
       ? "Create one high-quality horizontal story banner cover with the title text rendered inside the image."
       : "Create one high-quality horizontal story banner background (16:9 landscape). No text in the image."
-    : "Create one high-quality vertical character portrait (9:16 portrait). No text in the image.";
+    : "Create one hand-inked vertical comic character portrait (2:3 portrait). No text in the image.";
 
   const visualRules = effectiveIsCover
     ? renderTitleInImage
@@ -5005,6 +5008,8 @@ function buildStoryImagePrompt({
 
   return `${refRules}
 ${refBlock}
+
+${artDirection}
 
 ${kind}
 
@@ -5477,22 +5482,15 @@ async function generateStoryImageFromPrompt(
     }
 
     if (editsFailed) {
-      console.warn(
-        "[imageGen]",
-        "edits failed; falling back to text-only generations",
-        `referenceMode=${refMode || "(default)"}`,
-        result?.errorMessage || "",
+      // Never make a second chargeable text-only image after a reference failure.
+      const error = new Error(
+        result?.errorMessage || "reference edit failed; no text-only fallback",
       );
-      fallbackUsed = true;
-      generationMode = "generations-fallback";
-      const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
-      result = await readOpenAiStoryImageResponse(genRes, "generations-fallback");
-      console.log(
-        "[imageGen]",
-        `generationsStatus=${result.status}`,
-        "generationMode=generations-fallback",
-        "fallbackUsed=true",
-      );
+      error.openaiStatus = result?.status ?? 400;
+      error.openaiKind = result?.errorKind || "reference_edit_failed";
+      error.openaiCode = result?.errorCode || "";
+      error.openaiType = result?.errorType || "";
+      throw error;
     }
   } else {
     const genRes = await requestOpenAiStoryImageGeneration(prompt, imageSize);
@@ -5569,6 +5567,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       reference_images = [],
       render_title_in_image = false,
       style_type = "",
+      style_preset = "",
       reference_mode = "",
       referenceMode: referenceModeCamel = "",
     } = req.body || {};
@@ -5608,6 +5607,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       isCover: !portraitLayout,
       renderTitleInImage: !!render_title_in_image,
       styleType: style_type,
+      stylePreset: style_preset,
       referenceMode: referenceModeResolved,
     });
 
@@ -5628,6 +5628,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       prompt_used: promptUsed,
       image_size: imageSize,
       image_quality: OPENAI_IMAGE_QUALITY,
+      art_style: resolveStoryArtPreset(style_type, style_preset) || "photo",
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
       fallback_used: genResult.fallbackUsed,
@@ -5680,6 +5681,8 @@ app.post("/api/story-scene-image", async (req, res) => {
       scene_summary = "",
       reference_images = [],
       mood = "",
+      style_type = "",
+      style_preset = "",
     } = req.body || {};
 
     if (!OPENAI_API_KEY) {
@@ -5703,6 +5706,8 @@ app.post("/api/story-scene-image", async (req, res) => {
       emotion,
       referenceCharacterNames: refNames,
       isCover: false,
+      styleType: style_type,
+      stylePreset: style_preset,
     });
 
     const fileStem = `scene_${sanitizeStoryImagePathSegment(scene_label || "scene", 48)}`;
@@ -5721,6 +5726,7 @@ app.post("/api/story-scene-image", async (req, res) => {
       prompt_used: promptUsed,
       image_size: imageSize,
       image_quality: OPENAI_IMAGE_QUALITY,
+      art_style: resolveStoryArtPreset(style_type, style_preset) || "photo",
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
       fallback_used: genResult.fallbackUsed,
