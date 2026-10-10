@@ -5025,7 +5025,12 @@ function buildStoryImagePrompt({
       ? `${STORY_BANNER_TITLE_RULES}
 - only text allowed in the image is the story title shown below`
       : STORY_BANNER_NO_TITLE_RULES
-    : STORY_IMAGE_COMMON_RULES;
+    : webtoonArt
+      ? STORY_IMAGE_COMMON_RULES
+      : STORY_IMAGE_COMMON_RULES.replace(
+          "deliberate hand-drawn lighting and shadows",
+          "natural cinematic lighting",
+        );
 
   const titleBlock =
     effectiveIsCover && renderTitleInImage && t
