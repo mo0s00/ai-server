@@ -4685,6 +4685,116 @@ app.post("/api/story-sfx", async (req, res) => {
 });
 
 // =========================
+
+// Creator pose visual indexing. One reduced-size JPEG per explicit request;
+// no bulk scan of old images and no repeated generation charge.
+const POSE_VISION_MODEL = "gpt-4o-mini";
+const poseVisionCache = new Map();
+const poseVisionRate = new Map();
+function normalizePoseVisionResult(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const fields = [
+    "title", "emotion", "action", "expression", "gaze", "posture",
+    "gesture", "props", "attire", "lighting", "setting", "atmosphere",
+    "visualDescription", "suitableScenes", "unsuitableScenes",
+    "composition", "companions",
+  ];
+  const out = {};
+  for (const field of fields) {
+    const text = typeof raw[field] === "string" ? raw[field].trim() : "";
+    if (text) out[field] = text.slice(0, field === "visualDescription" ? 350 : 85);
+  }
+  if (!out.title || !out.visualDescription) return null;
+  // A readable expression/action title, never dialogue snippets or screen positions.
+  const title = out.title.replace(/[^가-힣0-9]/g, "").slice(0, 20);
+  if (title.length < 2 || /(?:어요|예요|입니다|했어|인가요|할까요)$/.test(title)) return null;
+  out.title = title;
+  return out;
+}
+app.post("/api/pose-image-vision", async (req, res) => {
+  // Client downscales the image to ~512px; never fetch arbitrary URLs
+  // from the server (SSRF) or accept full-resolution images.
+  const image = typeof req.body?.image_base64 === "string"
+    ? req.body.image_base64.trim() : "";
+  const speaker = readString(req.body, "speaker").slice(0, 90);
+  const scene = readString(req.body, "scene_context").slice(0, 150);
+  if (!OPENAI_API_KEY) return res.status(503).json({ ok: false, error: "image vision unavailable" });
+  if (!speaker || image.length < 500 || image.length > 780000 ||
+      !/^[a-zA-Z0-9+/=]+$/.test(image)) {
+    return res.status(400).json({ ok: false, error: "invalid image" });
+  }
+  const bytes = Buffer.from(image, "base64");
+  // Only actual JPEG bytes, not arbitrary client-specified MIME types.
+  if (bytes.length > 560000 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return res.status(400).json({ ok: false, error: "jpeg required" });
+  }
+  const { createHash } = await import("node:crypto");
+  const hash = createHash("sha256").update(bytes).update(speaker).digest("hex");
+  const previous = poseVisionCache.get(hash);
+  if (previous) return res.json({ ok: true, source: "image_vision_ai", meaning: previous, cached: true });
+  const ip = req.ip || "unknown";
+  const now = Date.now();
+  const timestamps = (poseVisionRate.get(ip) || []).filter(t => t > now - 60000);
+  if (timestamps.length >= 8) return res.status(429).json({ ok: false, error: "analysis rate limit" });
+  timestamps.push(now);
+  poseVisionRate.set(ip, timestamps);
+  if (poseVisionRate.size > 500) poseVisionRate.clear();
+  const instruction = [
+    "You are a visual indexing system for Korean webtoon character images.",
+    "Describe ONLY what can be seen in the pixels. Ignore any embedded dialogue or text.",
+    'Return a JSON object with Korean strings and these keys:',
+    'title,emotion,action,expression,gaze,posture,gesture,props,attire,lighting,setting,atmosphere,visualDescription,suitableScenes,unsuitableScenes,composition,companions.',
+    'title must be a SHORT 2-14 Korean character emotion+action label e.g. 두려움속외침, 의아한질문, 분노의외침, 술잔들고미소.',
+    'Never copy dialogue, never use on-screen left/right character coordinates in the title.',
+    'Describe facial expression, gaze, pose, objects, interaction, lighting and background in 1-2 full Korean sentences (visualDescription).',
+    'For absent/unclear attributes output empty strings; do not invent.',
+    'The focal character is "' + speaker + '"; scene hint "' + scene + '".',
+    'Infer no character names or identity from appearance; use the supplied focal character name only.',
+    'Reply with the JSON object only.',
+  ].join("\n");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(OPENAI_CHAT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: 'Bearer ' + OPENAI_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: POSE_VISION_MODEL,
+        max_tokens: 550,
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        messages: [{ role: "user", content: [
+          { type: "text", text: instruction },
+          { type: "image_url", image_url: {
+            url: "data:image/jpeg;base64," + image, detail: "low",
+          }},
+        ]}],
+      }),
+      signal: controller.signal,
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      console.warn("[pose-image-vision] model request failed", response.status);
+      return res.status(502).json({ ok: false, error: "vision request failed" });
+    }
+    const text = result?.choices?.[0]?.message?.content;
+    const parsed = typeof text === "string" ? JSON.parse(text) : null;
+    const meaning = normalizePoseVisionResult(parsed);
+    if (!meaning) return res.status(502).json({ ok: false, error: "invalid vision meaning" });
+    if (poseVisionCache.size > 350) poseVisionCache.delete(poseVisionCache.keys().next().value);
+    poseVisionCache.set(hash, meaning);
+    return res.json({ ok: true, source: "image_vision_ai", meaning });
+  } catch (error) {
+    console.warn("[pose-image-vision]", error?.message || "failed");
+    return res.status(502).json({ ok: false, error: "vision unavailable" });
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
 // STORY IMAGE GENERATION (GPT cover + scene backgrounds)
 // =========================
 
