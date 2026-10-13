@@ -6140,6 +6140,75 @@ app.get("/user-stories/:id", handleUserStoryByIdGet);
 app.delete("/api/user-stories/:id", handleUserStoryByIdDelete);
 app.delete("/user-stories/:id", handleUserStoryByIdDelete);
 
+// Published webtoon episode access: server owns the debit and entitlement.
+app.get("/api/webtoon/progress", async (req, res) => {
+  try {
+    const db = getSupabaseServiceRole();
+    const uid = String(req.query.user_id || "").trim();
+    const story = String(req.query.story_id || "").trim();
+    if (!db || !uid || !/^[0-9a-f-]{36}$/i.test(story))
+      return res.status(400).json({ ok: false });
+    const [unlocks, progress] = await Promise.all([
+      db.from("webtoon_episode_unlocks").select("episode_beat")
+        .eq("user_id", uid).eq("story_id", story),
+      db.from("webtoon_read_progress").select("episode_beat,cut_index")
+        .eq("user_id", uid).eq("story_id", story).maybeSingle(),
+    ]);
+    if (unlocks.error || progress.error) return res.status(500).json({ok:false});
+    return res.json({ok:true, unlockedBeats:(unlocks.data || []).map(x=>x.episode_beat),
+      progress:progress.data || null});
+  } catch (error) {
+    console.error("[webtoon progress]", error);
+    return res.status(500).json({ok:false});
+  }
+});
+app.post("/api/webtoon/unlock", async (req, res) => {
+  try {
+    const db = getSupabaseServiceRole();
+    const uid = String(req.body?.user_id || "").trim();
+    const story = String(req.body?.story_id || "").trim();
+    const beat = Number(req.body?.episode_beat);
+    if (!db || !uid || !/^[0-9a-f-]{36}$/i.test(story) ||
+        !Number.isSafeInteger(beat) || beat <= 0)
+      return res.status(400).json({ok:false,error:"invalid"});
+    const {data,error} = await db.rpc("webtoon_unlock_episode",
+      {p_user_id:uid,p_story_id:story,p_beat:beat});
+    if (error) {
+      console.error("[webtoon unlock]",error.message);
+      return res.status(500).json({ok:false,error:"database"});
+    }
+    return res.json(data);
+  } catch (error) {
+    console.error("[webtoon unlock]",error);
+    return res.status(500).json({ok:false});
+  }
+});
+app.post("/api/webtoon/progress", async (req,res) => {
+  try {
+    const db = getSupabaseServiceRole();
+    const uid = String(req.body?.user_id || "").trim();
+    const story = String(req.body?.story_id || "").trim();
+    const beat = Number(req.body?.episode_beat);
+    const cut = Number(req.body?.cut_index);
+    if (!db || !uid || !/^[0-9a-f-]{36}$/i.test(story) ||
+      !Number.isSafeInteger(beat) || beat <= 0 ||
+      !Number.isSafeInteger(cut) || cut < 0 || cut >= 60)
+      return res.status(400).json({ok:false,error:"invalid"});
+    const {data:entitlement,error:entError} = await db.from("webtoon_episode_unlocks")
+      .select("episode_beat").eq("user_id",uid).eq("story_id",story)
+      .eq("episode_beat",beat).maybeSingle();
+    if (entError || !entitlement) return res.status(403).json({ok:false});
+    const {error} = await db.from("webtoon_read_progress").upsert({
+      user_id:uid,story_id:story,episode_beat:beat,cut_index:cut,
+      updated_at:new Date().toISOString(),
+    },{onConflict:"user_id,story_id"});
+    return res.status(error?500:200).json({ok:!error});
+  } catch (error) {
+    console.error("[webtoon save progress]",error);
+    return res.status(500).json({ok:false});
+  }
+});
+
 // 스토리 라이브러리 댓글 — 앱 `GET/POST/PATCH/DELETE /api/story-comments`
 async function fetchStoryCommentsWithMeta(supabase, storyId, viewerUserId) {
   const { data: rows, error } = await supabase
