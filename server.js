@@ -5877,7 +5877,9 @@ function redactWebtoonForViewer(row, authenticatedUid) {
       authenticatedUid && authenticatedUid === String(row.user_id || "")) return row;
   const draft = row.draft_json;
   const beats = draft.confirmedBeats;
-  if (!Array.isArray(beats) || !beats.some(x => x?.webtoonEpisodePublished === true)) return row;
+  if (!Array.isArray(beats) || !beats.some(x =>
+      Array.isArray(x?.microBeats) &&
+      x.microBeats.some(p => Array.isArray(p?.webtoonScript)))) return row;
   const copy = JSON.parse(JSON.stringify(draft));
   for (const beat of (copy.confirmedBeats || [])) {
     const phases = beat?.microBeats;
@@ -5893,7 +5895,9 @@ function redactWebtoonForViewer(row, authenticatedUid) {
 }
 function hasPublishedWebtoon(row) {
   return !!row?.draft_json?.confirmedBeats?.some?.(
-    x => x?.webtoonEpisodePublished === true
+    x => x?.webtoonEpisodePublished === true ||
+      x?.microBeats?.some?.(p => Array.isArray(p?.webtoonScript) &&
+        p.webtoonScript.length > 0)
   );
 }
 
