@@ -5870,6 +5870,33 @@ app.post("/api/story-scene-image", async (req, res) => {
   }
 });
 
+// Hide unpublished/paid webtoon script from ordinary public story queries.
+// Episodes themselves are served only after entitlement validation.
+function redactWebtoonForViewer(row, authenticatedUid) {
+  if (!row || !row.draft_json ||
+      authenticatedUid && authenticatedUid === String(row.user_id || "")) return row;
+  const draft = row.draft_json;
+  const beats = draft.confirmedBeats;
+  if (!Array.isArray(beats) || !beats.some(x => x?.webtoonEpisodePublished === true)) return row;
+  const copy = JSON.parse(JSON.stringify(draft));
+  for (const beat of (copy.confirmedBeats || [])) {
+    const phases = beat?.microBeats;
+    if (!Array.isArray(phases)) continue;
+    for (const phase of phases) {
+      if (!Array.isArray(phase?.webtoonScript)) continue;
+      // Preserve panel count and metadata without leaking text or prompts.
+      phase.webtoonScript = phase.webtoonScript.map(() => ({panelVersion:2}));
+      delete phase.webtoonPreviewImages;
+    }
+  }
+  return {...row, draft_json:copy};
+}
+function hasPublishedWebtoon(row) {
+  return !!row?.draft_json?.confirmedBeats?.some?.(
+    x => x?.webtoonEpisodePublished === true
+  );
+}
+
 // 유저 제작 스토리 — 앱 `POST/GET /api/user-stories`
 async function handleUserStoriesPost(req, res) {
   try {
@@ -5891,6 +5918,14 @@ async function handleUserStoriesPost(req, res) {
     }
     if (draft_json == null || typeof draft_json !== "object") {
       return res.status(400).json({ ok: false, error: "draft_json 필요" });
+    }
+
+    // Published episode mutations require a verified owner, even when
+    // older legacy story endpoints allow unsigned draft editing.
+    if (hasPublishedWebtoon({draft_json}) ) {
+      const signedUid = await verifiedWebtoonFirebaseUid(req);
+      if (!signedUid || signedUid !== user_id)
+        return res.status(403).json({ok:false,error:"auth_required"});
     }
 
     const now = new Date().toISOString();
@@ -5918,6 +5953,15 @@ async function handleUserStoriesPost(req, res) {
       if (fetchErr) {
         logSupabaseErr("[user-stories] update fetch failed", fetchErr);
         return res.status(500).json({ ok: false, error: fetchErr.message });
+      }
+      if (existing) {
+        const {data: prior} = await supabase.from("user_stories")
+          .select("draft_json").eq("id",id).maybeSingle();
+        if (hasPublishedWebtoon(prior)) {
+          const signedUid = await verifiedWebtoonFirebaseUid(req);
+          if (!signedUid || signedUid !== user_id)
+            return res.status(403).json({ok:false,error:"auth_required"});
+        }
       }
       if (!existing) {
         row.created_at = now;
@@ -6011,7 +6055,9 @@ async function handleUserStoriesQueryGet(req, res) {
         logSupabaseErr("[user-stories public list]", error);
         return res.status(500).json({ ok: false, error: error.message });
       }
-      return res.json({ ok: true, stories: data || [] });
+      const viewerUid = await verifiedWebtoonFirebaseUid(req);
+      return res.json({ ok: true, stories:
+        (data || []).map(row => redactWebtoonForViewer(row, viewerUid)) });
     }
 
     const raw = req.query && req.query.user_id;
@@ -6035,7 +6081,9 @@ async function handleUserStoriesQueryGet(req, res) {
       logSupabaseErr("[user-stories list]", error);
       return res.status(500).json({ ok: false, error: error.message });
     }
-    return res.json({ ok: true, stories: data || [] });
+    const viewerUid = await verifiedWebtoonFirebaseUid(req);
+    return res.json({ ok: true, stories:
+      (data || []).map(row => redactWebtoonForViewer(row, viewerUid)) });
   } catch (e) {
     console.error("[user-stories list]", e);
     return res.status(500).json({ ok: false, error: e.message });
@@ -6065,7 +6113,9 @@ async function handleUserStoryByIdGet(req, res) {
     if (!data) {
       return res.status(404).json({ ok: false, error: "not found" });
     }
-    return res.json({ ok: true, story: data });
+    const viewerUid = await verifiedWebtoonFirebaseUid(req);
+    return res.json({ ok: true,
+      story: redactWebtoonForViewer(data, viewerUid) });
   } catch (e) {
     console.error("[user-stories get]", e);
     return res.status(500).json({ ok: false, error: e.message });
@@ -6193,6 +6243,42 @@ async function verifiedWebtoonFirebaseUid(req) {
     return null;
   }
 }
+
+// Return complete paid script only to an account with a server entitlement.
+app.get("/api/webtoon/episode/:storyId/:beat", async (req, res) => {
+  try {
+    const uid = await verifiedWebtoonFirebaseUid(req);
+    const storyId = String(req.params.storyId || "");
+    const beatNumber = Number(req.params.beat);
+    if (!uid) return res.status(401).json({ok:false,error:"login_required"});
+    if (!/^[0-9a-f-]{36}$/i.test(storyId) ||
+        !Number.isSafeInteger(beatNumber) || beatNumber <= 0)
+      return res.status(400).json({ok:false,error:"invalid"});
+    const db = getSupabaseServiceRole();
+    if (!db) return res.status(503).json({ok:false,error:"storage_unavailable"});
+    const {data:story,error} = await db.from("user_stories")
+      .select("visibility,draft_json").eq("id",storyId).maybeSingle();
+    if (error || !story || story.visibility !== "public")
+      return res.status(404).json({ok:false,error:"not_published"});
+    const beat = story.draft_json?.confirmedBeats?.find?.(
+      b => Number(b?.beat) === beatNumber && b?.webtoonEpisodePublished === true
+    );
+    if (!beat || !Array.isArray(beat.microBeats) ||
+        ![0,1,2].every(i=>Array.isArray(beat.microBeats[i]?.webtoonScript) &&
+          beat.microBeats[i].webtoonScript.length === 20))
+      return res.status(404).json({ok:false,error:"not_published"});
+    const {data:entitlement,error:entError} = await db
+      .from("webtoon_episode_unlocks").select("episode_beat")
+      .eq("user_id",uid).eq("story_id",storyId)
+      .eq("episode_beat",beatNumber).maybeSingle();
+    if (entError || !entitlement)
+      return res.status(403).json({ok:false,error:"locked"});
+    return res.json({ok:true,beat});
+  } catch (error) {
+    console.error("[webtoon fetch episode]",error);
+    return res.status(500).json({ok:false});
+  }
+});
 
 // Published webtoon episode access: server owns the debit and entitlement.
 app.get("/api/webtoon/progress", async (req, res) => {
