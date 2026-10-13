@@ -1,6 +1,7 @@
 "use strict";
 
 import express from "express";
+import { createPublicKey, verify as verifySignature } from "node:crypto";
 import FormData from "form-data";
 import { PassThrough } from "node:stream";
 import { createClient } from "@supabase/supabase-js";
@@ -6140,11 +6141,64 @@ app.get("/user-stories/:id", handleUserStoryByIdGet);
 app.delete("/api/user-stories/:id", handleUserStoryByIdDelete);
 app.delete("/user-stories/:id", handleUserStoryByIdDelete);
 
+// Verify Firebase ID tokens before any ledger or entitlement operation.
+// A caller-supplied user_id is never authority to charge another account.
+let firebaseCertificateCache = { expiresAt: 0, certificates: {} };
+function decodeFirebaseTokenPart(base64url) {
+  return JSON.parse(Buffer.from(base64url, "base64url").toString("utf8"));
+}
+async function verifiedWebtoonFirebaseUid(req) {
+  const authorization = String(req.headers.authorization || "");
+  if (!authorization.startsWith("Bearer ")) return null;
+  const token = authorization.slice(7).trim();
+  const segments = token.split(".");
+  if (segments.length !== 3) return null;
+  try {
+    const header = decodeFirebaseTokenPart(segments[0]);
+    const claims = decodeFirebaseTokenPart(segments[1]);
+    const project = "amen-f0e68";
+    const now = Math.floor(Date.now() / 1000);
+    if (header.alg !== "RS256" || !header.kid ||
+        claims.aud !== project ||
+        claims.iss !== `https://securetoken.google.com/${project}` ||
+        typeof claims.sub !== "string" || !claims.sub || claims.sub.length > 128 ||
+        !Number.isFinite(claims.exp) || claims.exp <= now ||
+        !Number.isFinite(claims.iat) || claims.iat > now ||
+        !Number.isFinite(claims.auth_time) || claims.auth_time > now) return null;
+    if (Date.now() >= firebaseCertificateCache.expiresAt ||
+        !firebaseCertificateCache.certificates[header.kid]) {
+      const response = await fetch(
+        "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com",
+        {signal: AbortSignal.timeout(8000)}
+      );
+      if (!response.ok) return null;
+      const certificates = await response.json();
+      const cacheControl = response.headers.get("cache-control") || "";
+      const seconds = Number(/max-age=(\d+)/.exec(cacheControl)?.[1] || 1800);
+      firebaseCertificateCache = {
+        expiresAt: Date.now() + Math.min(seconds, 3600) * 1000,
+        certificates
+      };
+    }
+    const cert = firebaseCertificateCache.certificates[header.kid];
+    if (!cert) return null;
+    const valid = verifySignature(
+      "RSA-SHA256",
+      Buffer.from(`${segments[0]}.${segments[1]}`),
+      createPublicKey(cert),
+      Buffer.from(segments[2], "base64url")
+    );
+    return valid ? claims.sub : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // Published webtoon episode access: server owns the debit and entitlement.
 app.get("/api/webtoon/progress", async (req, res) => {
   try {
     const db = getSupabaseServiceRole();
-    const uid = String(req.query.user_id || "").trim();
+    const uid = await verifiedWebtoonFirebaseUid(req);
     const story = String(req.query.story_id || "").trim();
     if (!db || !uid || !/^[0-9a-f-]{36}$/i.test(story))
       return res.status(400).json({ ok: false });
@@ -6165,7 +6219,7 @@ app.get("/api/webtoon/progress", async (req, res) => {
 app.post("/api/webtoon/unlock", async (req, res) => {
   try {
     const db = getSupabaseServiceRole();
-    const uid = String(req.body?.user_id || "").trim();
+    const uid = await verifiedWebtoonFirebaseUid(req);
     const story = String(req.body?.story_id || "").trim();
     const beat = Number(req.body?.episode_beat);
     if (!db || !uid || !/^[0-9a-f-]{36}$/i.test(story) ||
@@ -6186,7 +6240,7 @@ app.post("/api/webtoon/unlock", async (req, res) => {
 app.post("/api/webtoon/progress", async (req,res) => {
   try {
     const db = getSupabaseServiceRole();
-    const uid = String(req.body?.user_id || "").trim();
+    const uid = await verifiedWebtoonFirebaseUid(req);
     const story = String(req.body?.story_id || "").trim();
     const beat = Number(req.body?.episode_beat);
     const cut = Number(req.body?.cut_index);
