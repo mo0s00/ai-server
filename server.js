@@ -5870,6 +5870,55 @@ app.post("/api/story-scene-image", async (req, res) => {
   }
 });
 
+// Public chapter list receives one thumbnail URL per published 60-cut node,
+// never a pose registry or an unpublished script/image.
+function firstWebtoonPublicImage(raw) {
+  if (typeof raw === "string") {
+    const url = raw.trim();
+    return /^https?:\\/\\/[^\\s]+$/i.test(url) ? url : "";
+  }
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const found = firstWebtoonPublicImage(item);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (raw && typeof raw === "object") {
+    const keys = ["url", "imageUrl", "imagePath", "path", "image"];
+    for (const key of keys) {
+      if (!(key in raw)) continue;
+      const found = firstWebtoonPublicImage(raw[key]);
+      if (found) return found;
+    }
+    for (const [key, value] of Object.entries(raw)) {
+      if (key.startsWith("$") || keys.includes(key)) continue;
+      const found = firstWebtoonPublicImage(value);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
+function publishedWebtoonThumbnail(beat) {
+  const phases = beat?.microBeats;
+  if (beat?.webtoonEpisodePublished !== true ||
+      !Array.isArray(phases) || phases.length < 3 ||
+      !phases.slice(0, 3).every(p =>
+        Array.isArray(p?.webtoonScript) && p.webtoonScript.length === 20)) {
+    return "";
+  }
+  for (const phase of phases.slice(0, 3)) {
+    for (const cut of phase.webtoonScript) {
+      const image = firstWebtoonPublicImage(cut?.imageUrl);
+      if (image) return image;
+    }
+    const registered = firstWebtoonPublicImage(phase.webtoonPreviewImages);
+    if (registered) return registered;
+  }
+  return firstWebtoonPublicImage(beat.sceneCharacterImages);
+}
+
 // Hide unpublished/paid webtoon script from ordinary public story queries.
 // Episodes themselves are served only after entitlement validation.
 function redactWebtoonForViewer(row, authenticatedUid) {
@@ -5883,12 +5932,20 @@ function redactWebtoonForViewer(row, authenticatedUid) {
   const copy = JSON.parse(JSON.stringify(draft));
   for (const beat of (copy.confirmedBeats || [])) {
     const phases = beat?.microBeats;
-    if (!Array.isArray(phases)) continue;
+    if (!Array.isArray(phases) ||
+        !phases.some(p => Array.isArray(p?.webtoonScript))) continue;
+    const thumbnail = publishedWebtoonThumbnail(beat);
+    if (thumbnail) beat.webtoonEpisodeThumbnail = thumbnail;
+    else delete beat.webtoonEpisodeThumbnail;
+    // Public catalog must not reveal other registered poses of a locked
+    // or unfinished chapter. Only the single published thumbnail remains.
+    delete beat.sceneCharacterImages;
     for (const phase of phases) {
       if (!Array.isArray(phase?.webtoonScript)) continue;
-      // Preserve panel count and metadata without leaking text or prompts.
+      // Preserve panel count only, not paid text, prompts or private poses.
       phase.webtoonScript = phase.webtoonScript.map(() => ({panelVersion:2}));
       delete phase.webtoonPreviewImages;
+      delete phase.sceneCharacterImages;
     }
   }
   return {...row, draft_json:copy};
