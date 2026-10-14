@@ -126,6 +126,8 @@ const OPENAI_TTS_MODEL = "tts-1";
 const OPENAI_IMAGE_MODEL = "gpt-image-2.5-flare";
 const OPENAI_IMAGE_QUALITY = "medium";
 const STORY_IMAGE_SIZE_PORTRAIT = "672x1008";
+const STORY_IMAGE_SIZE_LONG = "672x1344";
+const STORY_IMAGE_SIZE_EXTRA_LONG = "672x2016";
 const STORY_IMAGE_SIZE_LANDSCAPE = "1536x1024";
 const FETCH_TIMEOUT_MS = 25000;
 const STORY_LLM_TIMEOUT_MS = 45000;
@@ -4904,8 +4906,12 @@ const STORY_CATEGORY_FOCUS = {
     "Focus: Single character portrait for vertical mobile chat wallpaper. Center face and upper body, match reference art style, keep background atmospheric but non-distracting.",
 };
 
-function storyImageApiSize({ landscape = false } = {}) {
-  return landscape ? STORY_IMAGE_SIZE_LANDSCAPE : STORY_IMAGE_SIZE_PORTRAIT;
+function storyImageApiSize({ landscape = false, imageAspect = "" } = {}) {
+  if (landscape) return STORY_IMAGE_SIZE_LANDSCAPE;
+  // Explicit allowlist: never forward arbitrary client sizes to the paid API.
+  if (imageAspect === "1:2") return STORY_IMAGE_SIZE_LONG;
+  if (imageAspect === "1:3") return STORY_IMAGE_SIZE_EXTRA_LONG;
+  return STORY_IMAGE_SIZE_PORTRAIT;
 }
 
 function normalizeStoryProgramType(raw) {
@@ -5709,6 +5715,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       art_style = "",
       reference_mode = "",
       referenceMode: referenceModeCamel = "",
+      image_aspect = "",
     } = req.body || {};
 
     if (!OPENAI_API_KEY) {
@@ -5750,7 +5757,8 @@ app.post("/api/story-cover-image", async (req, res) => {
       referenceMode: referenceModeResolved,
     });
 
-    const imageSize = storyImageApiSize({ landscape: !portraitLayout });
+    const imageAspect = portraitLayout ? String(image_aspect || "").trim() : "";
+    const imageSize = storyImageApiSize({ landscape: !portraitLayout, imageAspect });
     const fileStem = portraitLayout ? "character_chat" : "cover";
     const genResult = await generateStoryImageFromPrompt(
       promptUsed,
@@ -5766,6 +5774,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       image_url: genResult.imageUrl,
       prompt_used: promptUsed,
       image_size: imageSize,
+      image_aspect: imageAspect || (portraitLayout ? "2:3" : ""),
       image_quality: OPENAI_IMAGE_QUALITY,
       generation_mode: genResult.generationMode,
       reference_applied: genResult.referenceApplied,
