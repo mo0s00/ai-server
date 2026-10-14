@@ -5875,7 +5875,9 @@ app.post("/api/story-scene-image", async (req, res) => {
 function firstWebtoonPublicImage(raw) {
   if (typeof raw === "string") {
     const url = raw.trim();
-    return /^https?:\\/\\/[^\\s]+$/i.test(url) ? url : "";
+    return (url.startsWith("https://") || url.startsWith("http://")) &&
+        !url.includes(" ") && !url.includes("\n") && !url.includes("\r")
+        ? url : "";
   }
   if (Array.isArray(raw)) {
     for (const item of raw) {
