@@ -5902,7 +5902,48 @@ function firstWebtoonPublicImage(raw) {
   return "";
 }
 
-function publishedWebtoonThumbnail(beat) {
+// Enumerate actual registered image URLs, skipping reference-only metadata.
+function* publicWebtoonImageCandidates(raw) {
+  if (typeof raw === "string") {
+    const url = firstWebtoonPublicImage(raw);
+    if (url) yield url;
+    return;
+  }
+  if (Array.isArray(raw)) {
+    for (const entry of raw) yield* publicWebtoonImageCandidates(entry);
+    return;
+  }
+  if (!raw || typeof raw !== "object") return;
+  const imageKeys = ["url", "imageUrl", "imagePath", "path", "image"];
+  for (const key of imageKeys) {
+    if (key in raw) yield* publicWebtoonImageCandidates(raw[key]);
+  }
+  const nonImageKeys = new Set([
+    "label", "name", "imageId", "meaning", "visualStyle", "sfxAnchor",
+    "speechBubble", "speechBubble2", "speechBubbleDialogue2",
+    "speechBubbleInnerThought2", "referenceImage", "referenceFaces",
+    "referenceUrl",
+  ]);
+  for (const [key, value] of Object.entries(raw)) {
+    if (key.startsWith("$") || imageKeys.includes(key) ||
+        nonImageKeys.has(key)) continue;
+    yield* publicWebtoonImageCandidates(value);
+  }
+}
+
+// Signed URL query differences do not make a different picture.
+function publicWebtoonImageIdentity(url) {
+  const value = url.trim();
+  const query = value.indexOf("?");
+  const fragment = value.indexOf("#");
+  const end = Math.min(
+    query < 0 ? value.length : query,
+    fragment < 0 ? value.length : fragment,
+  );
+  return value.slice(0, end);
+}
+
+function publishedWebtoonThumbnail(beat, usedImages) {
   const phases = beat?.microBeats;
   if (beat?.webtoonEpisodePublished !== true ||
       !Array.isArray(phases) || phases.length < 3 ||
@@ -5910,15 +5951,24 @@ function publishedWebtoonThumbnail(beat) {
         Array.isArray(p?.webtoonScript) && p.webtoonScript.length === 20)) {
     return "";
   }
+  const claim = raw => {
+    for (const url of publicWebtoonImageCandidates(raw)) {
+      const identity = publicWebtoonImageIdentity(url);
+      if (usedImages.has(identity)) continue;
+      usedImages.add(identity);
+      return url;
+    }
+    return "";
+  };
   for (const phase of phases.slice(0, 3)) {
     for (const cut of phase.webtoonScript) {
-      const image = firstWebtoonPublicImage(cut?.imageUrl);
-      if (image) return image;
+      const selected = claim(cut?.imageUrl);
+      if (selected) return selected;
     }
-    const registered = firstWebtoonPublicImage(phase.webtoonPreviewImages);
+    const registered = claim(phase.webtoonPreviewImages);
     if (registered) return registered;
   }
-  return firstWebtoonPublicImage(beat.sceneCharacterImages);
+  return claim(beat.sceneCharacterImages);
 }
 
 // Hide unpublished/paid webtoon script from ordinary public story queries.
@@ -5932,11 +5982,26 @@ function redactWebtoonForViewer(row, authenticatedUid) {
       Array.isArray(x?.microBeats) &&
       x.microBeats.some(p => Array.isArray(p?.webtoonScript)))) return row;
   const copy = JSON.parse(JSON.stringify(draft));
+  // Reserve the opening first and handle chapters in ascending beat order,
+  // mirroring the Flutter catalog so repeated pose pictures are not displayed.
+  const usedImages = new Set();
+  for (const url of publicWebtoonImageCandidates(draft.openingCharacterImages)) {
+    usedImages.add(publicWebtoonImageIdentity(url));
+    break;
+  }
+  const thumbnailsByBeat = new Map();
+  const ordered = [...(draft.confirmedBeats || [])]
+    .sort((a, b) => Number(a?.beat || 0) - Number(b?.beat || 0));
+  for (const beat of ordered) {
+    thumbnailsByBeat.set(
+      String(beat?.beat), publishedWebtoonThumbnail(beat, usedImages),
+    );
+  }
   for (const beat of (copy.confirmedBeats || [])) {
     const phases = beat?.microBeats;
     if (!Array.isArray(phases) ||
         !phases.some(p => Array.isArray(p?.webtoonScript))) continue;
-    const thumbnail = publishedWebtoonThumbnail(beat);
+    const thumbnail = thumbnailsByBeat.get(String(beat?.beat)) || "";
     if (thumbnail) beat.webtoonEpisodeThumbnail = thumbnail;
     else delete beat.webtoonEpisodeThumbnail;
     // Public catalog must not reveal other registered poses of a locked
