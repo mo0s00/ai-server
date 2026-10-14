@@ -6425,15 +6425,19 @@ app.get("/api/webtoon/progress", async (req, res) => {
     const story = String(req.query.story_id || "").trim();
     if (!db || !uid || !/^[0-9a-f-]{36}$/i.test(story))
       return res.status(400).json({ ok: false });
-    const [unlocks, progress] = await Promise.all([
+    const [unlocks, progress, perEpisode] = await Promise.all([
       db.from("webtoon_episode_unlocks").select("episode_beat")
         .eq("user_id", uid).eq("story_id", story),
       db.from("webtoon_read_progress").select("episode_beat,cut_index")
         .eq("user_id", uid).eq("story_id", story).maybeSingle(),
+      db.from("webtoon_episode_read_progress").select("episode_beat,cut_index")
+        .eq("user_id", uid).eq("story_id", story),
     ]);
-    if (unlocks.error || progress.error) return res.status(500).json({ok:false});
+    if (unlocks.error || progress.error || perEpisode.error)
+      return res.status(500).json({ok:false});
     return res.json({ok:true, unlockedBeats:(unlocks.data || []).map(x=>x.episode_beat),
-      progress:progress.data || null});
+      progress:progress.data || null,
+      episodeProgress:perEpisode.data || []});
   } catch (error) {
     console.error("[webtoon progress]", error);
     return res.status(500).json({ok:false});
@@ -6475,6 +6479,15 @@ app.post("/api/webtoon/progress", async (req,res) => {
       .select("episode_beat").eq("user_id",uid).eq("story_id",story)
       .eq("episode_beat",beat).maybeSingle();
     if (entError || !entitlement) return res.status(403).json({ok:false});
+    // One last-read position (for 이어보기) plus a per-chapter high-water
+    // mark (for the episode cards). A reread must not lower the progress bar.
+    const {error:episodeError} = await db.rpc("webtoon_mark_episode_read", {
+      p_user_id:uid,p_story_id:story,p_beat:beat,p_cut:cut,
+    });
+    if (episodeError) {
+      console.error("[webtoon episode progress]",episodeError.message);
+      return res.status(500).json({ok:false});
+    }
     const {error} = await db.from("webtoon_read_progress").upsert({
       user_id:uid,story_id:story,episode_beat:beat,cut_index:cut,
       updated_at:new Date().toISOString(),
