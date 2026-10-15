@@ -6475,10 +6475,18 @@ app.post("/api/webtoon/progress", async (req,res) => {
       !Number.isSafeInteger(beat) || beat <= 0 ||
       !Number.isSafeInteger(cut) || cut < 0 || cut >= 60)
       return res.status(400).json({ok:false,error:"invalid"});
-    const {data:entitlement,error:entError} = await db.from("webtoon_episode_unlocks")
-      .select("episode_beat").eq("user_id",uid).eq("story_id",story)
-      .eq("episode_beat",beat).maybeSingle();
-    if (entError || !entitlement) return res.status(403).json({ok:false});
+    // A verified creator may read their own unpublished chapter in preview
+    // without a candy entitlement. This grants progress write only: fetching
+    // paid chapter scripts still requires a normal reader entitlement.
+    const {data:ownStory,error:ownError} = await db.from("user_stories")
+      .select("user_id").eq("id",story).maybeSingle();
+    if (ownError) return res.status(500).json({ok:false});
+    if (!ownStory || ownStory.user_id !== uid) {
+      const {data:entitlement,error:entError} = await db.from("webtoon_episode_unlocks")
+        .select("episode_beat").eq("user_id",uid).eq("story_id",story)
+        .eq("episode_beat",beat).maybeSingle();
+      if (entError || !entitlement) return res.status(403).json({ok:false});
+    }
     // One last-read position (for 이어보기) plus a per-chapter high-water
     // mark (for the episode cards). A reread must not lower the progress bar.
     const {error:episodeError} = await db.rpc("webtoon_mark_episode_read", {
