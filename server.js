@@ -4961,6 +4961,32 @@ function parseStoryReferenceImages(raw) {
     .slice(0, 4);
 }
 
+function buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary, characters, mood }) {
+  const t = String(title || "").trim().slice(0, 160);
+  const story = String(opening || "").trim().slice(0, 1500);
+  const scene = String(sceneSummary || "").trim().slice(0, 1300);
+  const cast = String(characters || "").trim().slice(0, 300);
+  const tone = String(mood || "").trim().slice(0, 180);
+  return `Create an ORIGINAL, premium, portrait 2:3 KOREAN WEBTOON opening poster illustration.
+Visual quality: dramatic ensemble key art, expressive hand-inked characters, bold
+contrasting lighting, painterly atmospheric depth, elegant cinematic staging,
+and a clear visual hierarchy like a professionally commissioned action-fantasy
+webtoon cover. Adapt character outfits, environment and atmosphere to the
+actual story and genre; do not substitute generic fantasy characters.
+The principal figure should remain recognizable and the scene must suggest
+the episode's core conflict. Make the lower 25% dark and uncluttered so the
+app can later typeset the exact Korean title on top.
+IMPORTANT: do not draw ANY lettering, title, Korean glyphs, typography,
+watermarks, dialogue, speech bubbles, logos or interface elements.
+The title below is semantic context only, NOT text to draw.
+Never copy the composition, identity or lettering of an existing webtoon.
+Story: ${t}
+Opening: ${story}
+Episode / scene: ${scene}
+Characters: ${cast}
+Mood: ${tone}`.trim();
+}
+
 const STORY_BANNER_TITLE_RULES = `Visual rules for story banner card:
 - horizontal 16:9 composition (landscape banner card, exact widescreen crop)
 - cinematic lighting, full background scene
@@ -5713,6 +5739,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       characters = "",
       reference_images = [],
       render_title_in_image = false,
+      webtoon_poster = false,
       style_type = "",
       art_style = "",
       reference_mode = "",
@@ -5729,7 +5756,8 @@ app.post("/api/story-cover-image", async (req, res) => {
     );
     const refs = parseStoryReferenceImages(reference_images);
     const refNames = refs.map((r) => r.name);
-    const portraitLayout = storyCoverRouteUsesPortraitLayout(
+    const isWebtoonPoster = webtoon_poster === true;
+    const portraitLayout = isWebtoonPoster || storyCoverRouteUsesPortraitLayout(
       program_type,
       referenceModeResolved,
     );
@@ -5742,7 +5770,9 @@ app.post("/api/story-cover-image", async (req, res) => {
       `layout=${portraitLayout ? "portrait" : "banner"}`,
     );
 
-    const promptUsed = buildStoryImagePrompt({
+    const promptUsed = isWebtoonPoster
+      ? buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary: scene_summary, characters, mood })
+      : buildStoryImagePrompt({
       programType: program_type,
       title,
       opening,
@@ -5759,9 +5789,9 @@ app.post("/api/story-cover-image", async (req, res) => {
       referenceMode: referenceModeResolved,
     });
 
-    const imageAspect = portraitLayout ? String(image_aspect || "").trim() : "";
+    const imageAspect = isWebtoonPoster ? "2:3" : portraitLayout ? String(image_aspect || "").trim() : "";
     const imageSize = storyImageApiSize({ landscape: !portraitLayout, imageAspect });
-    const fileStem = portraitLayout ? "character_chat" : "cover";
+    const fileStem = isWebtoonPoster ? "webtoon_poster" : portraitLayout ? "character_chat" : "cover";
     const genResult = await generateStoryImageFromPrompt(
       promptUsed,
       session_key || fileStem,
