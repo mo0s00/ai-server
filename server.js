@@ -4961,7 +4961,7 @@ function parseStoryReferenceImages(raw) {
     .slice(0, 4);
 }
 
-function buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary, characters, mood }) {
+function buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary, characters, mood, referenceCharacterNames = [] }) {
   const t = String(title || "").trim().slice(0, 160);
   const story = String(opening || "").trim().slice(0, 1500);
   const scene = String(sceneSummary || "").trim().slice(0, 1300);
@@ -4980,7 +4980,7 @@ IMPORTANT: do not draw ANY lettering, title, Korean glyphs, typography,
 watermarks, dialogue, speech bubbles, logos or interface elements.
 The title below is semantic context only, NOT text to draw.
 Never copy the composition, identity or lettering of an existing webtoon.
-Story: ${t}
+When character reference images are attached, retain each person's hairstyle,\nface, outfit, silhouette and age; stage the references as a coherent new group\ncomposition appropriate for the story, never replicate the reference pose.\nAttached character references in order: ${referenceCharacterNames.join(', ') || 'none'}\nStory: ${t}
 Opening: ${story}
 Episode / scene: ${scene}
 Characters: ${cast}
@@ -5771,7 +5771,7 @@ app.post("/api/story-cover-image", async (req, res) => {
     );
 
     const promptUsed = isWebtoonPoster
-      ? buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary: scene_summary, characters, mood })
+      ? buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary: scene_summary, characters, mood, referenceCharacterNames: refNames })
       : buildStoryImagePrompt({
       programType: program_type,
       title,
