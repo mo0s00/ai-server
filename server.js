@@ -1382,7 +1382,7 @@ async function callAnthropicLiveCommentCompletion({
     temperature,
     max_tokens,
     logTag,
-    fetchTimeoutMs: 12000,
+    fetchTimeoutMs: max_tokens > 240 ? 26000 : 12000,
     disableThinking: true,
   });
 }
@@ -1403,7 +1403,7 @@ async function callOpenAiLiveCommentCompletion({
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 9000);
+  const timer = setTimeout(() => controller.abort(), max_tokens > 240 ? 26000 : 9000);
   try {
     const response = await fetch(OPENAI_CHAT_URL, {
       method: "POST",
@@ -2230,7 +2230,9 @@ async function handleLiveCommentsPost(req, res) {
   const liveCommentArgs = {
     userPrompt: prompt.slice(0, MAX_PROMPT_CHARS),
     temperature: 1,
-    max_tokens: 240,
+    // Normal chat keeps the prior 240-token budget; ten reader reactions
+    // require a larger capped response for a complete JSON array.
+    max_tokens: Number(req.body?.batchSize) === 10 ? 1500 : 240,
     logTag: "live-comments",
   };
   const result = isAnthropicConfigured()
