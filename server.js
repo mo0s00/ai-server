@@ -3218,6 +3218,77 @@ app.post("/user-presence", handleUserPresencePost);
 app.get("/api/admin/presence-stats", handleAdminPresenceStatsGet);
 app.get("/admin/presence-stats", handleAdminPresenceStatsGet);
 
+// Admin-maintained, globally shared image composition references for webtoon posters.
+// The app only reads the ten slots; writes require the existing server-side
+// administrator credential and pass through service-role Storage/DB APIs.
+function posterReferenceSlot(raw) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 10 ? n : null;
+}
+
+async function handleWebtoonPosterReferencesGet(_req, res) {
+  try {
+    const sb = getSupabaseServiceRole();
+    if (!sb) return res.status(503).json({ ok: false, error: "cloud unavailable" });
+    const { data, error } = await sb.from("webtoon_poster_reference_slots")
+      .select("slot,image_url,caption,updated_at").order("slot", { ascending: true });
+    if (error) throw error;
+    const indexed = new Map((data || []).map(row => [Number(row.slot), row]));
+    return res.json({ ok: true, slots: Array.from({ length: 10 }, (_, index) => {
+      const slot = index + 1;
+      const row = indexed.get(slot);
+      return {
+        slot,
+        image_url: String(row?.image_url || ""),
+        caption: String(row?.caption || ""),
+        updated_at: row?.updated_at || null,
+      };
+    }) });
+  } catch (e) {
+    console.error("[webtoon-poster-references GET]", e);
+    return res.status(503).json({ ok: false, error: "참고 이미지 조회 실패" });
+  }
+}
+
+async function handleWebtoonPosterReferencesPut(req, res) {
+  if (!isAdminPresenceAuthorized(req)) {
+    return res.status(403).json({ ok: false, error: "관리자 권한 필요" });
+  }
+  const slot = posterReferenceSlot(req.params.slot);
+  if (!slot) return res.status(400).json({ ok: false, error: "invalid slot" });
+  try {
+    const sb = getSupabaseServiceRole();
+    if (!sb) return res.status(503).json({ ok: false, error: "cloud unavailable" });
+    const clear = req.body?.clear === true;
+    const caption = String(req.body?.caption || "").trim().slice(0, 100);
+    let imageUrl = "";
+    if (!clear) {
+      const bytes = decodeUserAssetImageBase64(req.body?.image_base64);
+      const detected = bytes && detectUserAssetImage(bytes);
+      if (!detected) return res.status(400).json({ ok: false, error: "invalid image" });
+      // Unique object paths avoid stale image caches on replacement.
+      const path = `webtoon-poster-references/slot-${slot}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${detected.ext}`;
+      const uploaded = await uploadUserAssetImage(path, bytes, detected.contentType);
+      if (!uploaded.url) {
+        return res.status(503).json({ ok: false, error: uploaded.error || "image upload failed" });
+      }
+      imageUrl = uploaded.url;
+    }
+    const row = { slot, image_url: imageUrl, caption: clear ? "" : caption, updated_at: new Date().toISOString() };
+    const { data, error } = await sb.from("webtoon_poster_reference_slots")
+      .upsert(row, { onConflict: "slot" })
+      .select("slot,image_url,caption,updated_at").single();
+    if (error) throw error;
+    return res.json({ ok: true, slot: data });
+  } catch (e) {
+    console.error("[webtoon-poster-references PUT]", e);
+    return res.status(503).json({ ok: false, error: "참고 이미지 저장 실패" });
+  }
+}
+
+app.get("/api/webtoon-poster-references", handleWebtoonPosterReferencesGet);
+app.put("/api/webtoon-poster-references/:slot", handleWebtoonPosterReferencesPut);
+
 const HOME_ANNOUNCEMENT_TITLE_MAX = 120;
 const HOME_ANNOUNCEMENT_BODY_MAX = 8000;
 
