@@ -5040,8 +5040,11 @@ function buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary, character
   const tone = String(mood || "").trim().slice(0, 180);
   const notes = String(posterNotes || "").trim().slice(0, 900);
   const aspect = ["2:3", "1:2", "1:3", "9:16", "3:4", "1:1", "3:2"].includes(imageAspect) ? imageAspect : "2:3";
-  const placement = ["top", "middle", "bottom"].includes(titlePlacement) ? titlePlacement : "bottom";
+  const placement = ["top", "middle", "bottom", "none"].includes(titlePlacement) ? titlePlacement : "bottom";
   const titleSpace = placement === "top" ? "upper" : placement === "middle" ? "central" : "lower";
+  const compositionInstruction = placement === "none"
+    ? "Fill the entire composition naturally; do not reserve empty or darkened space for a title, caption, or typography."
+    : `Make the ${titleSpace} 25% uncluttered and high-contrast so the app can later typeset the exact Korean title there.`;
   return `Create an ORIGINAL, premium ${aspect === "3:2" ? "landscape" : "portrait"} ${aspect} KOREAN WEBTOON opening poster illustration.
 Visual quality: dramatic ensemble key art, expressive hand-inked characters, bold
 contrasting lighting, painterly atmospheric depth, elegant cinematic staging,
@@ -5049,8 +5052,7 @@ and a clear visual hierarchy like a professionally commissioned action-fantasy
 webtoon cover. Adapt character outfits, environment and atmosphere to the
 actual story and genre; do not substitute generic fantasy characters.
 The principal figure should remain recognizable and the scene must suggest
-the episode's core conflict. Make the ${titleSpace} 25% uncluttered and high-contrast so the
-app can later typeset the exact Korean title there.
+the episode's core conflict. ${compositionInstruction}
 IMPORTANT: do not draw ANY lettering, title, Korean glyphs, typography,
 watermarks, dialogue, speech bubbles, logos or interface elements.
 The title below is semantic context only, NOT text to draw.
