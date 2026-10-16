@@ -5588,7 +5588,7 @@ async function requestOpenAiStoryImageEdits(
 
   const form = new FormData();
   refs.forEach((ref, index) => {
-    form.append("image", ref.buf, {
+    form.append(refs.length > 1 ? "image[]" : "image", ref.buf, {
       filename: `reference_${index + 1}.png`,
       contentType: "image/png",
     });
