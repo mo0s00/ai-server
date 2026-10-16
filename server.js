@@ -5032,26 +5032,30 @@ function parseStoryReferenceImages(raw) {
     .slice(0, 4);
 }
 
-function buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary, characters, mood, referenceCharacterNames = [] }) {
+function buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary, characters, mood, referenceCharacterNames = [], imageAspect = '2:3', posterNotes = '', titlePlacement = 'bottom', styleReference = false }) {
   const t = String(title || "").trim().slice(0, 160);
   const story = String(opening || "").trim().slice(0, 1500);
   const scene = String(sceneSummary || "").trim().slice(0, 1300);
   const cast = String(characters || "").trim().slice(0, 300);
   const tone = String(mood || "").trim().slice(0, 180);
-  return `Create an ORIGINAL, premium, portrait 2:3 KOREAN WEBTOON opening poster illustration.
+  const notes = String(posterNotes || "").trim().slice(0, 900);
+  const aspect = ["2:3", "1:2", "1:3"].includes(imageAspect) ? imageAspect : "2:3";
+  const placement = ["top", "middle", "bottom"].includes(titlePlacement) ? titlePlacement : "bottom";
+  const titleSpace = placement === "top" ? "upper" : placement === "middle" ? "central" : "lower";
+  return `Create an ORIGINAL, premium, portrait ${aspect} KOREAN WEBTOON opening poster illustration.
 Visual quality: dramatic ensemble key art, expressive hand-inked characters, bold
 contrasting lighting, painterly atmospheric depth, elegant cinematic staging,
 and a clear visual hierarchy like a professionally commissioned action-fantasy
 webtoon cover. Adapt character outfits, environment and atmosphere to the
 actual story and genre; do not substitute generic fantasy characters.
 The principal figure should remain recognizable and the scene must suggest
-the episode's core conflict. Make the lower 25% dark and uncluttered so the
-app can later typeset the exact Korean title on top.
+the episode's core conflict. Make the ${titleSpace} 25% uncluttered and high-contrast so the
+app can later typeset the exact Korean title there.
 IMPORTANT: do not draw ANY lettering, title, Korean glyphs, typography,
 watermarks, dialogue, speech bubbles, logos or interface elements.
 The title below is semantic context only, NOT text to draw.
 Never copy the composition, identity or lettering of an existing webtoon.
-When character reference images are attached, retain each person's hairstyle,\nface, outfit, silhouette and age; stage the references as a coherent new group\ncomposition appropriate for the story, never replicate the reference pose.\nAttached character references in order: ${referenceCharacterNames.join(', ') || 'none'}\nStory: ${t}
+When character reference images are attached, preserve identities for CHARACTER references only.\n${styleReference ? 'First attached image is a VISUAL STYLE REFERENCE only: draw new original characters, use only its atmosphere, framing, lighting, palette and design language. Never reuse its characters, logos or exact composition. Any subsequent attached images are character identity references.' : 'Character references guide hairstyles, faces, outfits and ages; never duplicate original poses.'}\nAttached references in order: ${referenceCharacterNames.join(', ') || 'none'}\nCreative notes (non-title): ${notes}\nStory: ${t}
 Opening: ${story}
 Episode / scene: ${scene}
 Characters: ${cast}
@@ -5811,6 +5815,9 @@ app.post("/api/story-cover-image", async (req, res) => {
       reference_images = [],
       render_title_in_image = false,
       webtoon_poster = false,
+      poster_notes = "",
+      poster_title_placement = "bottom",
+      poster_style_reference = false,
       style_type = "",
       art_style = "",
       reference_mode = "",
@@ -5842,7 +5849,7 @@ app.post("/api/story-cover-image", async (req, res) => {
     );
 
     const promptUsed = isWebtoonPoster
-      ? buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary: scene_summary, characters, mood, referenceCharacterNames: refNames })
+      ? buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary: scene_summary, characters, mood, referenceCharacterNames: refNames, imageAspect: image_aspect, posterNotes: poster_notes, titlePlacement: poster_title_placement, styleReference: poster_style_reference === true })
       : buildStoryImagePrompt({
       programType: program_type,
       title,
@@ -5860,7 +5867,10 @@ app.post("/api/story-cover-image", async (req, res) => {
       referenceMode: referenceModeResolved,
     });
 
-    const imageAspect = isWebtoonPoster ? "2:3" : portraitLayout ? String(image_aspect || "").trim() : "";
+    const requestedAspect = String(image_aspect || "").trim();
+    const imageAspect = isWebtoonPoster
+      ? (["2:3", "1:2", "1:3"].includes(requestedAspect) ? requestedAspect : "2:3")
+      : portraitLayout ? requestedAspect : "";
     const imageSize = storyImageApiSize({ landscape: !portraitLayout, imageAspect });
     const fileStem = isWebtoonPoster ? "webtoon_poster" : portraitLayout ? "character_chat" : "cover";
     const genResult = await generateStoryImageFromPrompt(
