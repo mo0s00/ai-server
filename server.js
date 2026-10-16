@@ -6410,6 +6410,51 @@ async function handleUserStoryByIdDelete(req, res) {
   }
 }
 
+// Owner-only recovery gallery: enumerate existing media objects without
+// modifying production draft_json or creating guessed pose associations.
+async function handleUserStoryRecoveryImagesGet(req, res) {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!/^[0-9a-fA-F-]{36}$/.test(id)) {
+      return res.status(400).json({ok:false,error:"invalid story id"});
+    }
+    const uid = await verifiedWebtoonFirebaseUid(req);
+    if (!uid) return res.status(401).json({ok:false,error:"auth_required"});
+    const supabase = getSupabase();
+    if (!supabase) return res.status(503).json({ok:false,error:"cloud unavailable"});
+    const {data: story, error: storyError} = await supabase
+      .from("user_stories").select("user_id").eq("id", id).maybeSingle();
+    if (storyError) throw storyError;
+    if (!story || String(story.user_id || "").trim() !== uid) {
+      return res.status(403).json({ok:false,error:"forbidden"});
+    }
+    const prefix = `user-stories/${uid}/${id}`;
+    const bucket = supabase.storage.from("story-covers");
+    const {data: objects, error: storageError} = await bucket.list(prefix, {
+      limit: 500,
+      offset: 0,
+      sortBy: {column:"created_at",order:"desc"},
+    });
+    if (storageError) throw storageError;
+    const images = (objects || [])
+      .filter(obj => obj && typeof obj.name === "string" &&
+          /\.(png|jpe?g|webp)$/i.test(obj.name))
+      .map(obj => {
+        const path = prefix + "/" + obj.name;
+        const {data: link} = bucket.getPublicUrl(path);
+        return {
+          name: obj.name,
+          url: link.publicUrl,
+          created_at: obj.created_at || null,
+        };
+      });
+    return res.json({ok:true,story_id:id,images});
+  } catch (error) {
+    console.error("[story-recovery-images]", error);
+    return res.status(500).json({ok:false,error:"recovery image list unavailable"});
+  }
+}
+
 app.post("/api/character-image", handleCharacterImagePost);
 app.post("/character-image", handleCharacterImagePost);
 app.post("/api/user-story-image", handleUserStoryImagePost);
@@ -6419,6 +6464,8 @@ app.post("/api/user-stories", handleUserStoriesPost);
 app.post("/user-stories", handleUserStoriesPost);
 app.get("/api/user-stories", handleUserStoriesQueryGet);
 app.get("/user-stories", handleUserStoriesQueryGet);
+app.get("/api/user-stories/:id/recovery-images", handleUserStoryRecoveryImagesGet);
+app.get("/user-stories/:id/recovery-images", handleUserStoryRecoveryImagesGet);
 app.get("/api/user-stories/:id", handleUserStoryByIdGet);
 app.get("/user-stories/:id", handleUserStoryByIdGet);
 app.delete("/api/user-stories/:id", handleUserStoryByIdDelete);
