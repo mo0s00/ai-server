@@ -5870,7 +5870,8 @@ app.post("/api/story-cover-image", async (req, res) => {
     const imageAspect = isWebtoonPoster
       ? (["2:3", "1:2", "1:3", "9:16", "3:4", "1:1", "3:2"].includes(requestedAspect) ? requestedAspect : "2:3")
       : portraitLayout ? requestedAspect : "";
-    const imageSize = storyImageApiSize({ landscape: !portraitLayout, imageAspect });
+    const actualLandscape = !portraitLayout || (isWebtoonPoster && imageAspect === "3:2");
+    const imageSize = storyImageApiSize({ landscape: actualLandscape, imageAspect });
     const fileStem = isWebtoonPoster ? "webtoon_poster" : portraitLayout ? "character_chat" : "cover";
     const genResult = await generateStoryImageFromPrompt(
       promptUsed,
