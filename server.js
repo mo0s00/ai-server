@@ -5039,10 +5039,10 @@ function buildStoryWebtoonPosterPrompt({ title, opening, sceneSummary, character
   const cast = String(characters || "").trim().slice(0, 300);
   const tone = String(mood || "").trim().slice(0, 180);
   const notes = String(posterNotes || "").trim().slice(0, 900);
-  const aspect = ["2:3", "1:2", "1:3"].includes(imageAspect) ? imageAspect : "2:3";
+  const aspect = ["2:3", "1:2", "1:3", "9:16", "3:4", "1:1", "3:2"].includes(imageAspect) ? imageAspect : "2:3";
   const placement = ["top", "middle", "bottom"].includes(titlePlacement) ? titlePlacement : "bottom";
   const titleSpace = placement === "top" ? "upper" : placement === "middle" ? "central" : "lower";
-  return `Create an ORIGINAL, premium, portrait ${aspect} KOREAN WEBTOON opening poster illustration.
+  return `Create an ORIGINAL, premium ${aspect === "3:2" ? "landscape" : "portrait"} ${aspect} KOREAN WEBTOON opening poster illustration.
 Visual quality: dramatic ensemble key art, expressive hand-inked characters, bold
 contrasting lighting, painterly atmospheric depth, elegant cinematic staging,
 and a clear visual hierarchy like a professionally commissioned action-fantasy
@@ -5835,10 +5835,9 @@ app.post("/api/story-cover-image", async (req, res) => {
     const refs = parseStoryReferenceImages(reference_images);
     const refNames = refs.map((r) => r.name);
     const isWebtoonPoster = webtoon_poster === true;
-    const portraitLayout = isWebtoonPoster || storyCoverRouteUsesPortraitLayout(
-      program_type,
-      referenceModeResolved,
-    );
+    const portraitLayout = isWebtoonPoster
+      ? String(image_aspect || "").trim() !== "3:2"
+      : storyCoverRouteUsesPortraitLayout(program_type, referenceModeResolved);
     console.log(
       "[imageGen] story-cover-image",
       `programType=${String(program_type || "").trim() || "(default)"}`,
@@ -5869,7 +5868,7 @@ app.post("/api/story-cover-image", async (req, res) => {
 
     const requestedAspect = String(image_aspect || "").trim();
     const imageAspect = isWebtoonPoster
-      ? (["2:3", "1:2", "1:3"].includes(requestedAspect) ? requestedAspect : "2:3")
+      ? (["2:3", "1:2", "1:3", "9:16", "3:4", "1:1", "3:2"].includes(requestedAspect) ? requestedAspect : "2:3")
       : portraitLayout ? requestedAspect : "";
     const imageSize = storyImageApiSize({ landscape: !portraitLayout, imageAspect });
     const fileStem = isWebtoonPoster ? "webtoon_poster" : portraitLayout ? "character_chat" : "cover";
