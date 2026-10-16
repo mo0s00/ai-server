@@ -6066,6 +6066,55 @@ function hasPublishedWebtoon(row) {
   );
 }
 
+// An empty locally restored draft must never erase a fuller cloud original.
+// This is especially important after Android uninstall/reinstall.
+function storyDraftContentCounts(draft) {
+  const d = draft && typeof draft === "object" ? draft : {};
+  let cuts = 0;
+  for (const beat of Array.isArray(d.confirmedBeats) ? d.confirmedBeats : []) {
+    for (const phase of Array.isArray(beat?.microBeats) ? beat.microBeats : []) {
+      if (Array.isArray(phase?.webtoonScript)) cuts += phase.webtoonScript.length;
+    }
+  }
+  return {
+    opening: Array.isArray(d.openingScript) ? d.openingScript.length : 0,
+    cuts,
+    beats: Array.isArray(d.confirmedBeats) ? d.confirmedBeats.length : 0,
+  };
+}
+
+function storyDraftWouldEraseContent(previous, incoming) {
+  const before = storyDraftContentCounts(previous);
+  const after = storyDraftContentCounts(incoming);
+  return (before.cuts >= 5 && after.cuts === 0) ||
+    (before.opening >= 4 && after.opening === 0 && after.cuts === 0) ||
+    (before.beats >= 3 && after.beats === 0);
+}
+
+async function snapshotUserStoryBeforeSave(supabase, storyId, priorRow) {
+  const previousDraft = priorRow?.draft_json;
+  if (!previousDraft || typeof previousDraft !== "object") return;
+  // Keep a recoverable hourly server-side copy. Clients cannot read this
+  // RLS-locked backup table directly; a service-role restore is deliberate.
+  const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const { data: latest, error: checkError } = await supabase
+    .from("story_recovery_snapshots")
+    .select("id")
+    .eq("story_id", storyId)
+    .eq("snapshot_kind", "pre_write_hourly")
+    .gte("created_at", hourAgo)
+    .limit(1);
+  if (checkError) throw checkError;
+  if (latest?.length) return;
+  const { error } = await supabase.from("story_recovery_snapshots").insert({
+    story_id: storyId,
+    snapshot_kind: "pre_write_hourly",
+    snapshot_json: priorRow,
+    source_updated_at: priorRow.updated_at || null,
+  });
+  if (error) throw error;
+}
+
 // 유저 제작 스토리 — 앱 `POST/GET /api/user-stories`
 async function handleUserStoriesPost(req, res) {
   try {
@@ -6124,8 +6173,23 @@ async function handleUserStoriesPost(req, res) {
         return res.status(500).json({ ok: false, error: fetchErr.message });
       }
       if (existing) {
-        const {data: prior} = await supabase.from("user_stories")
-          .select("draft_json").eq("id",id).maybeSingle();
+        const {data: prior, error: priorError} = await supabase.from("user_stories")
+          .select("*").eq("id",id).maybeSingle();
+        if (priorError) {
+          logSupabaseErr("[user-stories] prior read failed", priorError);
+          return res.status(500).json({ok:false,error:"cloud draft protection read failed"});
+        }
+        if (storyDraftWouldEraseContent(prior?.draft_json, draft_json)) {
+          console.warn("[user-stories] prevented accidental draft content loss", id);
+          return res.status(409).json({
+            ok: false,
+            error: "기존 클라우드 원고를 보호했습니다. 빈 제작 데이터를 덮어쓸 수 없습니다.",
+            error_kind: "cloud_draft_regression_blocked",
+          });
+        }
+        if (prior?.draft_json && JSON.stringify(prior.draft_json) !== JSON.stringify(draft_json)) {
+          await snapshotUserStoryBeforeSave(supabase, id, prior);
+        }
         if (hasPublishedWebtoon(prior)) {
           const signedUid = await verifiedWebtoonFirebaseUid(req);
           if (!signedUid || signedUid !== user_id)
