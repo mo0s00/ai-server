@@ -6180,12 +6180,19 @@ async function handleUserStoriesPost(req, res) {
           return res.status(500).json({ok:false,error:"cloud draft protection read failed"});
         }
         if (storyDraftWouldEraseContent(prior?.draft_json, draft_json)) {
-          console.warn("[user-stories] prevented accidental draft content loss", id);
-          return res.status(409).json({
-            ok: false,
-            error: "기존 클라우드 원고를 보호했습니다. 빈 제작 데이터를 덮어쓸 수 없습니다.",
-            error_kind: "cloud_draft_regression_blocked",
-          });
+          // Only an explicitly confirmed editor deletion with a verified
+          // owner token may replace a populated script with an empty one.
+          const confirmedOwnerDelete =
+            req.body?.allow_intentional_script_delete === true &&
+            (await verifiedWebtoonFirebaseUid(req)) === user_id;
+          if (!confirmedOwnerDelete) {
+            console.warn("[user-stories] prevented accidental draft content loss", id);
+            return res.status(409).json({
+              ok: false,
+              error: "기존 클라우드 원고를 보호했습니다. 빈 제작 데이터를 덮어쓸 수 없습니다.",
+              error_kind: "cloud_draft_regression_blocked",
+            });
+          }
         }
         if (prior?.draft_json && JSON.stringify(prior.draft_json) !== JSON.stringify(draft_json)) {
           await snapshotUserStoryBeforeSave(supabase, id, prior);
