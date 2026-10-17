@@ -5938,7 +5938,7 @@ app.post("/api/story-cover-image", async (req, res) => {
     let gallerySaved = null;
     if (isWebtoonPoster && shared_background_gallery === true) {
       gallerySaved = false;
-      const origin = (process.env.SUPABASE_URL || "").trim().replace(/\\/+$/, "");
+      const origin = (process.env.SUPABASE_URL || "").trim().replace(/[/]+$/, "");
       const generatedUrl = String(genResult.imageUrl || "").trim();
       if (origin && generatedUrl.startsWith(origin + "/storage/v1/object/public/")) {
         try {
