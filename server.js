@@ -5924,9 +5924,15 @@ app.post("/api/story-cover-image", async (req, res) => {
     const actualLandscape = !portraitLayout || (isWebtoonPoster && imageAspect === "3:2");
     const imageSize = storyImageApiSize({ landscape: actualLandscape, imageAspect });
     const fileStem = isWebtoonPoster ? "webtoon_poster" : portraitLayout ? "character_chat" : "cover";
+    // Background-gallery files need immutable URLs. Other images retain their
+    // existing session-key caching behavior for backwards compatibility.
+    const imageSessionKey = webtoon_poster === true && shared_background_gallery === true
+      ? "recentbg_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10)
+        + "_" + String(session_key || fileStem)
+      : session_key || fileStem;
     const genResult = await generateStoryImageFromPrompt(
       promptUsed,
-      session_key || fileStem,
+      imageSessionKey,
       fileStem,
       refs,
       imageSize,
