@@ -3289,6 +3289,54 @@ async function handleWebtoonPosterReferencesPut(req, res) {
 app.get("/api/webtoon-poster-references", handleWebtoonPosterReferencesGet);
 app.put("/api/webtoon-poster-references/:slot", handleWebtoonPosterReferencesPut);
 
+// Global collection of recently generated webtoon phase backgrounds.
+// Do not remove objects from Storage when removing a gallery entry: stories may reuse them.
+app.get("/api/webtoon-background-gallery", async (req, res) => {
+  try {
+    const sb = getSupabaseServiceRole();
+    if (!sb) return res.status(503).json({ ok: false, error: "cloud unavailable" });
+    const offset = Math.max(0, Math.min(10000, Number.parseInt(req.query.offset, 10) || 0));
+    const limit = Math.max(1, Math.min(48, Number.parseInt(req.query.limit, 10) || 48));
+    const { data, error } = await sb.from("webtoon_background_gallery")
+      .select("id,image_url,created_at")
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false })
+      .range(offset, offset + limit);
+    if (error) throw error;
+    res.set("Cache-Control", "no-store");
+    return res.json({
+      ok: true,
+      items: (data || []).slice(0, limit).map(row => ({
+        id: row.id, image_url: row.image_url, created_at: row.created_at,
+      })),
+      has_more: (data || []).length > limit,
+    });
+  } catch (e) {
+    console.error("[webtoon-background-gallery GET]", e);
+    return res.status(503).json({ ok: false, error: "최근 이미지 조회 실패" });
+  }
+});
+
+app.delete("/api/webtoon-background-gallery/:id", async (req, res) => {
+  if (!isAdminPresenceAuthorized(req)) {
+    return res.status(403).json({ ok: false, error: "관리자 권한 필요" });
+  }
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    return res.status(400).json({ ok: false, error: "invalid image id" });
+  }
+  try {
+    const sb = getSupabaseServiceRole();
+    if (!sb) return res.status(503).json({ ok: false, error: "cloud unavailable" });
+    const { error } = await sb.from("webtoon_background_gallery").delete().eq("id", id);
+    if (error) throw error;
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[webtoon-background-gallery DELETE]", e);
+    return res.status(503).json({ ok: false, error: "목록 삭제 실패" });
+  }
+});
+
 const HOME_ANNOUNCEMENT_TITLE_MAX = 120;
 const HOME_ANNOUNCEMENT_BODY_MAX = 8000;
 
@@ -5817,6 +5865,7 @@ app.post("/api/story-cover-image", async (req, res) => {
       reference_images = [],
       render_title_in_image = false,
       webtoon_poster = false,
+      shared_background_gallery = false,
       poster_notes = "",
       poster_title_placement = "bottom",
       poster_style_reference = false,
@@ -5884,9 +5933,34 @@ app.post("/api/story-cover-image", async (req, res) => {
       { referenceMode: referenceModeResolved },
     );
 
+    // The generating server is the only writer; clients never submit arbitrary URLs.
+    // A successful generation must not be lost if the optional gallery write fails.
+    let gallerySaved = null;
+    if (isWebtoonPoster && shared_background_gallery === true) {
+      gallerySaved = false;
+      const origin = (process.env.SUPABASE_URL || "").trim().replace(/\\/+$/, "");
+      const generatedUrl = String(genResult.imageUrl || "").trim();
+      if (origin && generatedUrl.startsWith(origin + "/storage/v1/object/public/")) {
+        try {
+          const sb = getSupabaseServiceRole();
+          if (sb) {
+            const { error } = await sb.from("webtoon_background_gallery")
+              .upsert({ image_url: generatedUrl }, { onConflict: "image_url", ignoreDuplicates: true });
+            if (error) throw error;
+            gallerySaved = true;
+          }
+        } catch (galleryError) {
+          console.error("[webtoon-background-gallery save]", galleryError);
+        }
+      } else {
+        console.error("[webtoon-background-gallery] generated image not in durable Supabase Storage");
+      }
+    }
+
     return res.json({
       ok: true,
       image_url: genResult.imageUrl,
+      gallery_saved: gallerySaved,
       prompt_used: promptUsed,
       image_size: imageSize,
       image_aspect: imageAspect || (portraitLayout ? "2:3" : ""),
