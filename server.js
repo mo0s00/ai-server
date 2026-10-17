@@ -5629,7 +5629,9 @@ function logStoryImageOpenAiResponse(label, status, raw, ok) {
     errorMessage: fields.message || null,
     errorType: fields.type || null,
     errorParam: fields.param || null,
-    responseBody: raw,
+    // Image responses contain multi-megabyte base64 payloads. Never print them.
+    // The status and structured error fields are enough to diagnose failures.
+    responseBytes: Buffer.byteLength(String(raw || ""), "utf8"),
   };
   const line = `[story-image openai] ${JSON.stringify(payload)}`;
   if (ok) {
